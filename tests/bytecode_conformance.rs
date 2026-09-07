@@ -55,6 +55,29 @@ fn conformance_registry() -> Rc<dyn ModuleLookup> {
     Rc::new(ModuleRegistry::new().with(ConformanceModule))
 }
 
+/// With and without the `lower` pass, the bytecode engine produces the same
+/// result for every non-foreign eval conformance case.  This is the parity
+/// gate that keeps lowering an opt-in, semantics-preserving normalization.
+#[test]
+fn bytecode_engine_lowering_parity_on_eval_corpus() {
+    let without = BytecodeEngine::new();
+    let with = BytecodeEngine::new().with_lowering();
+    let corpus = eval_corpus();
+    for case in &corpus {
+        if case.name == "foreign" {
+            continue;
+        }
+        let req = EvalRequest::new(case.ast.clone());
+        let base = without.eval(&case.lang, &req);
+        let lowered = with.eval(&case.lang, &req);
+        assert_eq!(
+            base, lowered,
+            "case '{}': lowering changed the eval result",
+            case.name
+        );
+    }
+}
+
 /// The bytecode engine passes the full eval conformance suite (non-foreign
 /// cases).
 #[test]

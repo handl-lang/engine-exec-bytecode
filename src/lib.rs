@@ -62,6 +62,8 @@ pub use instr::Instr;
 
 use handl_language::{Ast, AstRef, LangError, Language, SchemeVersion, Value};
 use handl_plugin_engine_exec::{EvalEngine, EvalRequest};
+use handl_plugin_engine_transform::native::{NativeRewrite, NativeRewriteRegistry, RewriteCtx};
+use handl_plugin_engine_transform_rewrite::RewriteEngine;
 use handl_value::TaggedValue;
 use rustc_hash::FxHashMap;
 use std::rc::Rc;
@@ -85,6 +87,8 @@ pub struct BytecodeEngine {
     import_resolver: Option<Rc<dyn handl_plugin_engine_exec::ImportResolver>>,
     /// Global variables injected by the host (e.g. `self` -> language value).
     globals: FxHashMap<Rc<str>, TaggedValue>,
+    /// Run the `lower` transform pass before evaluation.
+    lowering: bool,
 }
 
 impl BytecodeEngine {
@@ -94,6 +98,7 @@ impl BytecodeEngine {
             modules: None,
             import_resolver: None,
             globals: FxHashMap::default(),
+            lowering: false,
         }
     }
 
@@ -107,7 +112,14 @@ impl BytecodeEngine {
             modules: Some(modules),
             import_resolver: None,
             globals: FxHashMap::default(),
+            lowering: false,
         }
+    }
+
+    /// Opt in to the `lower` transform pass before evaluation.
+    pub fn with_lowering(mut self) -> Self {
+        self.lowering = true;
+        self
     }
 
     /// Inject a global variable into the root scope (builder style).
@@ -127,8 +139,7 @@ impl Default for BytecodeEngine {
 
 impl EvalEngine for BytecodeEngine {
     fn eval(&self, lang: &Language, req: &EvalRequest) -> Result<Value, LangError> {
-        let ast = &req.ast;
-        if ast.is_empty() {
+        if req.ast.is_empty() {
             return Ok(Value::Null);
         }
         // Scheme version check -- the engine supports v2 only.
@@ -138,9 +149,23 @@ impl EvalEngine for BytecodeEngine {
                 lang.scheme_version
             )));
         }
-        let root_ref = AstRef::new(ast.len() - 1);
+
+        // Optional lowering pass.  The `lower` pass canonicalizes backend-
+        // specific AST shapes (e.g. object entry key kinds) before the VM
+        // compiles and executes the program.  It is disabled by default to
+        // preserve existing behavior; opt in with `with_lowering`.
+        let (ast, root_ref) = if self.lowering {
+            let root = AstRef::new(req.ast.len() - 1);
+            let engine = RewriteEngine::new()
+                .with_native_registry(Rc::new(lower_natives()) as Rc<dyn NativeRewrite>);
+            let out = engine.run_pass(lang, &req.ast, root, "lower")?;
+            (out.ast, out.root)
+        } else {
+            (req.ast.clone(), AstRef::new(req.ast.len() - 1))
+        };
+
         let mut frame = VmFrame::new(
-            ast,
+            &ast,
             lang,
             self.modules.as_ref(),
             self.import_resolver.as_ref(),
@@ -255,6 +280,39 @@ impl handl_runtime::CompileEngine for BytecodeCompileEngine {
     fn box_clone(&self) -> Box<dyn handl_runtime::CompileEngine> {
         Box::new(self.clone())
     }
+}
+
+/// Native rewrites for the `lower` pass.
+///
+/// These are backend-specific normalizations that the canonical transform
+/// engine cannot express without an escape hatch (e.g. copying a child
+/// payload into a newly-created leaf).  They are registered only when the
+/// `BytecodeEngine` opts in to `with_lowering`.
+fn lower_natives() -> NativeRewriteRegistry {
+    let mut reg = NativeRewriteRegistry::new();
+    reg.register(
+        "lower.object_key",
+        Box::new(|ctx: &mut RewriteCtx<'_>| {
+            let key_idx = ctx.child_ref(0).ok_or_else(|| {
+                LangError::engine("lower.object_key: entry missing key child".to_string())
+            })?;
+            let key_node = ctx
+                .ast()
+                .get(AstRef::new(key_idx))
+                .ok_or_else(|| {
+                    LangError::engine("lower.object_key: key child out of bounds".to_string())
+                })?;
+            if key_node.kind != "string" {
+                return Ok(ctx.pass_through());
+            }
+            let val_idx = ctx.remap_child(1).ok_or_else(|| {
+                LangError::engine("lower.object_key: entry missing value child".to_string())
+            })?;
+            let new_key = ctx.push_leaf("var", key_node.payload.clone());
+            Ok(AstRef::new(ctx.push_node("entry", vec![new_key, val_idx])))
+        }),
+    );
+    reg
 }
 
 #[cfg(test)]

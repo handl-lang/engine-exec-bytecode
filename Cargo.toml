@@ -7,6 +7,8 @@ edition.workspace = true
 handl-language = {path = "../handl-language" }
 handl-platform = {path = "../platform" }
 handl-plugin-engine-exec = {path = "../plugin-engine-exec" }
+handl-plugin-engine-transform = {path = "../plugin-engine-transform" }
+handl-plugin-engine-transform-rewrite = {path = "../plugin-engine-transform-rewrite" }
 handl-runtime = {path = "../handl-runtime" }
 handl-value = {path = "../handl-value" }
 serde_json = { workspace = true }
