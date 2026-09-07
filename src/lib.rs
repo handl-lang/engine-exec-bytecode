@@ -67,6 +67,7 @@ use handl_plugin_engine_transform_rewrite::RewriteEngine;
 use handl_value::TaggedValue;
 use rustc_hash::FxHashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use vm::VmFrame;
 
@@ -157,7 +158,7 @@ impl EvalEngine for BytecodeEngine {
         let (ast, root_ref) = if self.lowering {
             let root = AstRef::new(req.ast.len() - 1);
             let engine = RewriteEngine::new()
-                .with_native_registry(Rc::new(lower_natives()) as Rc<dyn NativeRewrite>);
+                .with_native_registry(Arc::new(lower_natives()) as Arc<dyn NativeRewrite>);
             let out = engine.run_pass(lang, &req.ast, root, "lower")?;
             (out.ast, out.root)
         } else {
