@@ -91,6 +91,15 @@ pub(crate) struct ScopeStack {
     /// variables. Stored as `Rc` so closure calls avoid deep-cloning the
     /// entire captured `HashMap`.
     pub(crate) captured_root: Option<Rc<FxHashMap<Rc<str>, TaggedValue>>>,
+    /// Set when `assign` updates a binding in an *enclosing* scope (below
+    /// the innermost mark) with a different value. Read and cleared by
+    /// `eval_rec` fixpoint detection (`prim_v2_eval_rec`) — such writes are
+    /// the ADR-0074 feedback wires: the `while`/`do-while`/`for` desugars
+    /// update `__continue`/`__xs` (and user bindings like `x = x + 1`)
+    /// from inside `if`/`match` branch blocks, and a pass that produces
+    /// any such write must not count as converged. Mirrors the tree-walk
+    /// `ScopeStack::enclosing_updated`.
+    pub(crate) enclosing_updated: bool,
 }
 
 impl ScopeStack {
@@ -99,6 +108,7 @@ impl ScopeStack {
             bindings: Vec::new(),
             marks: vec![0],
             captured_root: None,
+            enclosing_updated: false,
         }
     }
 
@@ -125,10 +135,25 @@ impl ScopeStack {
     /// which mirrors the tree-walk `ScopeStack::assign` scope walk), or
     /// define it in the innermost scope when the name is not already bound.
     /// See the tree-walk engine for the ADR-0074 feedback-wire rationale.
+    ///
+    /// When the update lands below the innermost mark (a cross-scope write)
+    /// and the value actually changed, `enclosing_updated` is set so the
+    /// `eval_rec` fixpoint check can observe the write — exactly like the
+    /// tree-walk `ScopeStack::assign`.
     pub(crate) fn assign(&mut self, name: &str, value: TaggedValue) {
-        for (n, v) in self.bindings.iter_mut().rev() {
+        let inner_start = self.marks.last().copied().unwrap_or(0);
+        for (pos, (n, v)) in self.bindings.iter_mut().enumerate().rev() {
             if n.as_ref() == name {
-                *v = value;
+                if !handl_value::eq(v, &value) {
+                    *v = value;
+                    // Only cross-scope writes are fixpoint-relevant: an
+                    // update to a binding defined earlier in the *same*
+                    // innermost scope is ordinary sequencing and must not
+                    // keep a `rec` pass alive.
+                    if pos < inner_start {
+                        self.enclosing_updated = true;
+                    }
+                }
                 return;
             }
         }
@@ -275,6 +300,35 @@ fn is_either_right(v: &TaggedValue) -> bool {
 /// Extract the carried value from an Either.
 fn either_value(v: &TaggedValue) -> Option<&TaggedValue> {
     handl_value::either_value(v)
+}
+
+/// Convergence comparison for `eval_rec` bindings.
+///
+/// Closures (`TaggedValue::Arrow`) are compared by params and body index
+/// only, NOT by their captured env. In a `rec` fixpoint, each pass
+/// re-evaluates a closure binding and creates a new closure that captures
+/// the current scope (which now includes other rec bindings). The captured
+/// env naturally differs each pass even though the closure's code is
+/// identical, so a full structural `eq` would never converge. Comparing
+/// only params + body lets the fixpoint converge after the env stabilizes.
+/// Non-closure values use the standard structural `eq`. Mirrors the
+/// tree-walk `rec_value_eq`.
+fn rec_value_eq(a: &TaggedValue, b: &TaggedValue) -> bool {
+    match (a, b) {
+        (
+            TaggedValue::Arrow {
+                params: p1,
+                body: b1,
+                ..
+            },
+            TaggedValue::Arrow {
+                params: p2,
+                body: b2,
+                ..
+            },
+        ) => p1.len() == p2.len() && p1.iter().zip(p2.iter()).all(|(a, b)| a == b) && b1 == b2,
+        _ => handl_value::eq(a, b),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1722,6 +1776,9 @@ impl<'a, 'h> VmFrame<'a, 'h> {
             // sequence in a new scope and returns the last child's value. It
             // also handles `assign` children as bindings.
             "eval_block" => self.prim_v2_eval_block(node),
+            // ADR-0074: `rec` — recursive computation region, iterated to a
+            // fixpoint (mirrors the v2 tree-walk's `eval_rec`).
+            "eval_rec" => self.prim_v2_eval_rec(node),
             _ => Err(LangError::engine_node(
                 format!("unknown v2 native op: {}", op),
                 node,
@@ -1911,6 +1968,281 @@ impl<'a, 'h> VmFrame<'a, 'h> {
             }
         }
         self.scopes.pop_scope();
+        Ok(result)
+    }
+
+    /// Whether `node`'s shape declares the given child role (ADR-0081).
+    fn role_declared(&self, node: &AstNode, role: &str) -> bool {
+        matches!(self.lang.child_role_index(&node.kind, role), Ok(Some(_)))
+    }
+
+    /// Whether `node` is a binding (assign-like) node: its shape declares a
+    /// `target` role. Mirrors the tree-walk `is_assign_node`.
+    fn is_assign_node(&self, node: &AstNode) -> bool {
+        self.role_declared(node, "target")
+    }
+
+    /// Whether `node` is a return node: its shape declares a `value` role
+    /// but no `target` role (a binding declares both). Mirrors the
+    /// tree-walk `is_return_node`.
+    fn is_return_node(&self, node: &AstNode) -> bool {
+        self.role_declared(node, "value") && !self.role_declared(node, "target")
+    }
+
+    /// Resolve the bound name of a binding's `target` child: a bare
+    /// `var`-like node carries the name in its payload; a wrapper whose
+    /// shape declares a `subject` role (e.g. a type annotation — the
+    /// `subject`/`annot` role convention, ADR-0081) delegates to that
+    /// child. Mirrors the tree-walk `binding_target_name`.
+    fn binding_target_name(
+        &self,
+        target_idx: usize,
+        err_ctx: &str,
+        err_node: &AstNode,
+    ) -> Result<String, LangError> {
+        let mut node = self.ast.at(AstRef::new(target_idx))?;
+        // Unwrap `subject`-roled wrappers (annotation-like nodes).
+        for _ in 0..8 {
+            if let Some(name) = node.payload.as_str() {
+                return Ok(name.to_string());
+            }
+            let subject_idx = match self.role_child_arena(node, "subject")? {
+                Some(i) => i,
+                None => break,
+            };
+            node = self.ast.at(AstRef::new(subject_idx))?;
+        }
+        node.payload.as_str().map(str::to_string).ok_or_else(|| {
+            LangError::engine_node(
+                format!("{err_ctx}: binding target must be an identifier"),
+                err_node,
+            )
+        })
+    }
+
+    /// `eval_rec` native op: recursive computation region (ADR-0074).
+    /// Mirrors the v2 tree-walk's `prim_eval_rec` exactly.
+    ///
+    /// The `rec` node's children are the flattened block bindings. Each
+    /// child is an expression:
+    /// - `assign` children (`a = expr`) define bindings that may reference
+    ///   each other cyclically.
+    /// - `return` children exit the region early with the return value.
+    /// - Any other expression is evaluated for its side effects / result.
+    ///
+    /// The engine iterates to a fixpoint: on each pass, every binding's
+    /// value expression is re-evaluated using the current values of other
+    /// bindings. When no binding's value changes between passes, the
+    /// fixpoint is reached. A fuel limit (10000 iterations) prevents
+    /// infinite loops. `return` inside a `rec` region exits the region
+    /// early with the return value. The last child's value is the result
+    /// of the region (unless a `return` exits early).
+    ///
+    /// Bindings are NOT pre-initialized. On the first pass, a binding that
+    /// references another not-yet-computed binding will either find it in
+    /// an enclosing scope (if it exists there) or encounter an error (e.g.
+    /// arithmetic on an unbound variable). Errors during binding evaluation
+    /// are caught and the binding is skipped for that pass — it will be
+    /// retried on the next pass once its dependencies have values.
+    fn prim_v2_eval_rec(&mut self, node: &AstNode) -> Result<TaggedValue, LangError> {
+        let children = node
+            .payload
+            .get("children")
+            .and_then(|c| c.as_array())
+            .ok_or_else(|| {
+                LangError::engine_node(
+                    "eval_rec: expected children array in payload".to_string(),
+                    node,
+                )
+            })?;
+        if children.is_empty() {
+            return Ok(TaggedValue::Null);
+        }
+
+        // Push a new scope for the rec region. Bindings will be defined
+        // here as they are computed.
+        self.scopes.push_scope();
+
+        // Track the previous value of each binding for change detection.
+        // Initialize from the enclosing scope so we can detect the first
+        // change correctly.
+        let mut prev_values: FxHashMap<Rc<str>, TaggedValue> = FxHashMap::default();
+        let mut binding_names: Vec<Rc<str>> = Vec::new();
+        for entry in children {
+            let child_idx = entry.as_u64().ok_or_else(|| {
+                LangError::engine_node("eval_rec: child index must be a number".to_string(), node)
+            })? as usize;
+            let child_node = self.ast.at(AstRef::new(child_idx))?;
+            if self.is_assign_node(child_node) {
+                if let Some(ac) = child_node
+                    .payload
+                    .get("children")
+                    .and_then(|c| c.as_array())
+                {
+                    if ac.len() >= 2 {
+                        let var_idx = self
+                            .role_child_arena(child_node, "target")?
+                            .or_else(|| ac[0].as_u64().map(|i| i as usize))
+                            .ok_or_else(|| {
+                                LangError::engine_node(
+                                    "eval_rec: assign var index must be a number".to_string(),
+                                    node,
+                                )
+                            })?;
+                        if let Ok(name) = self.binding_target_name(var_idx, "eval_rec", node) {
+                            // Seed from the enclosing scope (before the
+                            // push). Since we already pushed a scope,
+                            // lookup will search innermost-first, but the
+                            // inner scope is empty at this point, so it
+                            // falls through.
+                            let outer_val = self
+                                .scopes
+                                .lookup(&name)
+                                .cloned()
+                                .unwrap_or(TaggedValue::Null);
+                            let name_rc = Rc::from(name.as_str());
+                            prev_values.insert(Rc::clone(&name_rc), outer_val);
+                            binding_names.push(name_rc);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut result = TaggedValue::Null;
+        const MAX_FUEL: usize = 10000;
+        let mut converged = false;
+
+        for _iter in 0..MAX_FUEL {
+            let mut changed = false;
+
+            for entry in children {
+                let child_idx = entry.as_u64().ok_or_else(|| {
+                    LangError::engine_node(
+                        "eval_rec: child index must be a number".to_string(),
+                        node,
+                    )
+                })? as usize;
+                let child_node = self.ast.at(AstRef::new(child_idx))?;
+
+                // Handle `return` — exit the region with the return value.
+                if self.is_return_node(child_node) {
+                    if let Some(rc) = child_node
+                        .payload
+                        .get("children")
+                        .and_then(|c| c.as_array())
+                    {
+                        if let Some(first) = rc.first() {
+                            if let Some(ret_idx) = first.as_u64() {
+                                result = self.exec_node_inner(AstRef::new(ret_idx as usize))?;
+                                self.scopes.pop_scope();
+                                return Ok(result);
+                            }
+                        }
+                    }
+                    // `return` with no value → exit with Null.
+                    self.scopes.pop_scope();
+                    return Ok(TaggedValue::Null);
+                }
+
+                // Handle `assign` bindings — evaluate the value expression
+                // and update the binding in the current scope. Errors are
+                // caught: a binding may reference another not-yet-computed
+                // binding (still unbound or Null), which would error. The
+                // binding is skipped for this pass and retried next pass.
+                if self.is_assign_node(child_node) {
+                    if let Some(ac) = child_node
+                        .payload
+                        .get("children")
+                        .and_then(|c| c.as_array())
+                    {
+                        if ac.len() >= 2 {
+                            let var_idx = self
+                                .role_child_arena(child_node, "target")?
+                                .or_else(|| ac[0].as_u64().map(|i| i as usize))
+                                .ok_or_else(|| {
+                                    LangError::engine_node(
+                                        "eval_rec: assign var index must be a number".to_string(),
+                                        node,
+                                    )
+                                })?;
+                            let value_idx = self
+                                .role_child_arena(child_node, "value")?
+                                .or_else(|| ac[1].as_u64().map(|i| i as usize))
+                                .ok_or_else(|| {
+                                    LangError::engine_node(
+                                        "eval_rec: assign value index must be a number".to_string(),
+                                        node,
+                                    )
+                                })?;
+                            let var_name = self.binding_target_name(var_idx, "eval_rec", node)?;
+
+                            match self.exec_node_inner(AstRef::new(value_idx)) {
+                                Ok(new_val) => {
+                                    self.scopes.define(&var_name, new_val.clone());
+                                    result = new_val;
+                                }
+                                Err(_) => {
+                                    // Skip — binding couldn't be computed
+                                    // this pass (likely references a
+                                    // not-yet-computed binding). It will be
+                                    // retried on the next pass.
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                // Non-binding expression — evaluate normally.
+                result = self.exec_node_inner(AstRef::new(child_idx))?;
+            }
+
+            // End-of-pass fixpoint check. A binding's value can also change
+            // via a nested update — `x = y` inside a block updates the
+            // nearest enclosing binding (`ScopeStack::assign`), which is
+            // how the `while`/`do-while`/`for` desugars rewrite the
+            // rec-scope `__continue`/`__xs` slots from inside the
+            // `if`/`match` branch blocks. Comparing only at rec-level
+            // assign-eval time misses those writes and converges one pass
+            // early (or oscillates), so compare each tracked binding's
+            // *current* env value against the value it held at the end of
+            // the previous pass — and treat any cross-scope write observed
+            // this pass (e.g. a body rebinding an outer variable) as a
+            // change.
+            if self.scopes.enclosing_updated {
+                changed = true;
+                self.scopes.enclosing_updated = false;
+            }
+            for name in &binding_names {
+                let cur = self
+                    .scopes
+                    .lookup(name)
+                    .cloned()
+                    .unwrap_or(TaggedValue::Null);
+                let prev = prev_values
+                    .get(name.as_ref())
+                    .cloned()
+                    .unwrap_or(TaggedValue::Null);
+                prev_values.insert(Rc::clone(name), cur.clone());
+                if !rec_value_eq(&cur, &prev) {
+                    changed = true;
+                }
+            }
+
+            if !changed {
+                converged = true;
+                break;
+            }
+        }
+
+        self.scopes.pop_scope();
+        if !converged {
+            return Err(LangError::engine_node(
+                "rec: exceeded fuel limit (10000 iterations) without reaching fixpoint".to_string(),
+                node,
+            ));
+        }
         Ok(result)
     }
 
