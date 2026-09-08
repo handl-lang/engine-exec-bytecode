@@ -389,6 +389,7 @@ fn compile_arr(
         if let Some(closure) = try_extract_closure_params_body(lang, ast, node)? {
             out.push(Instr::Closure {
                 params: closure.params,
+                rest: closure.rest,
                 body: closure.body,
             });
             return Ok(false);
@@ -571,6 +572,8 @@ fn try_extract_static_object_keys(
 /// arena index.
 struct StaticClosure {
     params: Rc<[String]>,
+    /// Rest/variadic param name (`[a, ...rest] ~> body`), if declared.
+    rest: Option<Rc<str>>,
     body: usize,
 }
 
@@ -610,8 +613,13 @@ fn try_extract_closure_params_body(
             };
             names.push(s.to_string());
         }
+        let rest = payload
+            .get("rest")
+            .and_then(|v| v.as_str())
+            .map(Rc::from);
         return Ok(Some(StaticClosure {
             params: Rc::from(names),
+            rest,
             body: b as usize,
         }));
     }
@@ -631,38 +639,17 @@ fn try_extract_closure_params_body(
         // shape declaring a variadic role (e.g. `params`) is a param list;
         // the legacy `paren`/`array` kinds remain only as the role-less
         // fallback.
-        let names: Vec<String> = if lang.has_variadic_role(&param_node.kind) {
-            let param_children = match param_node
-                .payload
-                .get("children")
-                .and_then(|c| c.as_array())
-            {
-                Some(c) => c,
-                None => return Ok(None),
-            };
-            let mut names = Vec::with_capacity(param_children.len());
-            for pc in param_children {
-                let pidx = match pc.as_u64() {
-                    Some(idx) => idx as usize,
-                    None => return Ok(None),
-                };
-                let pnode = ast.at(AstRef::new(pidx))?;
-                let pname = match pnode.payload.as_str() {
-                    Some(s) => s,
-                    None => return Ok(None),
-                };
-                names.push(pname.to_string());
-            }
-            names
-        } else {
-            let pname = match param_node.payload.as_str() {
-                Some(s) => s,
-                None => return Ok(None),
-            };
-            vec![pname.to_string()]
+        // `param_names` resolves fixed params plus an optional rest param
+        // (`...name`) data-driven via `pattern_role`/variadic metadata
+        // (ADR-0081). `Err` (unresolvable param shape) falls back to the
+        // runtime `NativeOp("closure")` path like `Ok(None)`.
+        let (names, rest) = match lang.param_names(ast, param_node) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
         };
         return Ok(Some(StaticClosure {
             params: Rc::from(names),
+            rest: rest.map(Rc::from),
             body: body_idx,
         }));
     }

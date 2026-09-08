@@ -356,6 +356,8 @@ pub enum Instr {
     Closure {
         /// Pre-extracted parameter names (allocated once at compile time).
         params: Rc<[String]>,
+        /// Pre-extracted rest/variadic param name (`[a, ...rest] ~> body`).
+        rest: Option<Rc<str>>,
         /// AST node index for the closure body.
         body: usize,
     },
