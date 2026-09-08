@@ -116,6 +116,13 @@ pub enum Instr {
     /// cache) and executes that child node's v2 bytecode.
     EvalChild(usize),
 
+    /// Like [`EvalChild`], but pushes `null` when the child index is absent
+    /// (e.g. the missing `else` of an else-less `if` — a child produced by an
+    /// `optional_children` grammar row).
+    ///
+    /// Emitted by `Arr { op: "proj_child_or", lit: Some(idx), .. }`.
+    EvalChildOr(usize),
+
     /// Pop a value, push a new scope, and bind the given name in that scope.
     ///
     /// Emitted by `Arr { op: "extend_env", lit: Some(name), .. }` when the
@@ -349,6 +356,8 @@ pub enum Instr {
     Closure {
         /// Pre-extracted parameter names (allocated once at compile time).
         params: Rc<[String]>,
+        /// Pre-extracted rest/variadic param name (`[a, ...rest] ~> body`).
+        rest: Option<Rc<str>>,
         /// AST node index for the closure body.
         body: usize,
     },

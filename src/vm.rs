@@ -494,6 +494,23 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     let result = self.exec_node_inner(child_ref)?;
                     stack.push(result);
                 }
+                Instr::EvalChildOr(n) => {
+                    // Like EvalChild, but tolerates an absent child index
+                    // (e.g. an optional `else` child) — pushes null.
+                    let arena_idx = node
+                        .payload
+                        .get("children")
+                        .and_then(|c| c.as_array())
+                        .and_then(|children| children.get(*n))
+                        .and_then(|v| v.as_u64());
+                    match arena_idx {
+                        Some(i) => {
+                            let result = self.exec_node_inner(AstRef::new(i as usize))?;
+                            stack.push(result);
+                        }
+                        None => stack.push(TaggedValue::Null),
+                    }
+                }
                 Instr::Store(name) => {
                     let val = stack.pop().ok_or_else(|| {
                         LangError::engine_node("stack underflow on Store".to_string(), node)
@@ -851,7 +868,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     stack.push(TaggedValue::Obj(Rc::new(obj)));
                 }
                 // --- Closure construction bytecode ---
-                Instr::Closure { params, body } => {
+                Instr::Closure { params, rest, body } => {
                     // Capture the current environment and construct a
                     // `TaggedValue::Arrow`. Identical to the `closure`
                     // native op, but avoids the per-call `Vec` allocation
@@ -861,6 +878,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     let captured = self.scopes.capture();
                     stack.push(TaggedValue::Arrow {
                         params: Rc::clone(params),
+                        rest: rest.clone(),
                         body: *body,
                         env: Rc::new(captured),
                         home: None,
@@ -952,7 +970,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
             }
             "closure" => {
                 let payload = &node.payload;
-                let (params, body) = if let (Some(p), Some(b)) = (
+                let (params, rest, body) = if let (Some(p), Some(b)) = (
                     payload.get("params").and_then(|v| v.as_array()),
                     payload.get("body").and_then(|v| v.as_u64()),
                 ) {
@@ -969,7 +987,11 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                                 .map(String::from)
                         })
                         .collect::<Result<_, _>>()?;
-                    (param_names, b as usize)
+                    let rest_name = payload
+                        .get("rest")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    (param_names, rest_name, b as usize)
                 } else if let Some(children) = payload.get("children").and_then(|c| c.as_array()) {
                     let param_idx = children.first().and_then(|v| v.as_u64()).ok_or_else(|| {
                         LangError::engine_node("closure: missing param child".to_string(), node)
@@ -978,45 +1000,14 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                         LangError::engine_node("closure: missing body child".to_string(), node)
                     })? as usize;
                     let param_node = self.ast.at(AstRef::new(param_idx))?;
-                    // Collection-vs-single params is a shape question
-                    // (ADR-0081): a shape declaring a variadic role (e.g.
-                    // `params`) is a param list; the legacy `paren`/`array`
-                    // kinds remain only as the role-less fallback.
-                    let param_names: Vec<String> = if self.lang.has_variadic_role(&param_node.kind)
-                    {
-                        let param_children = param_node
-                            .payload
-                            .get("children")
-                            .and_then(|c| c.as_array())
-                            .ok_or_else(|| {
-                                LangError::engine_node(
-                                    "closure: params missing children".to_string(),
-                                    node,
-                                )
-                            })?;
-                        let mut names = Vec::with_capacity(param_children.len());
-                        for pc in param_children {
-                            let pidx = pc.as_u64().ok_or_else(|| {
-                                LangError::engine(
-                                    "closure: param index must be a number".to_string(),
-                                )
-                            })? as usize;
-                            let pnode = self.ast.at(AstRef::new(pidx))?;
-                            let pname = self
-                                .lang
-                                .param_name(self.ast, pnode)
-                                .map_err(|e| LangError::engine_node(e.to_string(), node))?;
-                            names.push(pname);
-                        }
-                        names
-                    } else {
-                        let pname = self
-                            .lang
-                            .param_name(self.ast, param_node)
-                            .map_err(|e| LangError::engine_node(e.to_string(), node))?;
-                        vec![pname]
-                    };
-                    (param_names, body_idx)
+                    // `param_names` resolves fixed params plus an optional
+                    // rest param (`...name`) data-driven via
+                    // `pattern_role`/variadic metadata (ADR-0081).
+                    let (param_names, rest_name) = self
+                        .lang
+                        .param_names(self.ast, param_node)
+                        .map_err(|e| LangError::engine_node(e.to_string(), node))?;
+                    (param_names, rest_name, body_idx)
                 } else {
                     return Err(LangError::engine(
                         "closure: missing params/body in payload".to_string(),
@@ -1025,6 +1016,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 let captured = self.scopes.capture();
                 Ok(TaggedValue::Arrow {
                     params: Rc::from(params),
+                    rest: rest.map(Rc::from),
                     body,
                     env: Rc::new(captured),
                     home: None,
@@ -1083,8 +1075,12 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 } else if let Some(children) =
                     node.payload.get("children").and_then(|c| c.as_array())
                 {
+                    let start = self
+                        .lang
+                        .child_role_index(&node.kind, "entries")?
+                        .unwrap_or(0);
                     let mut obj = FxHashMap::default();
-                    for entry in children {
+                    for entry in children.iter().skip(start) {
                         let entry_idx = entry.as_u64().ok_or_else(|| {
                             LangError::engine_node(
                                 "object: entry index must be a number".to_string(),
@@ -1102,25 +1098,29 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                                     node,
                                 )
                             })?;
-                        let key_idx =
-                            entry_children
-                                .get(0)
-                                .and_then(|v| v.as_u64())
-                                .ok_or_else(|| {
-                                    LangError::engine_node(
-                                        "object: entry missing key child".to_string(),
-                                        node,
-                                    )
-                                })? as usize;
-                        let val_idx =
-                            entry_children
-                                .get(1)
-                                .and_then(|v| v.as_u64())
-                                .ok_or_else(|| {
-                                    LangError::engine(
-                                        "object: entry missing value child".to_string(),
-                                    )
-                                })? as usize;
+                        let key_role = self
+                            .lang
+                            .child_role_index(&entry_node.kind, "key")?
+                            .unwrap_or(0);
+                        let val_role = self
+                            .lang
+                            .child_role_index(&entry_node.kind, "value")?
+                            .unwrap_or(1);
+                        let key_idx = entry_children
+                            .get(key_role)
+                            .and_then(|v| v.as_u64())
+                            .ok_or_else(|| {
+                                LangError::engine_node(
+                                    "object: entry missing key child".to_string(),
+                                    node,
+                                )
+                            })? as usize;
+                        let val_idx = entry_children
+                            .get(val_role)
+                            .and_then(|v| v.as_u64())
+                            .ok_or_else(|| {
+                                LangError::engine("object: entry missing value child".to_string())
+                            })? as usize;
                         // Object key: a literal key child (the entry shape
                         // declares `literal_children: { key: [...] }`,
                         // ADR-0081) uses its payload as the key string
@@ -2058,10 +2058,14 @@ impl<'a, 'h> VmFrame<'a, 'h> {
         args: &[TaggedValue],
     ) -> Result<TaggedValue, LangError> {
         // Closure application — match on TaggedValue::Arrow directly.
-        let (params, body_idx, captured_env) = match callee {
+        let (params, rest_param, body_idx, captured_env) = match callee {
             TaggedValue::Arrow {
-                params, body, env, ..
-            } => (params.clone(), *body, Rc::clone(env)),
+                params,
+                rest,
+                body,
+                env,
+                ..
+            } => (params.clone(), rest.clone(), *body, Rc::clone(env)),
             _ => {
                 return Err(LangError::engine(
                     "callee is not an arrow-value".to_string(),
@@ -2069,7 +2073,14 @@ impl<'a, 'h> VmFrame<'a, 'h> {
             }
         };
         let body_ref = AstRef::new(body_idx);
-        if params.len() != args.len() {
+        // Rest param (`[a, ...rest] ~> body`): surplus args bind to the rest
+        // name as an array, so `args.len() >= params.len()` is required.
+        let arity_ok = if rest_param.is_some() {
+            args.len() >= params.len()
+        } else {
+            params.len() == args.len()
+        };
+        if !arity_ok {
             return Err(LangError::engine(format!(
                 "arrow-value expects {} args, got {}",
                 params.len(),
@@ -2092,6 +2103,13 @@ impl<'a, 'h> VmFrame<'a, 'h> {
         self.scopes.push_scope();
         for (param, arg) in params.iter().zip(args.iter()) {
             self.scopes.define(param, arg.clone());
+        }
+        // Bind the rest param to the surplus args as an array.
+        if let Some(rest_name) = &rest_param {
+            self.scopes.define(
+                rest_name.as_ref(),
+                TaggedValue::Arr(Rc::from(args[params.len()..].to_vec())),
+            );
         }
         let result = self.exec_node_inner(body_ref);
         // Restore: truncate bindings and marks to pre-call state, discarding

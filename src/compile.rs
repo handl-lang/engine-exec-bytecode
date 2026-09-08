@@ -288,6 +288,14 @@ fn compile_arr(
             out.push(Instr::EvalChild(idx as usize));
             return Ok(false);
         }
+        "proj_child_or" => {
+            // Like `proj_child`, but tolerates an absent child (pushes null).
+            let idx = lit.and_then(|v| v.as_u64()).ok_or_else(|| {
+                LangError::engine_node("proj_child_or: missing index literal".to_string(), node)
+            })?;
+            out.push(Instr::EvalChildOr(idx as usize));
+            return Ok(false);
+        }
         "extend_env" => {
             let name = lit.and_then(|v| v.as_str()).ok_or_else(|| {
                 LangError::engine_node("extend_env: missing name literal".to_string(), node)
@@ -348,10 +356,10 @@ fn compile_arr(
     }
 
     // Hot-path optimization for `object` with static keys: when the object
-    // node's payload has a `children` array of entry nodes whose key children
-    // are all `var` or `string` kind (static keys known at compile time),
-    // pre-extract the keys into `Rc<[Rc<str>]>` and emit `EvalNode` for each
-    // value followed by `MakeObj { keys }`. This avoids per-evaluation
+    // node's payload has a `children` array of `entry` nodes whose `key`
+    // role is declared literal (`literal_children`, ADR-0081), pre-extract
+    // the keys into `Rc<[Rc<str>]>` and emit `EvalNode` for each value
+    // followed by `MakeObj { keys }`. This avoids per-evaluation
     // `Rc::from(key)` allocation for object field names — the keys are
     // allocated once at compile time and reused (refcount bump) on every
     // iteration. Falls back to `NativeOp("object", n)` for dynamic
@@ -381,6 +389,7 @@ fn compile_arr(
         if let Some(closure) = try_extract_closure_params_body(lang, ast, node)? {
             out.push(Instr::Closure {
                 params: closure.params,
+                rest: closure.rest,
                 body: closure.body,
             });
             return Ok(false);
@@ -494,11 +503,15 @@ fn try_extract_static_object_keys(
         Some(c) => c,
         None => return Ok(None),
     };
+    let start = match lang.child_role_index(&node.kind, "entries")? {
+        Some(i) => i,
+        None => 0,
+    };
 
-    let mut keys: Vec<Rc<str>> = Vec::with_capacity(children.len());
-    let mut value_indices: Vec<usize> = Vec::with_capacity(children.len());
+    let mut keys: Vec<Rc<str>> = Vec::with_capacity(children.len().saturating_sub(start));
+    let mut value_indices: Vec<usize> = Vec::with_capacity(children.len().saturating_sub(start));
 
-    for entry in children {
+    for entry in children.iter().skip(start) {
         let entry_idx = match entry.as_u64() {
             Some(idx) => idx as usize,
             None => return Ok(None),
@@ -512,11 +525,13 @@ fn try_extract_static_object_keys(
             Some(c) => c,
             None => return Ok(None),
         };
-        let key_idx = match entry_children.get(0).and_then(|v| v.as_u64()) {
+        let key_role = lang.child_role_index(&entry_node.kind, "key")?.unwrap_or(0);
+        let val_role = lang.child_role_index(&entry_node.kind, "value")?.unwrap_or(1);
+        let key_idx = match entry_children.get(key_role).and_then(|v| v.as_u64()) {
             Some(idx) => idx as usize,
             None => return Ok(None),
         };
-        let val_idx = match entry_children.get(1).and_then(|v| v.as_u64()) {
+        let val_idx = match entry_children.get(val_role).and_then(|v| v.as_u64()) {
             Some(idx) => idx as usize,
             None => return Ok(None),
         };
@@ -529,7 +544,9 @@ fn try_extract_static_object_keys(
         // non-lowering path and role-less shapes (see doc comment above).
         let is_literal_key = lang
             .literal_child(&entry_node.kind, "key", &key_node.kind)
-            .unwrap_or_else(|| matches!(key_node.kind.as_str(), "var" | "string"));
+            .unwrap_or_else(|| {
+                matches!(key_node.kind.as_str(), "var" | "string")
+            });
         let key_str: String = if is_literal_key {
             match key_node.payload.as_str() {
                 Some(s) => s.to_string(),
@@ -563,6 +580,8 @@ fn try_extract_static_object_keys(
 /// arena index.
 struct StaticClosure {
     params: Rc<[String]>,
+    /// Rest/variadic param name (`[a, ...rest] ~> body`), if declared.
+    rest: Option<Rc<str>>,
     body: usize,
 }
 
@@ -602,8 +621,13 @@ fn try_extract_closure_params_body(
             };
             names.push(s.to_string());
         }
+        let rest = payload
+            .get("rest")
+            .and_then(|v| v.as_str())
+            .map(Rc::from);
         return Ok(Some(StaticClosure {
             params: Rc::from(names),
+            rest,
             body: b as usize,
         }));
     }
@@ -623,38 +647,17 @@ fn try_extract_closure_params_body(
         // shape declaring a variadic role (e.g. `params`) is a param list;
         // the legacy `paren`/`array` kinds remain only as the role-less
         // fallback.
-        let names: Vec<String> = if lang.has_variadic_role(&param_node.kind) {
-            let param_children = match param_node
-                .payload
-                .get("children")
-                .and_then(|c| c.as_array())
-            {
-                Some(c) => c,
-                None => return Ok(None),
-            };
-            let mut names = Vec::with_capacity(param_children.len());
-            for pc in param_children {
-                let pidx = match pc.as_u64() {
-                    Some(idx) => idx as usize,
-                    None => return Ok(None),
-                };
-                let pnode = ast.at(AstRef::new(pidx))?;
-                let pname = match pnode.payload.as_str() {
-                    Some(s) => s,
-                    None => return Ok(None),
-                };
-                names.push(pname.to_string());
-            }
-            names
-        } else {
-            let pname = match param_node.payload.as_str() {
-                Some(s) => s,
-                None => return Ok(None),
-            };
-            vec![pname.to_string()]
+        // `param_names` resolves fixed params plus an optional rest param
+        // (`...name`) data-driven via `pattern_role`/variadic metadata
+        // (ADR-0081). `Err` (unresolvable param shape) falls back to the
+        // runtime `NativeOp("closure")` path like `Ok(None)`.
+        let (names, rest) = match lang.param_names(ast, param_node) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
         };
         return Ok(Some(StaticClosure {
             params: Rc::from(names),
+            rest: rest.map(Rc::from),
             body: body_idx,
         }));
     }
