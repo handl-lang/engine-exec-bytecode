@@ -1130,8 +1130,11 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                         // `[expr]:` are desugared to `paren { expr }`
                         // before eval (ADR-0058), so they fall into the
                         // `else` branch. Mirrors the v2 tree-walk's object
-                        // prim. Role-less shapes fall back to the legacy
-                        // `var`/`string` kind heuristic.
+                        // prim. The `var`/`string` fallback below is for the
+                        // non-lowering path and role-less shapes; it is
+                        // bypassed when `BytecodeEngine::with_lowering()` has
+                        // normalized `string` keys to `var` and the `entry`
+                        // shape declares `literal_children` for `key`.
                         let key_node = self.ast.at(AstRef::new(key_idx))?;
                         let is_literal_key = self
                             .lang

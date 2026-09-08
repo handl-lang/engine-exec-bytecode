@@ -474,8 +474,12 @@ struct StaticObjectKeys {
 /// `var`/`string`; the payload string is used directly as the key — see
 /// the `object` handler in `vm.rs`). Computed keys (e.g. `[expr]:`
 /// desugared to `paren`) cause this function to return `None`, so the
-/// compiler falls back to `NativeOp("object", n)`. Shapes that declare no
-/// `literal_children` list keep the legacy `var`/`string` heuristic.
+/// compiler falls back to `NativeOp("object", n)`.
+///
+/// The `var`/`string` kind fallback below is redundant when the `lower`
+/// pass has normalized `string` keys to `var` (`BytecodeEngine::with_lowering`),
+/// and when the `entry` shape declares `literal_children` for `key`. It is
+/// retained only for the non-lowering path and for role-less `entry` shapes.
 ///
 /// Returns `None` if the payload shape is not `children` (e.g. the `entries`
 /// rich-payload shape) or if any key is dynamic.
@@ -521,8 +525,8 @@ fn try_extract_static_object_keys(
         // Static keys are declared literal for the `key` role by the entry
         // shape (`literal_children`, ADR-0081). The key string is the node's
         // payload. Computed keys (e.g. `paren` from `[expr]:` desugaring)
-        // fall back to `NativeOp`. Role-less shapes fall back to the legacy
-        // `var`/`string` kind heuristic.
+        // fall back to `NativeOp`. The `var`/`string` fallback is for the
+        // non-lowering path and role-less shapes (see doc comment above).
         let is_literal_key = lang
             .literal_child(&entry_node.kind, "key", &key_node.kind)
             .unwrap_or_else(|| matches!(key_node.kind.as_str(), "var" | "string"));
