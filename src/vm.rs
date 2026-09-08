@@ -1083,8 +1083,12 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 } else if let Some(children) =
                     node.payload.get("children").and_then(|c| c.as_array())
                 {
+                    let start = self
+                        .lang
+                        .child_role_index(&node.kind, "entries")?
+                        .unwrap_or(0);
                     let mut obj = FxHashMap::default();
-                    for entry in children {
+                    for entry in children.iter().skip(start) {
                         let entry_idx = entry.as_u64().ok_or_else(|| {
                             LangError::engine_node(
                                 "object: entry index must be a number".to_string(),
@@ -1102,25 +1106,29 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                                     node,
                                 )
                             })?;
-                        let key_idx =
-                            entry_children
-                                .get(0)
-                                .and_then(|v| v.as_u64())
-                                .ok_or_else(|| {
-                                    LangError::engine_node(
-                                        "object: entry missing key child".to_string(),
-                                        node,
-                                    )
-                                })? as usize;
-                        let val_idx =
-                            entry_children
-                                .get(1)
-                                .and_then(|v| v.as_u64())
-                                .ok_or_else(|| {
-                                    LangError::engine(
-                                        "object: entry missing value child".to_string(),
-                                    )
-                                })? as usize;
+                        let key_role = self
+                            .lang
+                            .child_role_index(&entry_node.kind, "key")?
+                            .unwrap_or(0);
+                        let val_role = self
+                            .lang
+                            .child_role_index(&entry_node.kind, "value")?
+                            .unwrap_or(1);
+                        let key_idx = entry_children
+                            .get(key_role)
+                            .and_then(|v| v.as_u64())
+                            .ok_or_else(|| {
+                                LangError::engine_node(
+                                    "object: entry missing key child".to_string(),
+                                    node,
+                                )
+                            })? as usize;
+                        let val_idx = entry_children
+                            .get(val_role)
+                            .and_then(|v| v.as_u64())
+                            .ok_or_else(|| {
+                                LangError::engine("object: entry missing value child".to_string())
+                            })? as usize;
                         // Object key: a literal key child (the entry shape
                         // declares `literal_children: { key: [...] }`,
                         // ADR-0081) uses its payload as the key string
