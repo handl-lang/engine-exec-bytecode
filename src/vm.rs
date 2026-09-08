@@ -120,6 +120,21 @@ impl ScopeStack {
         self.bindings.push((Rc::from(name), value));
     }
 
+    /// Assign `name = value`: update the nearest existing binding (the
+    /// innermost *visible* binding — a reverse linear scan over `bindings`,
+    /// which mirrors the tree-walk `ScopeStack::assign` scope walk), or
+    /// define it in the innermost scope when the name is not already bound.
+    /// See the tree-walk engine for the ADR-0074 feedback-wire rationale.
+    pub(crate) fn assign(&mut self, name: &str, value: TaggedValue) {
+        for (n, v) in self.bindings.iter_mut().rev() {
+            if n.as_ref() == name {
+                *v = value;
+                return;
+            }
+        }
+        self.define(name, value);
+    }
+
     /// Push a new empty scope by recording the current bindings length.
     pub(crate) fn push_scope(&mut self) {
         self.marks.push(self.bindings.len());
@@ -1866,7 +1881,10 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     }
                 };
                 let value = self.exec_node_inner(AstRef::new(value_idx))?;
-                self.scopes.define(&var_name, value.clone());
+                // `x = y` updates the nearest enclosing binding when `x`
+                // is already bound (ADR-0074 feedback wires); otherwise it
+                // defines a block-local binding.
+                self.scopes.assign(&var_name, value.clone());
                 result = value;
             } else {
                 result = self.exec_node_inner(AstRef::new(idx))?;
