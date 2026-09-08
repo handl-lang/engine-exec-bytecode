@@ -1798,10 +1798,30 @@ impl<'a, 'h> VmFrame<'a, 'h> {
         let bindings = resolver
             .resolve_import(&path)
             .map_err(|e| LangError::engine_node(format!("import \"{}\": {}", path, e), node))?;
-        // If an alias is present (`from "path" import * as alias`), bind the
-        // whole module object to that name. Otherwise bind each top-level
-        // export into the current scope.
-        if let Some(alias) = node.payload.get("alias").and_then(|v| v.as_str()) {
+        // Binding semantics mirror the tree-walk `prim_import` (ADR-0096):
+        // `names` (non-"*") projects a single export, `alias` alone binds
+        // the whole module object, otherwise each export is spliced into
+        // the current scope.
+        let names = node
+            .payload
+            .get("names")
+            .and_then(|v| v.as_str())
+            .filter(|n| *n != "*");
+        let alias = node.payload.get("alias").and_then(|v| v.as_str());
+        if let Some(imported) = names {
+            let exported = match &bindings {
+                Value::Object(map) => map.get(imported).cloned(),
+                _ => None,
+            };
+            let value = exported.ok_or_else(|| {
+                LangError::engine_node(
+                    format!("import \"{}\": module has no export `{}`", path, imported),
+                    node,
+                )
+            })?;
+            self.scopes
+                .define(alias.unwrap_or(imported), TaggedValue::from(value));
+        } else if let Some(alias) = alias {
             self.scopes
                 .define(alias, TaggedValue::from(bindings.clone()));
         } else if let Value::Object(map) = bindings {
