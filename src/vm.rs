@@ -1139,9 +1139,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                         let is_literal_key = self
                             .lang
                             .literal_child(&entry_node.kind, "key", &key_node.kind)
-                            .unwrap_or_else(|| {
-                                matches!(key_node.kind.as_str(), "var" | "string")
-                            });
+                            .unwrap_or_else(|| matches!(key_node.kind.as_str(), "var" | "string"));
                         let key = if is_literal_key {
                             key_node
                                 .payload
@@ -1782,14 +1780,15 @@ impl<'a, 'h> VmFrame<'a, 'h> {
         let resolver = self.import_resolver.ok_or_else(|| {
             LangError::engine_node("import: no import resolver configured".to_string(), node)
         })?;
-        let bindings = resolver.resolve_import(&path).map_err(|e| {
-            LangError::engine_node(format!("import \"{}\": {}", path, e), node)
-        })?;
+        let bindings = resolver
+            .resolve_import(&path)
+            .map_err(|e| LangError::engine_node(format!("import \"{}\": {}", path, e), node))?;
         // If an alias is present (`from "path" import * as alias`), bind the
         // whole module object to that name. Otherwise bind each top-level
         // export into the current scope.
         if let Some(alias) = node.payload.get("alias").and_then(|v| v.as_str()) {
-            self.scopes.define(alias, TaggedValue::from(bindings.clone()));
+            self.scopes
+                .define(alias, TaggedValue::from(bindings.clone()));
         } else if let Value::Object(map) = bindings {
             for (name, val) in map {
                 self.scopes.define(&name, TaggedValue::from(val.clone()));
@@ -1837,10 +1836,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
         let mut result = TaggedValue::Null;
         for entry in children.iter() {
             let idx = entry.as_u64().ok_or_else(|| {
-                LangError::engine_node(
-                    "eval_block: child index must be a number".to_string(),
-                    node,
-                )
+                LangError::engine_node("eval_block: child index must be a number".to_string(), node)
             })? as usize;
             let child_node = self.ast.at(AstRef::new(idx))?;
 
@@ -3096,8 +3092,9 @@ mod tests {
             }
         }
 
-        let resolver: Rc<dyn ImportResolver> =
-            Rc::new(StubResolver { bindings: json!({"x": 42, "y": "hi"}) });
+        let resolver: Rc<dyn ImportResolver> = Rc::new(StubResolver {
+            bindings: json!({"x": 42, "y": "hi"}),
+        });
 
         let mut lang = Language::new();
         // var -> proj_env $payload
@@ -3115,7 +3112,11 @@ mod tests {
                 "stmt.import",
                 Scheme::arr_native(
                     "import",
-                    vec![Scheme::arr_native_lit("proj_child", vec![], Value::from(0u64))],
+                    vec![Scheme::arr_native_lit(
+                        "proj_child",
+                        vec![],
+                        Value::from(0u64),
+                    )],
                 ),
             ))
             .unwrap();
@@ -3145,7 +3146,11 @@ mod tests {
                 "stmt.import",
                 Scheme::arr_native(
                     "import",
-                    vec![Scheme::arr_native_lit("const", vec![], Value::from("m.hnl"))],
+                    vec![Scheme::arr_native_lit(
+                        "const",
+                        vec![],
+                        Value::from("m.hnl"),
+                    )],
                 ),
             ))
             .unwrap();
@@ -3166,8 +3171,9 @@ mod tests {
             }
         }
 
-        let resolver: Rc<dyn ImportResolver> =
-            Rc::new(StubResolver { bindings: json!({"x": 42 }) });
+        let resolver: Rc<dyn ImportResolver> = Rc::new(StubResolver {
+            bindings: json!({"x": 42 }),
+        });
 
         let mut lang = Language::new();
         lang.eval
@@ -3190,7 +3196,11 @@ mod tests {
                 "stmt.import",
                 Scheme::arr_native(
                     "import",
-                    vec![Scheme::arr_native_lit("proj_child", vec![], Value::from(0u64))],
+                    vec![Scheme::arr_native_lit(
+                        "proj_child",
+                        vec![],
+                        Value::from(0u64),
+                    )],
                 ),
             ))
             .unwrap();
