@@ -289,7 +289,7 @@ impl handl_runtime::CompileEngine for BytecodeCompileEngine {
 /// engine cannot express without an escape hatch (e.g. copying a child
 /// payload into a newly-created leaf).  They are registered only when the
 /// `BytecodeEngine` opts in to `with_lowering`.
-fn lower_natives() -> NativeRewriteRegistry {
+pub(crate) fn lower_natives() -> NativeRewriteRegistry {
     let mut reg = NativeRewriteRegistry::new();
     reg.register(
         "lower.object_key",
@@ -840,5 +840,60 @@ mod tests {
         ]);
         let req = EvalRequest::new(ast);
         assert_eq!(engine.eval(&lang, &req).unwrap(), json!(6));
+    }
+
+    #[test]
+    fn lower_object_key_bypasses_string_kind_heuristic() {
+        use handl_language::{
+            AstShapeDef, ChildRoleSpec, TransformCondition, TransformDef, TransformRule,
+        };
+
+        let mut lang = Language::new();
+        lang.ast
+            .merge(
+                AstShapeDef::new("ast.entry", "entry").with_children(vec![
+                    ChildRoleSpec {
+                        role: "key".into(),
+                        variadic: false,
+                    },
+                    ChildRoleSpec {
+                        role: "value".into(),
+                        variadic: false,
+                    },
+                ]),
+            )
+            .unwrap();
+        lang.transforms
+            .merge(
+                TransformDef::new(
+                    "transform.lower.entry",
+                    "lower",
+                    "entry",
+                    TransformRule::Native("lower.object_key".into()),
+                )
+                .with_when(TransformCondition::KindAt {
+                    index: None,
+                    role: Some("key".into()),
+                    kind: "string".into(),
+                }),
+            )
+            .unwrap();
+
+        let ast = make_ast(vec![
+            AstNode::new("string").with_payload(json!("x")),
+            AstNode::new("value").with_payload(json!({"value": 1})),
+            AstNode::new("entry").with_payload(json!({"children": [0, 1]})),
+        ]);
+        let root = AstRef::new(ast.len() - 1);
+        let engine = RewriteEngine::new()
+            .with_native_registry(Arc::new(super::lower_natives()) as Arc<dyn NativeRewrite>);
+        let out = engine.run_pass(&lang, &ast, root, "lower").unwrap();
+
+        let out_entry = out.ast.at(out.root).unwrap();
+        let children = out_entry.payload.get("children").unwrap().as_array().unwrap();
+        let key_idx = children[0].as_u64().unwrap() as usize;
+        let key_node = out.ast.at(AstRef::new(key_idx)).unwrap();
+        assert_eq!(key_node.kind, "var");
+        assert_eq!(key_node.payload, json!("x"));
     }
 }
