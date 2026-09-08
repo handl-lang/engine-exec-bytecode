@@ -288,6 +288,14 @@ fn compile_arr(
             out.push(Instr::EvalChild(idx as usize));
             return Ok(false);
         }
+        "proj_child_or" => {
+            // Like `proj_child`, but tolerates an absent child (pushes null).
+            let idx = lit.and_then(|v| v.as_u64()).ok_or_else(|| {
+                LangError::engine_node("proj_child_or: missing index literal".to_string(), node)
+            })?;
+            out.push(Instr::EvalChildOr(idx as usize));
+            return Ok(false);
+        }
         "extend_env" => {
             let name = lit.and_then(|v| v.as_str()).ok_or_else(|| {
                 LangError::engine_node("extend_env: missing name literal".to_string(), node)

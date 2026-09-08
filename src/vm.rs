@@ -494,6 +494,23 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     let result = self.exec_node_inner(child_ref)?;
                     stack.push(result);
                 }
+                Instr::EvalChildOr(n) => {
+                    // Like EvalChild, but tolerates an absent child index
+                    // (e.g. an optional `else` child) — pushes null.
+                    let arena_idx = node
+                        .payload
+                        .get("children")
+                        .and_then(|c| c.as_array())
+                        .and_then(|children| children.get(*n))
+                        .and_then(|v| v.as_u64());
+                    match arena_idx {
+                        Some(i) => {
+                            let result = self.exec_node_inner(AstRef::new(i as usize))?;
+                            stack.push(result);
+                        }
+                        None => stack.push(TaggedValue::Null),
+                    }
+                }
                 Instr::Store(name) => {
                     let val = stack.pop().ok_or_else(|| {
                         LangError::engine_node("stack underflow on Store".to_string(), node)
