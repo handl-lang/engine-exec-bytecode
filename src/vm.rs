@@ -1602,10 +1602,6 @@ impl<'a, 'h> VmFrame<'a, 'h> {
             // `name` and `children: [value_idx, body_idx]`; evaluate value,
             // extend env with name=value, evaluate body, pop scope.
             "bind" => self.prim_v2_bind(node),
-            // `eval_let` — v0.1 `let` evaluation. Same payload format as
-            // `bind` (`{"name": ..., "children": [value, body]}`), so
-            // dispatch to the same handler.
-            "eval_let" => self.prim_v2_bind(node),
             // ADR-0060: json node payload is the JSON template string. When
             // the json node has children (desugared from json{...}(args)),
             // child 0 is the template node and children 1..N are args.
