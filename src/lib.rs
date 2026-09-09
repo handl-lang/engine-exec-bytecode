@@ -62,7 +62,7 @@ pub use instr::Instr;
 
 use handl_language::{Ast, AstRef, LangError, Language, SchemeVersion, Value};
 use handl_plugin_engine_exec::{EvalEngine, EvalRequest};
-use handl_plugin_engine_exec_tree_walk::{register_home_frame, EvalFrame as TreeWalkEvalFrame};
+use handl_plugin_engine_exec_tree_walk::{EvalFrame as TreeWalkEvalFrame, register_home_frame};
 use handl_plugin_engine_transform::native::{NativeRewrite, NativeRewriteRegistry, RewriteCtx};
 use handl_plugin_engine_transform_rewrite::RewriteEngine;
 use handl_value::TaggedValue;
@@ -187,8 +187,12 @@ impl BytecodeEngine {
         };
 
         eval_frame.enter(|| {
-            let mut frame =
-                VmFrame::new(ast_ref, &lang, self.modules.as_ref(), self.import_resolver.as_ref());
+            let mut frame = VmFrame::new(
+                ast_ref,
+                &lang,
+                self.modules.as_ref(),
+                self.import_resolver.as_ref(),
+            );
             frame.set_globals(Rc::clone(&globals_rc));
             frame.exec_node(root_ref)
         })
@@ -358,12 +362,9 @@ pub(crate) fn lower_natives() -> NativeRewriteRegistry {
             let key_idx = ctx.child_ref(0).ok_or_else(|| {
                 LangError::engine("lower.object_key: entry missing key child".to_string())
             })?;
-            let key_node = ctx
-                .ast()
-                .get(AstRef::new(key_idx))
-                .ok_or_else(|| {
-                    LangError::engine("lower.object_key: key child out of bounds".to_string())
-                })?;
+            let key_node = ctx.ast().get(AstRef::new(key_idx)).ok_or_else(|| {
+                LangError::engine("lower.object_key: key child out of bounds".to_string())
+            })?;
             if key_node.kind != "string" {
                 return Ok(ctx.pass_through());
             }
@@ -953,18 +954,16 @@ mod tests {
 
         let mut lang = Language::new();
         lang.ast
-            .merge(
-                AstShapeDef::new("ast.entry", "entry").with_children(vec![
-                    ChildRoleSpec {
-                        role: "key".into(),
-                        variadic: false,
-                    },
-                    ChildRoleSpec {
-                        role: "value".into(),
-                        variadic: false,
-                    },
-                ]),
-            )
+            .merge(AstShapeDef::new("ast.entry", "entry").with_children(vec![
+                ChildRoleSpec {
+                    role: "key".into(),
+                    variadic: false,
+                },
+                ChildRoleSpec {
+                    role: "value".into(),
+                    variadic: false,
+                },
+            ]))
             .unwrap();
         lang.transforms
             .merge(
@@ -993,7 +992,12 @@ mod tests {
         let out = engine.run_pass(&lang, &ast, root, "lower").unwrap();
 
         let out_entry = out.ast.at(out.root).unwrap();
-        let children = out_entry.payload.get("children").unwrap().as_array().unwrap();
+        let children = out_entry
+            .payload
+            .get("children")
+            .unwrap()
+            .as_array()
+            .unwrap();
         let key_idx = children[0].as_u64().unwrap() as usize;
         let key_node = out.ast.at(AstRef::new(key_idx)).unwrap();
         assert_eq!(key_node.kind, "var");

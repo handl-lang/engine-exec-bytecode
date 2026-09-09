@@ -77,7 +77,8 @@ fn compile_into(
             Ok(false)
         }
 
-        Term::Op { name: op,
+        Term::Op {
+            name: op,
             args,
             source,
             lit,
@@ -148,7 +149,11 @@ fn compile_into(
             // scope via `capture()`) on every iteration. Mirrors the
             // tree-walk optimization at
             // `plugin-engine-exec-tree-walk/src/lib.rs:402-456`.
-            if let Term::Op { name: op, args, source, ..
+            if let Term::Op {
+                name: op,
+                args,
+                source,
+                ..
             } = body.as_ref()
             {
                 if *source == ArrSource::Native && op == "loop_step" && !args.is_empty() {
@@ -533,7 +538,9 @@ fn try_extract_static_object_keys(
             None => return Ok(None),
         };
         let key_role = lang.child_role_index(&entry_node.kind, "key")?.unwrap_or(0);
-        let val_role = lang.child_role_index(&entry_node.kind, "value")?.unwrap_or(1);
+        let val_role = lang
+            .child_role_index(&entry_node.kind, "value")?
+            .unwrap_or(1);
         let key_idx = match entry_children.get(key_role).and_then(|v| v.as_u64()) {
             Some(idx) => idx as usize,
             None => return Ok(None),
@@ -551,9 +558,7 @@ fn try_extract_static_object_keys(
         // non-lowering path and role-less shapes (see doc comment above).
         let is_literal_key = lang
             .literal_child(&entry_node.kind, "key", &key_node.kind)
-            .unwrap_or_else(|| {
-                matches!(key_node.kind.as_str(), "var" | "string")
-            });
+            .unwrap_or_else(|| matches!(key_node.kind.as_str(), "var" | "string"));
         let key_str: String = if is_literal_key {
             match key_node.payload.as_str() {
                 Some(s) => s.to_string(),
@@ -628,10 +633,7 @@ fn try_extract_closure_params_body(
             };
             names.push(s.to_string());
         }
-        let rest = payload
-            .get("rest")
-            .and_then(|v| v.as_str())
-            .map(Rc::from);
+        let rest = payload.get("rest").and_then(|v| v.as_str()).map(Rc::from);
         return Ok(Some(StaticClosure {
             params: Rc::from(names),
             rest,

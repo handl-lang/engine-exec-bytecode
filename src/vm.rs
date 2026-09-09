@@ -1167,8 +1167,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                         // `...expr` syntax), flatten its value into the
                         // array if it's an array. Mirrors the tree-walk
                         // implementation.
-                        if self.ast.get(AstRef::new(idx)).map(|n| n.kind.as_str()) == Some("rest")
-                        {
+                        if self.ast.get(AstRef::new(idx)).map(|n| n.kind.as_str()) == Some("rest") {
                             let val = self.exec_node_inner(AstRef::new(idx))?;
                             if let TaggedValue::Arr(arr) = val {
                                 result.extend(arr.iter().cloned());
@@ -1890,8 +1889,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                         })
                     }
                     (TaggedValue::Str(s), TaggedValue::Str(key)) => {
-                        let joined: Rc<str> =
-                            Rc::from(format!("{}.{}", s.as_ref(), key.as_ref()));
+                        let joined: Rc<str> = Rc::from(format!("{}.{}", s.as_ref(), key.as_ref()));
                         Ok(TaggedValue::Str(joined))
                     }
                     (target, field) => Err(LangError::engine_node(
@@ -1939,13 +1937,9 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                         LangError::engine_node("flow: no module registry".to_string(), node)
                     })?;
                     let func = modules.lookup(name).ok_or_else(|| {
-                        LangError::engine_node(
-                            format!("flow: function '{}' not found", name),
-                            node,
-                        )
+                        LangError::engine_node(format!("flow: function '{}' not found", name), node)
                     })?;
-                    let call_args: Vec<Value> =
-                        actual_args.iter().map(tagged_to_value).collect();
+                    let call_args: Vec<Value> = actual_args.iter().map(tagged_to_value).collect();
                     let mut pctx = handl_platform::EvalContext::new();
                     let val = func
                         .call(&call_args, &mut pctx)
@@ -1967,7 +1961,10 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     .get("kind")
                     .and_then(|v| v.as_str())
                     .unwrap_or("desugar-error");
-                Err(LangError::engine_node(format!("{}: {}", kind, reason), node))
+                Err(LangError::engine_node(
+                    format!("{}: {}", kind, reason),
+                    node,
+                ))
             }
             "left" => {
                 let f = args.first().cloned().unwrap_or(TaggedValue::Null);
@@ -1981,7 +1978,10 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 } else if is_either_right(&input) {
                     Ok(input)
                 } else {
-                    Err(LangError::engine_node("left: input is not an either".to_string(), node))
+                    Err(LangError::engine_node(
+                        "left: input is not an either".to_string(),
+                        node,
+                    ))
                 }
             }
             "right" => {
@@ -2017,7 +2017,10 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     let gv = self.apply_app(&g, &[v])?;
                     Ok(either_right(gv))
                 } else {
-                    Err(LangError::engine_node("sum: input is not an either".to_string(), node))
+                    Err(LangError::engine_node(
+                        "sum: input is not an either".to_string(),
+                        node,
+                    ))
                 }
             }
             "runtime_assert" => {
@@ -2035,28 +2038,27 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     .lang
                     .child_role_index(&node.kind, "predicate")?
                     .unwrap_or(0);
-                let expr_idx = self
-                    .lang
-                    .child_role_index(&node.kind, "expr")?
-                    .unwrap_or(1);
-                let pred_arena = children
-                    .get(pred_idx)
-                    .and_then(|v| v.as_u64())
-                    .ok_or_else(|| {
-                        LangError::engine_node(
-                            format!("runtime_assert: predicate child {} not found", pred_idx),
-                            node,
-                        )
-                    })? as usize;
-                let expr_arena = children
-                    .get(expr_idx)
-                    .and_then(|v| v.as_u64())
-                    .ok_or_else(|| {
-                        LangError::engine_node(
-                            format!("runtime_assert: expr child {} not found", expr_idx),
-                            node,
-                        )
-                    })? as usize;
+                let expr_idx = self.lang.child_role_index(&node.kind, "expr")?.unwrap_or(1);
+                let pred_arena =
+                    children
+                        .get(pred_idx)
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| {
+                            LangError::engine_node(
+                                format!("runtime_assert: predicate child {} not found", pred_idx),
+                                node,
+                            )
+                        })? as usize;
+                let expr_arena =
+                    children
+                        .get(expr_idx)
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| {
+                            LangError::engine_node(
+                                format!("runtime_assert: expr child {} not found", expr_idx),
+                                node,
+                            )
+                        })? as usize;
                 let pred_val = self.exec_node_inner(AstRef::new(pred_arena))?;
                 let expr_val = self.exec_node_inner(AstRef::new(expr_arena))?;
                 if !matches!(pred_val, TaggedValue::Arrow { .. }) {
@@ -2961,7 +2963,7 @@ fn eval_bin_cmp(instr: &Instr, a: TaggedValue, b: TaggedValue) -> Result<TaggedV
 #[cfg(test)]
 mod tests {
     use super::*;
-    use handl_language::{Ast, AstNode, EvalSchemeDef, Language, Term, SchemeVersion};
+    use handl_language::{Ast, AstNode, EvalSchemeDef, Language, SchemeVersion, Term};
     use handl_platform::{EvalContext, Function, Module, ModuleLookup};
     use handl_plugin_engine_exec::ImportResolver;
     use handl_plugin_module::ModuleRegistry;
@@ -3850,11 +3852,7 @@ mod tests {
                 "stmt.import",
                 Term::arr_native(
                     "import",
-                    vec![Term::arr_native_lit(
-                        "const",
-                        vec![],
-                        Value::from("m.hnl"),
-                    )],
+                    vec![Term::arr_native_lit("const", vec![], Value::from("m.hnl"))],
                 ),
             ))
             .unwrap();
