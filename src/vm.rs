@@ -1905,6 +1905,123 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     self.apply_app(callee, &actual_args)
                 }
             }
+            "export" => Ok(args.first().cloned().unwrap_or(TaggedValue::Null)),
+            "desugar_error" => {
+                let reason = node
+                    .payload
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown desugar error");
+                let kind = node
+                    .payload
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("desugar-error");
+                Err(LangError::engine_node(format!("{}: {}", kind, reason), node))
+            }
+            "left" => {
+                let f = args.first().cloned().unwrap_or(TaggedValue::Null);
+                let input = incoming
+                    .or_else(|| args.get(1).cloned())
+                    .unwrap_or(TaggedValue::Null);
+                if is_either_left(&input) {
+                    let v = either_value(&input).cloned().unwrap_or(TaggedValue::Null);
+                    let fv = self.apply_app(&f, &[v])?;
+                    Ok(either_left(fv))
+                } else if is_either_right(&input) {
+                    Ok(input)
+                } else {
+                    Err(LangError::engine_node("left: input is not an either".to_string(), node))
+                }
+            }
+            "right" => {
+                let f = args.first().cloned().unwrap_or(TaggedValue::Null);
+                let input = incoming
+                    .or_else(|| args.get(1).cloned())
+                    .unwrap_or(TaggedValue::Null);
+                if is_either_right(&input) {
+                    let v = either_value(&input).cloned().unwrap_or(TaggedValue::Null);
+                    let fv = self.apply_app(&f, &[v])?;
+                    Ok(either_right(fv))
+                } else if is_either_left(&input) {
+                    Ok(input)
+                } else {
+                    Err(LangError::engine_node(
+                        "right: input is not an either".to_string(),
+                        node,
+                    ))
+                }
+            }
+            "sum" => {
+                let f = args.first().cloned().unwrap_or(TaggedValue::Null);
+                let g = args.get(1).cloned().unwrap_or(TaggedValue::Null);
+                let input = incoming
+                    .or_else(|| args.get(2).cloned())
+                    .unwrap_or(TaggedValue::Null);
+                if is_either_left(&input) {
+                    let v = either_value(&input).cloned().unwrap_or(TaggedValue::Null);
+                    let fv = self.apply_app(&f, &[v])?;
+                    Ok(either_left(fv))
+                } else if is_either_right(&input) {
+                    let v = either_value(&input).cloned().unwrap_or(TaggedValue::Null);
+                    let gv = self.apply_app(&g, &[v])?;
+                    Ok(either_right(gv))
+                } else {
+                    Err(LangError::engine_node("sum: input is not an either".to_string(), node))
+                }
+            }
+            "runtime_assert" => {
+                let children = node
+                    .payload
+                    .get("children")
+                    .and_then(|c| c.as_array())
+                    .ok_or_else(|| {
+                        LangError::engine_node(
+                            "runtime_assert: expected children array in payload".to_string(),
+                            node,
+                        )
+                    })?;
+                let pred_idx = self
+                    .lang
+                    .child_role_index(&node.kind, "predicate")?
+                    .unwrap_or(0);
+                let expr_idx = self
+                    .lang
+                    .child_role_index(&node.kind, "expr")?
+                    .unwrap_or(1);
+                let pred_arena = children
+                    .get(pred_idx)
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| {
+                        LangError::engine_node(
+                            format!("runtime_assert: predicate child {} not found", pred_idx),
+                            node,
+                        )
+                    })? as usize;
+                let expr_arena = children
+                    .get(expr_idx)
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| {
+                        LangError::engine_node(
+                            format!("runtime_assert: expr child {} not found", expr_idx),
+                            node,
+                        )
+                    })? as usize;
+                let pred_val = self.exec_node_inner(AstRef::new(pred_arena))?;
+                let expr_val = self.exec_node_inner(AstRef::new(expr_arena))?;
+                if !matches!(pred_val, TaggedValue::Arrow { .. }) {
+                    return Ok(expr_val);
+                }
+                let check_result = self.apply_app(&pred_val, &[expr_val.clone()])?;
+                if is_truthy(&check_result) {
+                    Ok(expr_val)
+                } else {
+                    Err(LangError::engine_node(
+                        "runtime_assert: assertion failed — predicate returned false".to_string(),
+                        node,
+                    ))
+                }
+            }
             _ => Err(LangError::engine_node(
                 format!("unknown v2 native op: {}", op),
                 node,
