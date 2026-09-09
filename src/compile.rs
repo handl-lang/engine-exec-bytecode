@@ -249,6 +249,8 @@ fn compile_into(
                 .map_err(|e| LangError::engine_node(e.to_string(), node))?;
             compile_into(&eliminated, lang, ast, node, out)
         }
+
+        Term::Rewrite { .. } => Err(LangError::NotImplemented),
     }
 }
 
