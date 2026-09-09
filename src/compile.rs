@@ -260,9 +260,22 @@ fn compile_into(
 
         Term::Iter { .. } => Err(LangError::NotImplemented),
         Term::Child { .. } => Err(LangError::NotImplemented),
-        Term::Path { .. } | Term::Equiv { .. } | Term::Transport { .. } => Err(LangError::NotImplemented),
+        Term::Path { .. } => Err(LangError::NotImplemented),
+        Term::Equiv { .. } => Err(LangError::NotImplemented),
+        Term::Transport { .. } => Err(LangError::NotImplemented), // frontier: Transport not yet compiled
+        Term::CellId { .. } => Err(LangError::NotImplemented), // frontier: CellId not yet compiled
+        Term::CellCompV { .. } => Err(LangError::NotImplemented), // frontier: CellCompV not yet compiled
+        Term::CellCompH { .. } => Err(LangError::NotImplemented), // frontier: CellCompH not yet compiled
+        Term::Whisker { .. } => Err(LangError::NotImplemented), // frontier: Whisker not yet compiled
+        Term::Univalence { .. } => Err(LangError::NotImplemented), // frontier: Univalence not yet compiled
+        Term::Glue { .. } => Err(LangError::NotImplemented), // frontier: Glue not yet compiled
+        Term::Fibrant { .. } => Err(LangError::NotImplemented), // frontier: Fibrant not yet compiled
+        Term::JElim { .. } => Err(LangError::NotImplemented), // frontier: JElim not yet compiled
+        Term::Witness { .. } => Err(LangError::NotImplemented), // frontier: Witness not yet compiled
+        Term::Refine { .. } => Err(LangError::NotImplemented), // frontier: Refine not yet compiled
+        Term::Cobind { .. } => Err(LangError::NotImplemented), // frontier: Cobind not yet compiled
+        Term::Cobox { .. } => Err(LangError::NotImplemented), // frontier: Cobox not yet compiled
         Term::Rewrite { .. } => Err(LangError::NotImplemented),
-        _ => Err(LangError::NotImplemented),
     }
 }
 
