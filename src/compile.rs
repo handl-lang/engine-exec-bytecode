@@ -262,6 +262,7 @@ fn compile_into(
         Term::Child { .. } => Err(LangError::NotImplemented),
         Term::Path { .. } | Term::Equiv { .. } | Term::Transport { .. } => Err(LangError::NotImplemented),
         Term::Rewrite { .. } => Err(LangError::NotImplemented),
+        _ => Err(LangError::NotImplemented),
     }
 }
 
