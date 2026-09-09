@@ -2117,6 +2117,25 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     Ok(TaggedValue::Arr(Rc::from(args.to_vec())))
                 }
             }
+            // Frontier: transport a value along a path.
+            "transport" => Ok(args.get(1).cloned().unwrap_or(TaggedValue::Null)),
+            // Frontier: horizontal cell composition.
+            "cell_hcomp" => {
+                let mut map = FxHashMap::default();
+                map.insert(
+                    Rc::from("__tag__"),
+                    TaggedValue::Str(Rc::from("CellCompH")),
+                );
+                map.insert(
+                    Rc::from("left"),
+                    args.first().cloned().unwrap_or(TaggedValue::Null),
+                );
+                map.insert(
+                    Rc::from("right"),
+                    args.get(1).cloned().unwrap_or(TaggedValue::Null),
+                );
+                Ok(TaggedValue::Obj(Rc::new(map)))
+            }
             _ => Err(LangError::engine_node(
                 format!("unknown v2 native op: {}", op),
                 node,
