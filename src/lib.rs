@@ -2,9 +2,9 @@
 //!
 //! The **bytecode eval engine** for the eval operation (ADR-0044 §4, §7).
 //!
-//! This engine compiles [`handl_language::Scheme`] (the v2 arrow-calculus
+//! This engine compiles [`handl_language::Term`] (the v2 arrow-calculus
 //! kernel, ADR-0052) data to a bytecode representation and executes it via a
-//! stack-based VM. It shares the same `Scheme` vocabulary as the
+//! stack-based VM. It shares the same `Term` vocabulary as the
 //! [`handl_plugin_engine_exec_tree_walk`](handl_plugin_engine_exec_tree_walk)
 //! reference interpreter; conformance tests verify both produce **identical
 //! results**.
@@ -12,7 +12,7 @@
 //! ## Compilers erase data dispatch (ADR-0044 §7)
 //!
 //! The tree-walk pays for per-node scheme lookup (`lang.eval[node.kind]` →
-//! `Scheme`) on every execution. The bytecode engine **compiles this lookup
+//! `Term`) on every execution. The bytecode engine **compiles this lookup
 //! away**: at compile time, every node kind's scheme is resolved to a fixed
 //! instruction sequence. The compiled artifact has no hash lookups, no string
 //! matching, no `lang.eval` access at execution time.
@@ -28,7 +28,7 @@
 //! ## Bytecode ISA
 //!
 //! See the [`instr`] module for the full instruction set documentation. The
-//! ISA covers all six `Scheme` combinators (`Arr`, `Seq`, `First`, `Choice`,
+//! ISA covers all six `Term` combinators (`Arr`, `Seq`, `First`, `Choice`,
 //! `Loop`, `App`); see the [`instr`] module's combinator-to-instruction
 //! mapping table for details.
 //!
@@ -62,10 +62,12 @@ pub use instr::Instr;
 
 use handl_language::{Ast, AstRef, LangError, Language, SchemeVersion, Value};
 use handl_plugin_engine_exec::{EvalEngine, EvalRequest};
+use handl_plugin_engine_exec_tree_walk::{register_home_frame, EvalFrame as TreeWalkEvalFrame};
 use handl_plugin_engine_transform::native::{NativeRewrite, NativeRewriteRegistry, RewriteCtx};
 use handl_plugin_engine_transform_rewrite::RewriteEngine;
 use handl_value::TaggedValue;
 use rustc_hash::FxHashMap;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -73,7 +75,7 @@ use vm::VmFrame;
 
 /// The bytecode eval engine.
 ///
-/// Compiles [`Scheme`](handl_language::Scheme) (the v2 arrow-calculus kernel)
+/// Compiles [`Term`](handl_language::Term) (the v2 arrow-calculus kernel)
 /// data to bytecode and executes via a stack-based VM. Construct with
 /// [`BytecodeEngine::new`] and optionally pass a module registry via
 /// [`BytecodeEngine::with_modules`].
@@ -87,7 +89,7 @@ pub struct BytecodeEngine {
     /// The import resolver for `import "path"` statements (Phase 9.5).
     import_resolver: Option<Rc<dyn handl_plugin_engine_exec::ImportResolver>>,
     /// Global variables injected by the host (e.g. `self` -> language value).
-    globals: FxHashMap<Rc<str>, TaggedValue>,
+    globals: HashMap<String, Value>,
     /// Run the `lower` transform pass before evaluation.
     lowering: bool,
 }
@@ -98,7 +100,7 @@ impl BytecodeEngine {
         Self {
             modules: None,
             import_resolver: None,
-            globals: FxHashMap::default(),
+            globals: HashMap::new(),
             lowering: false,
         }
     }
@@ -106,13 +108,13 @@ impl BytecodeEngine {
     /// Create a bytecode engine with a module registry attached.
     ///
     /// The module registry is used for
-    /// [`Scheme::Arr`](handl_language::Scheme::Arr) with
+    /// [`Term::Arr`](handl_language::Term::Arr) with
     /// [`ArrSource::Foreign`](handl_language::ArrSource::Foreign) dispatch.
     pub fn with_modules(modules: Rc<dyn handl_platform::ModuleLookup>) -> Self {
         Self {
             modules: Some(modules),
             import_resolver: None,
-            globals: FxHashMap::default(),
+            globals: HashMap::new(),
             lowering: false,
         }
     }
@@ -126,8 +128,7 @@ impl BytecodeEngine {
     /// Inject a global variable into the root scope (builder style).
     /// ADR-0041 Phase 3: `self` is an ambient variable, not a function call.
     pub fn with_global(mut self, name: &str, value: Value) -> Self {
-        self.globals
-            .insert(Rc::from(name), TaggedValue::from(value));
+        self.globals.insert(name.to_string(), value);
         self
     }
 }
@@ -139,13 +140,14 @@ impl Default for BytecodeEngine {
 }
 
 impl BytecodeEngine {
-    /// Evaluate `ast` (borrowed) — shared core of [`EvalEngine::eval`] and
-    /// [`EvalEngine::eval_shared`].
-    fn eval_ast(&self, lang: &Language, ast: &Ast) -> Result<Value, LangError> {
+    /// Shared core of [`EvalEngine::eval`] and [`EvalEngine::eval_shared`]:
+    /// install the `ast`/`lang`/`modules` in the home-frame thread-locals,
+    /// compile/execute the arena root, and return a `Value`.
+    fn eval_ast_rc(&self, lang: Rc<Language>, ast: Rc<Ast>) -> Result<Value, LangError> {
         if ast.is_empty() {
             return Ok(Value::Null);
         }
-        // Scheme version check -- the engine supports v2 only.
+        // Term version check -- the engine supports v2 only.
         if !SchemeVersion::v2().supports(&lang.scheme_version) {
             return Err(LangError::engine(format!(
                 "unsupported scheme version: {} (engine supports v2)",
@@ -161,29 +163,41 @@ impl BytecodeEngine {
             let root = AstRef::new(ast.len() - 1);
             let engine = RewriteEngine::new()
                 .with_native_registry(Arc::new(lower_natives()) as Arc<dyn NativeRewrite>);
-            let out = engine.run_pass(lang, ast, root, "lower")?;
+            let out = engine.run_pass(&lang, &ast, root, "lower")?;
             (Some(out.ast), out.root)
         } else {
             (None, AstRef::new(ast.len() - 1))
         };
-        let ast = lowered.as_ref().unwrap_or(ast);
+        let ast_ref: &Ast = lowered.as_ref().unwrap_or(&ast);
 
-        let mut frame = VmFrame::new(
-            ast,
-            lang,
-            self.modules.as_ref(),
-            self.import_resolver.as_ref(),
+        // Host-provided globals (e.g. `self`, `__arg_N`). Kept in a separate
+        // `ScopeStack::globals` map so they are not captured into closures.
+        let globals_rc: Rc<FxHashMap<Rc<str>, TaggedValue>> = Rc::new(
+            self.globals
+                .iter()
+                .map(|(k, v)| (Rc::from(k.as_str()), TaggedValue::from(v.clone())))
+                .collect(),
         );
-        for (name, val) in &self.globals {
-            frame.define_global(name, val.clone());
-        }
-        frame.exec_node(root_ref)
+
+        let eval_frame = TreeWalkEvalFrame {
+            ast: Rc::clone(&ast),
+            lang: Rc::clone(&lang),
+            modules: self.modules.clone(),
+            globals: Some(Rc::clone(&globals_rc)),
+        };
+
+        eval_frame.enter(|| {
+            let mut frame =
+                VmFrame::new(ast_ref, &lang, self.modules.as_ref(), self.import_resolver.as_ref());
+            frame.set_globals(Rc::clone(&globals_rc));
+            frame.exec_node(root_ref)
+        })
     }
 }
 
 impl EvalEngine for BytecodeEngine {
     fn eval(&self, lang: &Language, req: &EvalRequest) -> Result<Value, LangError> {
-        self.eval_ast(lang, &req.ast)
+        self.eval_ast_rc(Rc::new(lang.clone()), Rc::new(req.ast.clone()))
     }
 
     /// Borrow the caller's `Rc<Ast>` arena instead of deep-cloning it into
@@ -191,7 +205,7 @@ impl EvalEngine for BytecodeEngine {
     /// re-evaluation of a cached AST (e.g. `plugin-lib-handl`'s
     /// `HandlFunction` bridge) costs zero clones.
     fn eval_shared(&self, lang: &Language, ast: &Rc<Ast>) -> Result<Value, LangError> {
-        self.eval_ast(lang, ast)
+        self.eval_ast_rc(Rc::new(lang.clone()), Rc::clone(ast))
     }
 
     fn box_clone(&self) -> Box<dyn EvalEngine> {
@@ -215,6 +229,36 @@ impl EvalEngine for BytecodeEngine {
         let mut engine = self.clone();
         engine.import_resolver = Some(resolver);
         Box::new(engine)
+    }
+
+    /// Seal a module's exported bindings before they cross into the
+    /// importer's scope (Phase 9.5 `import "path"`).
+    ///
+    /// Registers the module's AST as a home frame and stamps any unhomed
+    /// arrow values so a later engine can route application back here.
+    fn seal_module_value(
+        &self,
+        ast: &Ast,
+        lang: &Language,
+        value: Value,
+    ) -> Result<Value, LangError> {
+        if !contains_unhomed_arrow(&value) {
+            return Ok(value);
+        }
+        let globals: Option<HashMap<String, Value>> = if self.globals.is_empty() {
+            None
+        } else {
+            Some(self.globals.clone())
+        };
+        let frame_id = register_home_frame(
+            Rc::new(ast.clone()),
+            Rc::new(lang.clone()),
+            self.modules.clone(),
+            globals,
+        );
+        let mut value = value;
+        stamp_home(&mut value, frame_id);
+        Ok(value)
     }
 }
 
@@ -333,10 +377,52 @@ pub(crate) fn lower_natives() -> NativeRewriteRegistry {
     reg
 }
 
+/// Whether `value` contains an arrow value (`{"__arrow__": true, ...}`)
+/// that carries no `__home__` frame id — i.e. an arrow whose `body` index
+/// refers to the ambient eval's AST and must be stamped before it crosses
+/// a runtime boundary.
+fn contains_unhomed_arrow(value: &Value) -> bool {
+    match value {
+        Value::Array(a) => a.iter().any(contains_unhomed_arrow),
+        Value::Object(o) => {
+            if o.get("__arrow__").and_then(|v| v.as_bool()) == Some(true) {
+                return o.get("__home__").and_then(|v| v.as_u64()).is_none()
+                    || o.values().any(contains_unhomed_arrow);
+            }
+            o.values().any(contains_unhomed_arrow)
+        }
+        _ => false,
+    }
+}
+
+/// Stamp every arrow value inside `value` that lacks a `__home__` frame id
+/// with `frame_id` — recursively, including arrows nested inside a
+/// closure's captured `env`. Arrows that already carry a `__home__` keep it.
+fn stamp_home(value: &mut Value, frame_id: u64) {
+    match value {
+        Value::Array(a) => {
+            for v in a.iter_mut() {
+                stamp_home(v, frame_id);
+            }
+        }
+        Value::Object(o) => {
+            if o.get("__arrow__").and_then(|v| v.as_bool()) == Some(true)
+                && o.get("__home__").and_then(|v| v.as_u64()).is_none()
+            {
+                o.insert("__home__".to_string(), Value::from(frame_id));
+            }
+            for v in o.values_mut() {
+                stamp_home(v, frame_id);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use handl_language::{AstNode, EvalSchemeDef, Language, Scheme, Value};
+    use handl_language::{AstNode, EvalSchemeDef, Language, Term, Value};
     use handl_platform::{EvalContext, Function, Module, ModuleLookup};
     use handl_plugin_engine_exec::EvalRequest;
     use handl_plugin_module::ModuleRegistry;
@@ -415,7 +501,7 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.const",
                 "const",
-                Scheme::arr_native_lit("const", vec![], json!(99)),
+                Term::arr_native_lit("const", vec![], json!(99)),
             ))
             .unwrap();
         let ast = make_ast(vec![AstNode::new("const")]);
@@ -431,11 +517,11 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.add",
                 "binary.add",
-                Scheme::arr_native(
+                Term::arr_native(
                     "add",
                     vec![
-                        Scheme::arr_native_lit("proj_child", vec![], json!(0u64)),
-                        Scheme::arr_native_lit("proj_child", vec![], json!(1u64)),
+                        Term::arr_native_lit("proj_child", vec![], json!(0u64)),
+                        Term::arr_native_lit("proj_child", vec![], json!(1u64)),
                     ],
                 ),
             ))
@@ -457,19 +543,19 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.var",
                 "var",
-                Scheme::arr_native_lit("proj_env", vec![], "$payload"),
+                Term::arr_native_lit("proj_env", vec![], "$payload"),
             ))
             .unwrap();
         lang.eval
             .merge(EvalSchemeDef::new(
                 "e.let",
                 "let",
-                Scheme::seq(
-                    Scheme::seq(
-                        Scheme::arr_native_lit("proj_child", vec![], json!(0u64)),
-                        Scheme::arr_native_lit("extend_env", vec![], "$payload"),
+                Term::seq(
+                    Term::seq(
+                        Term::arr_native_lit("proj_child", vec![], json!(0u64)),
+                        Term::arr_native_lit("extend_env", vec![], "$payload"),
                     ),
-                    Scheme::arr_native_lit("proj_child", vec![], json!(1u64)),
+                    Term::arr_native_lit("proj_child", vec![], json!(1u64)),
                 ),
             ))
             .unwrap();
@@ -490,14 +576,14 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.if",
                 "if",
-                Scheme::seq(
-                    Scheme::seq(
-                        Scheme::arr_native_lit("proj_child", vec![], json!(0u64)),
-                        Scheme::arr_native("tag", vec![]),
+                Term::seq(
+                    Term::seq(
+                        Term::arr_native_lit("proj_child", vec![], json!(0u64)),
+                        Term::arr_native("tag", vec![]),
                     ),
-                    Scheme::choice(
-                        Scheme::arr_native_lit("proj_child", vec![], json!(1u64)),
-                        Scheme::arr_native_lit("proj_child", vec![], json!(2u64)),
+                    Term::choice(
+                        Term::arr_native_lit("proj_child", vec![], json!(1u64)),
+                        Term::arr_native_lit("proj_child", vec![], json!(2u64)),
                     ),
                 ),
             ))
@@ -520,14 +606,14 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.if",
                 "if",
-                Scheme::seq(
-                    Scheme::seq(
-                        Scheme::arr_native_lit("proj_child", vec![], json!(0u64)),
-                        Scheme::arr_native("tag", vec![]),
+                Term::seq(
+                    Term::seq(
+                        Term::arr_native_lit("proj_child", vec![], json!(0u64)),
+                        Term::arr_native("tag", vec![]),
                     ),
-                    Scheme::choice(
-                        Scheme::arr_native_lit("proj_child", vec![], json!(1u64)),
-                        Scheme::arr_native_lit("proj_child", vec![], json!(2u64)),
+                    Term::choice(
+                        Term::arr_native_lit("proj_child", vec![], json!(1u64)),
+                        Term::arr_native_lit("proj_child", vec![], json!(2u64)),
                     ),
                 ),
             ))
@@ -550,9 +636,9 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.dbl",
                 "dbl",
-                Scheme::arr_foreign(
+                Term::arr_foreign(
                     "double",
-                    vec![Scheme::arr_native_lit("proj_child", vec![], json!(0u64))],
+                    vec![Term::arr_native_lit("proj_child", vec![], json!(0u64))],
                 ),
             ))
             .unwrap();
@@ -572,9 +658,9 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.dbl",
                 "dbl",
-                Scheme::arr_foreign(
+                Term::arr_foreign(
                     "double",
-                    vec![Scheme::arr_native_lit("proj_child", vec![], json!(0u64))],
+                    vec![Term::arr_native_lit("proj_child", vec![], json!(0u64))],
                 ),
             ))
             .unwrap();
@@ -595,19 +681,19 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.var",
                 "var",
-                Scheme::arr_native_lit("proj_env", vec![], "$payload"),
+                Term::arr_native_lit("proj_env", vec![], "$payload"),
             ))
             .unwrap();
         lang.eval
             .merge(EvalSchemeDef::new(
                 "e.let",
                 "let",
-                Scheme::seq(
-                    Scheme::seq(
-                        Scheme::arr_native_lit("proj_child", vec![], json!(0u64)),
-                        Scheme::arr_native_lit("extend_env", vec![], "$payload"),
+                Term::seq(
+                    Term::seq(
+                        Term::arr_native_lit("proj_child", vec![], json!(0u64)),
+                        Term::arr_native_lit("extend_env", vec![], "$payload"),
                     ),
-                    Scheme::arr_native_lit("proj_child", vec![], json!(1u64)),
+                    Term::arr_native_lit("proj_child", vec![], json!(1u64)),
                 ),
             ))
             .unwrap();
@@ -615,11 +701,11 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.add",
                 "binary.add",
-                Scheme::arr_native(
+                Term::arr_native(
                     "add",
                     vec![
-                        Scheme::arr_native_lit("proj_child", vec![], json!(0u64)),
-                        Scheme::arr_native_lit("proj_child", vec![], json!(1u64)),
+                        Term::arr_native_lit("proj_child", vec![], json!(0u64)),
+                        Term::arr_native_lit("proj_child", vec![], json!(1u64)),
                     ],
                 ),
             ))
@@ -675,25 +761,25 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.fn",
                 "function",
-                Scheme::arr_native("closure", vec![]),
+                Term::arr_native("closure", vec![]),
             ))
             .unwrap();
         lang.eval
             .merge(EvalSchemeDef::new(
                 "e.var",
                 "var",
-                Scheme::arr_native_lit("proj_env", vec![], "$payload"),
+                Term::arr_native_lit("proj_env", vec![], "$payload"),
             ))
             .unwrap();
         lang.eval
             .merge(EvalSchemeDef::new(
                 "e.add",
                 "binary.add",
-                Scheme::arr_native(
+                Term::arr_native(
                     "add",
                     vec![
-                        Scheme::arr_native_lit("proj_child", vec![], json!(0u64)),
-                        Scheme::arr_native_lit("proj_child", vec![], json!(1u64)),
+                        Term::arr_native_lit("proj_child", vec![], json!(0u64)),
+                        Term::arr_native_lit("proj_child", vec![], json!(1u64)),
                     ],
                 ),
             ))
@@ -702,9 +788,9 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.call",
                 "call",
-                Scheme::app(
-                    Scheme::arr_native_lit("proj_child", vec![], json!(0u64)),
-                    vec![Scheme::arr_native_lit("proj_child", vec![], json!(1u64))],
+                Term::app(
+                    Term::arr_native_lit("proj_child", vec![], json!(0u64)),
+                    vec![Term::arr_native_lit("proj_child", vec![], json!(1u64))],
                 ),
             ))
             .unwrap();
@@ -728,19 +814,19 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.var",
                 "var",
-                Scheme::arr_native_lit("proj_env", vec![], "$payload"),
+                Term::arr_native_lit("proj_env", vec![], "$payload"),
             ))
             .unwrap();
         lang.eval
             .merge(EvalSchemeDef::new(
                 "e.let",
                 "let",
-                Scheme::seq(
-                    Scheme::seq(
-                        Scheme::arr_native_lit("proj_child", vec![], json!(0u64)),
-                        Scheme::arr_native_lit("extend_env", vec![], "$payload"),
+                Term::seq(
+                    Term::seq(
+                        Term::arr_native_lit("proj_child", vec![], json!(0u64)),
+                        Term::arr_native_lit("extend_env", vec![], "$payload"),
                     ),
-                    Scheme::arr_native_lit("proj_child", vec![], json!(1u64)),
+                    Term::arr_native_lit("proj_child", vec![], json!(1u64)),
                 ),
             ))
             .unwrap();
@@ -748,11 +834,11 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.add",
                 "binary.add",
-                Scheme::arr_native(
+                Term::arr_native(
                     "add",
                     vec![
-                        Scheme::arr_native_lit("proj_child", vec![], json!(0u64)),
-                        Scheme::arr_native_lit("proj_child", vec![], json!(1u64)),
+                        Term::arr_native_lit("proj_child", vec![], json!(0u64)),
+                        Term::arr_native_lit("proj_child", vec![], json!(1u64)),
                     ],
                 ),
             ))
@@ -761,16 +847,16 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.fn",
                 "function",
-                Scheme::arr_native("closure", vec![]),
+                Term::arr_native("closure", vec![]),
             ))
             .unwrap();
         lang.eval
             .merge(EvalSchemeDef::new(
                 "e.call",
                 "call",
-                Scheme::app(
-                    Scheme::arr_native_lit("proj_child", vec![], json!(0u64)),
-                    vec![Scheme::arr_native_lit("proj_child", vec![], json!(1u64))],
+                Term::app(
+                    Term::arr_native_lit("proj_child", vec![], json!(0u64)),
+                    vec![Term::arr_native_lit("proj_child", vec![], json!(1u64))],
                 ),
             ))
             .unwrap();
@@ -799,9 +885,9 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.triple",
                 "triple",
-                Scheme::arr_foreign(
+                Term::arr_foreign(
                     "triple",
-                    vec![Scheme::arr_native_lit("proj_child", vec![], json!(0u64))],
+                    vec![Term::arr_native_lit("proj_child", vec![], json!(0u64))],
                 ),
             ))
             .unwrap();
@@ -825,18 +911,18 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.var",
                 "var",
-                Scheme::arr_native_lit("proj_env", vec![], "$payload"),
+                Term::arr_native_lit("proj_env", vec![], "$payload"),
             ))
             .unwrap();
         lang.eval
             .merge(EvalSchemeDef::new(
                 "e.add",
                 "binary.add",
-                Scheme::arr_native(
+                Term::arr_native(
                     "add",
                     vec![
-                        Scheme::arr_native_lit("proj_child", vec![], json!(0u64)),
-                        Scheme::arr_native_lit("proj_child", vec![], json!(1u64)),
+                        Term::arr_native_lit("proj_child", vec![], json!(0u64)),
+                        Term::arr_native_lit("proj_child", vec![], json!(1u64)),
                     ],
                 ),
             ))
@@ -845,7 +931,7 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.bind",
                 "bind",
-                Scheme::arr_native("bind", vec![]),
+                Term::arr_native("bind", vec![]),
             ))
             .unwrap();
         let ast = make_ast(vec![

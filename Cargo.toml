@@ -7,6 +7,7 @@ edition.workspace = true
 handl-language = {path = "../handl-language" }
 handl-platform = {path = "../platform" }
 handl-plugin-engine-exec = {path = "../plugin-engine-exec" }
+handl-plugin-engine-exec-tree-walk = {path = "../plugin-engine-exec-tree-walk" }
 handl-plugin-engine-transform = {path = "../plugin-engine-transform" }
 handl-plugin-engine-transform-rewrite = {path = "../plugin-engine-transform-rewrite" }
 handl-runtime = {path = "../handl-runtime" }
@@ -16,6 +17,5 @@ rustc-hash = "2"
 
 [dev-dependencies]
 handl-test-utils = {path = "../handl-test-utils" }
-handl-plugin-engine-exec-tree-walk = {path = "../plugin-engine-exec-tree-walk" }
 handl-plugin-module = {path = "../plugin-module" }
 serde_json = { workspace = true }

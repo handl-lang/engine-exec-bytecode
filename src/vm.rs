@@ -61,6 +61,7 @@ use std::rc::Rc;
 
 use handl_language::{Ast, AstNode, AstRef, LangError, Language, Value};
 use handl_plugin_engine_exec::pattern_match::{self, PatternMatchCtx};
+use handl_plugin_engine_exec_tree_walk::home_frame;
 use handl_value::{TaggedValue, tagged_to_value};
 use rustc_hash::FxHashMap;
 
@@ -91,6 +92,11 @@ pub(crate) struct ScopeStack {
     /// variables. Stored as `Rc` so closure calls avoid deep-cloning the
     /// entire captured `HashMap`.
     pub(crate) captured_root: Option<Rc<FxHashMap<Rc<str>, TaggedValue>>>,
+    /// Host-provided globals (e.g. `self` and `__arg_N`), searched after
+    /// local/captured bindings so user-defined scopes shadow them. Held in
+    /// a cheaply-cloned `Rc` so it is excluded from `capture()` and shared
+    /// across closure calls. Mirrors the tree-walk `ScopeStack::globals`.
+    pub(crate) globals: Rc<FxHashMap<Rc<str>, TaggedValue>>,
     /// Set when `assign` updates a binding in an *enclosing* scope (below
     /// the innermost mark) with a different value. Read and cleared by
     /// `eval_rec` fixpoint detection (`prim_v2_eval_rec`) — such writes are
@@ -108,12 +114,20 @@ impl ScopeStack {
             bindings: Vec::new(),
             marks: vec![0],
             captured_root: None,
+            globals: Rc::new(FxHashMap::default()),
             enclosing_updated: false,
         }
     }
 
+    /// Set the host-provided globals map (an `Rc` clone, cheap). Globals
+    /// are accessible via `lookup()` but excluded from `capture()`.
+    pub(crate) fn set_globals(&mut self, globals: Rc<FxHashMap<Rc<str>, TaggedValue>>) {
+        self.globals = globals;
+    }
+
     /// Look up a variable, searching innermost bindings first (linear scan
-    /// from the end), then falling back to the captured root (if any).
+    /// from the end), then the captured root (if any), then host-provided
+    /// globals. Mirrors the tree-walk `ScopeStack::lookup` ordering.
     pub(crate) fn lookup(&self, name: &str) -> Option<&TaggedValue> {
         // Search innermost bindings first (reverse linear scan).
         for (n, v) in self.bindings.iter().rev() {
@@ -122,7 +136,11 @@ impl ScopeStack {
             }
         }
         // Fall back to captured root.
-        self.captured_root.as_ref().and_then(|m| m.get(name))
+        if let Some(v) = self.captured_root.as_ref().and_then(|m| m.get(name)) {
+            return Some(v);
+        }
+        // Fall back to host-provided globals.
+        self.globals.get(name)
     }
 
     /// Define a variable in the current (innermost) scope.
@@ -180,8 +198,21 @@ impl ScopeStack {
     ///
     /// Used by the `closure` primitive to snapshot the current environment.
     /// Inner scopes shadow outer ones (later entries overwrite earlier).
+    /// Includes the parent closure's captured env (if any) so that nested
+    /// closures retain access to bindings from all enclosing closure scopes.
     pub(crate) fn capture(&self) -> FxHashMap<Rc<str>, TaggedValue> {
-        self.bindings.iter().cloned().collect()
+        let mut captured = FxHashMap::default();
+        // Include parent closure's captured env first (lower priority).
+        if let Some(parent_captured) = &self.captured_root {
+            for (k, v) in parent_captured.iter() {
+                captured.insert(Rc::clone(k), v.clone());
+            }
+        }
+        // Then include current scopes (higher priority, overwrites parent).
+        for (n, v) in &self.bindings {
+            captured.insert(Rc::clone(n), v.clone());
+        }
+        captured
     }
 }
 
@@ -396,9 +427,14 @@ impl<'a, 'h> VmFrame<'a, 'h> {
         }
     }
 
-    /// Define a global variable in the root scope.
+    /// Define a global variable in the root scope (for unit tests).
     pub(crate) fn define_global(&mut self, name: &str, value: TaggedValue) {
         self.scopes.define(name, value);
+    }
+
+    /// Set the host-provided globals map (e.g. `self`, `__arg_N`).
+    pub(crate) fn set_globals(&mut self, globals: Rc<FxHashMap<Rc<str>, TaggedValue>>) {
+        self.scopes.set_globals(globals);
     }
 }
 
@@ -422,7 +458,7 @@ impl<'a, 'h> PatternMatchCtx for VmFrame<'a, 'h> {
 impl<'a, 'h> VmFrame<'a, 'h> {
     /// Compile (if not cached) and execute a single node using v2 bytecode.
     ///
-    /// Looks up `lang.eval[node.kind]` to find the node's `Scheme`, compiles
+    /// Looks up `lang.eval[node.kind]` to find the node's `Term`, compiles
     /// it to v2 instructions (or uses the no-scheme fallback
     /// `[LoadPayload, Return]`), caches the result, and executes. On
     /// subsequent calls for the same [`AstRef`], the cached instructions are
@@ -1127,7 +1163,21 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                                 node,
                             )
                         })? as usize;
-                        result.push(self.exec_node_inner(AstRef::new(idx))?);
+                        // Spread: if the child is a `rest` node (from
+                        // `...expr` syntax), flatten its value into the
+                        // array if it's an array. Mirrors the tree-walk
+                        // implementation.
+                        if self.ast.get(AstRef::new(idx)).map(|n| n.kind.as_str()) == Some("rest")
+                        {
+                            let val = self.exec_node_inner(AstRef::new(idx))?;
+                            if let TaggedValue::Arr(arr) = val {
+                                result.extend(arr.iter().cloned());
+                            } else {
+                                result.push(val);
+                            }
+                        } else {
+                            result.push(self.exec_node_inner(AstRef::new(idx))?);
+                        }
                     }
                     Ok(TaggedValue::Arr(Rc::from(result)))
                 } else {
@@ -2671,14 +2721,14 @@ impl<'a, 'h> VmFrame<'a, 'h> {
         args: &[TaggedValue],
     ) -> Result<TaggedValue, LangError> {
         // Closure application — match on TaggedValue::Arrow directly.
-        let (params, rest_param, body_idx, captured_env) = match callee {
+        let (params, rest_param, body_idx, captured_env, home) = match callee {
             TaggedValue::Arrow {
                 params,
                 rest,
                 body,
                 env,
-                ..
-            } => (params.clone(), rest.clone(), *body, Rc::clone(env)),
+                home,
+            } => (params.clone(), rest.clone(), *body, Rc::clone(env), *home),
             _ => {
                 return Err(LangError::engine(
                     "callee is not an arrow-value".to_string(),
@@ -2686,6 +2736,29 @@ impl<'a, 'h> VmFrame<'a, 'h> {
             }
         };
         let body_ref = AstRef::new(body_idx);
+
+        // Boundary-crossed arrow: its `body` index refers to a different
+        // AST (the one that minted it). Run the body in that home frame,
+        // with the home frame's modules, globals, and the arrow's captured
+        // env.
+        if let Some(frame_id) = home {
+            let frame = home_frame(frame_id).ok_or_else(|| {
+                LangError::engine(format!("arrow: unknown home frame {}", frame_id))
+            })?;
+            let home_modules_ref = frame.modules.as_ref();
+            let mut home_vm = VmFrame::new(&*frame.ast, &*frame.lang, home_modules_ref, None);
+            if let Some(g) = &frame.globals {
+                home_vm.scopes.set_globals(Rc::clone(g));
+            }
+            let local_callee = TaggedValue::Arrow {
+                params,
+                rest: rest_param,
+                body: body_idx,
+                env: captured_env,
+                home: None,
+            };
+            return home_vm.apply_app(&local_callee, args);
+        }
         // Rest param (`[a, ...rest] ~> body`): surplus args bind to the rest
         // name as an array, so `args.len() >= params.len()` is required.
         let arity_ok = if rest_param.is_some() {
@@ -2888,7 +2961,7 @@ fn eval_bin_cmp(instr: &Instr, a: TaggedValue, b: TaggedValue) -> Result<TaggedV
 #[cfg(test)]
 mod tests {
     use super::*;
-    use handl_language::{Ast, AstNode, EvalSchemeDef, Language, Scheme, SchemeVersion};
+    use handl_language::{Ast, AstNode, EvalSchemeDef, Language, Term, SchemeVersion};
     use handl_platform::{EvalContext, Function, Module, ModuleLookup};
     use handl_plugin_engine_exec::ImportResolver;
     use handl_plugin_module::ModuleRegistry;
@@ -2910,7 +2983,7 @@ mod tests {
     }
 
     /// Evaluate a standalone v2 scheme with a fresh frame and dummy node.
-    fn eval_standalone(scheme: &Scheme) -> Result<Value, LangError> {
+    fn eval_standalone(scheme: &Term) -> Result<Value, LangError> {
         let ast = make_ast(vec![dummy_node()]);
         let lang = Language::new();
         let node = ast.at(AstRef::new(0)).unwrap();
@@ -2939,14 +3012,14 @@ mod tests {
 
     #[test]
     fn arr_const_returns_literal() {
-        let s = Scheme::arr_native_lit("const", vec![], json!(42));
+        let s = Term::arr_native_lit("const", vec![], json!(42));
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, json!(42));
     }
 
     #[test]
     fn arr_const_null_when_no_literal() {
-        let s = Scheme::arr_native("const", vec![]);
+        let s = Term::arr_native("const", vec![]);
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, Value::Null);
     }
@@ -2955,7 +3028,7 @@ mod tests {
 
     #[test]
     fn arr_proj_env_bound_lookup() {
-        let s = Scheme::arr_native_lit("proj_env", vec![], "x");
+        let s = Term::arr_native_lit("proj_env", vec![], "x");
         let ast = make_ast(vec![dummy_node()]);
         let lang = Language::new();
         let node = ast.at(AstRef::new(0)).unwrap();
@@ -2968,7 +3041,7 @@ mod tests {
 
     #[test]
     fn arr_proj_env_unbound_returns_name() {
-        let s = Scheme::arr_native_lit("proj_env", vec![], "unknown");
+        let s = Term::arr_native_lit("proj_env", vec![], "unknown");
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, Value::from("unknown"));
     }
@@ -2977,9 +3050,9 @@ mod tests {
 
     #[test]
     fn seq_const_then_id() {
-        let s = Scheme::seq(
-            Scheme::arr_native_lit("const", vec![], json!(5)),
-            Scheme::arr_native("id", vec![]),
+        let s = Term::seq(
+            Term::arr_native_lit("const", vec![], json!(5)),
+            Term::arr_native("id", vec![]),
         );
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, json!(5));
@@ -2989,12 +3062,12 @@ mod tests {
 
     #[test]
     fn bind_shape_extend_env_then_proj_env() {
-        let s = Scheme::seq(
-            Scheme::seq(
-                Scheme::arr_native_lit("const", vec![], json!(5)),
-                Scheme::arr_native_lit("extend_env", vec![], "x"),
+        let s = Term::seq(
+            Term::seq(
+                Term::arr_native_lit("const", vec![], json!(5)),
+                Term::arr_native_lit("extend_env", vec![], "x"),
             ),
-            Scheme::arr_native_lit("proj_env", vec![], "x"),
+            Term::arr_native_lit("proj_env", vec![], "x"),
         );
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, json!(5));
@@ -3004,9 +3077,9 @@ mod tests {
 
     #[test]
     fn first_id_on_pair() {
-        let s = Scheme::seq(
-            Scheme::arr_native_lit("const", vec![], pair(json!(3), json!(7))),
-            Scheme::first(Scheme::arr_native("id", vec![])),
+        let s = Term::seq(
+            Term::arr_native_lit("const", vec![], pair(json!(3), json!(7))),
+            Term::first(Term::arr_native("id", vec![])),
         );
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, pair(json!(3), json!(7)));
@@ -3014,9 +3087,9 @@ mod tests {
 
     #[test]
     fn first_const_on_pair() {
-        let s = Scheme::seq(
-            Scheme::arr_native_lit("const", vec![], pair(json!(3), json!(7))),
-            Scheme::first(Scheme::arr_native_lit("const", vec![], json!(99))),
+        let s = Term::seq(
+            Term::arr_native_lit("const", vec![], pair(json!(3), json!(7))),
+            Term::first(Term::arr_native_lit("const", vec![], json!(99))),
         );
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, pair(json!(99), json!(7)));
@@ -3026,11 +3099,11 @@ mod tests {
 
     #[test]
     fn choice_left() {
-        let s = Scheme::seq(
-            Scheme::arr_native_lit("const", vec![], either_left(json!(5))),
-            Scheme::choice(
-                Scheme::arr_native_lit("const", vec![], json!(1)),
-                Scheme::arr_native_lit("const", vec![], json!(2)),
+        let s = Term::seq(
+            Term::arr_native_lit("const", vec![], either_left(json!(5))),
+            Term::choice(
+                Term::arr_native_lit("const", vec![], json!(1)),
+                Term::arr_native_lit("const", vec![], json!(2)),
             ),
         );
         let result = eval_standalone(&s).unwrap();
@@ -3039,11 +3112,11 @@ mod tests {
 
     #[test]
     fn choice_right() {
-        let s = Scheme::seq(
-            Scheme::arr_native_lit("const", vec![], either_right(json!(5))),
-            Scheme::choice(
-                Scheme::arr_native_lit("const", vec![], json!(1)),
-                Scheme::arr_native_lit("const", vec![], json!(2)),
+        let s = Term::seq(
+            Term::arr_native_lit("const", vec![], either_right(json!(5))),
+            Term::choice(
+                Term::arr_native_lit("const", vec![], json!(1)),
+                Term::arr_native_lit("const", vec![], json!(2)),
             ),
         );
         let result = eval_standalone(&s).unwrap();
@@ -3054,14 +3127,14 @@ mod tests {
 
     #[test]
     fn tag_choice_true_yields_then() {
-        let s = Scheme::seq(
-            Scheme::seq(
-                Scheme::arr_native_lit("const", vec![], json!(true)),
-                Scheme::arr_native("tag", vec![]),
+        let s = Term::seq(
+            Term::seq(
+                Term::arr_native_lit("const", vec![], json!(true)),
+                Term::arr_native("tag", vec![]),
             ),
-            Scheme::choice(
-                Scheme::arr_native_lit("const", vec![], "yes"),
-                Scheme::arr_native_lit("const", vec![], "no"),
+            Term::choice(
+                Term::arr_native_lit("const", vec![], "yes"),
+                Term::arr_native_lit("const", vec![], "no"),
             ),
         );
         let result = eval_standalone(&s).unwrap();
@@ -3070,14 +3143,14 @@ mod tests {
 
     #[test]
     fn tag_choice_false_yields_else() {
-        let s = Scheme::seq(
-            Scheme::seq(
-                Scheme::arr_native_lit("const", vec![], json!(false)),
-                Scheme::arr_native("tag", vec![]),
+        let s = Term::seq(
+            Term::seq(
+                Term::arr_native_lit("const", vec![], json!(false)),
+                Term::arr_native("tag", vec![]),
             ),
-            Scheme::choice(
-                Scheme::arr_native_lit("const", vec![], "yes"),
-                Scheme::arr_native_lit("const", vec![], "no"),
+            Term::choice(
+                Term::arr_native_lit("const", vec![], "yes"),
+                Term::arr_native_lit("const", vec![], "no"),
             ),
         );
         let result = eval_standalone(&s).unwrap();
@@ -3088,9 +3161,9 @@ mod tests {
 
     #[test]
     fn loop_causal_single_step() {
-        let s = Scheme::seq(
-            Scheme::arr_native_lit("const", vec![], json!(10)),
-            Scheme::loop_feedback(Scheme::arr_native("inc_fst", vec![])),
+        let s = Term::seq(
+            Term::arr_native_lit("const", vec![], json!(10)),
+            Term::loop_feedback(Term::arr_native("inc_fst", vec![])),
         );
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, json!(11));
@@ -3100,9 +3173,9 @@ mod tests {
 
     #[test]
     fn loop_multi_step_either_countdown() {
-        let s = Scheme::seq(
-            Scheme::arr_native_lit("const", vec![], pair(json!(42), json!(5))),
-            Scheme::loop_feedback(Scheme::arr_native("countdown_step", vec![])),
+        let s = Term::seq(
+            Term::arr_native_lit("const", vec![], pair(json!(42), json!(5))),
+            Term::loop_feedback(Term::arr_native("countdown_step", vec![])),
         );
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, json!(42));
@@ -3110,9 +3183,9 @@ mod tests {
 
     #[test]
     fn loop_multi_step_max_iterations_guard() {
-        let s = Scheme::seq(
-            Scheme::arr_native_lit("const", vec![], json!(1)),
-            Scheme::loop_feedback(Scheme::arr_native("infinite_step", vec![])),
+        let s = Term::seq(
+            Term::arr_native_lit("const", vec![], json!(1)),
+            Term::loop_feedback(Term::arr_native("infinite_step", vec![])),
         );
         let err = eval_standalone(&s).unwrap_err();
         assert!(
@@ -3135,7 +3208,7 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.var",
                 "var",
-                Scheme::arr_native_lit("proj_env", vec![], Value::String("$payload".into())),
+                Term::arr_native_lit("proj_env", vec![], Value::String("$payload".into())),
             ))
             .unwrap();
         // binary.eq / sub / mul -> native op over the two children
@@ -3148,11 +3221,11 @@ mod tests {
                 .merge(EvalSchemeDef::new(
                     id,
                     kind,
-                    Scheme::arr_native(
+                    Term::arr_native(
                         op,
                         vec![
-                            Scheme::arr_native_lit("proj_child", vec![], json!(0u64)),
-                            Scheme::arr_native_lit("proj_child", vec![], json!(1u64)),
+                            Term::arr_native_lit("proj_child", vec![], json!(0u64)),
+                            Term::arr_native_lit("proj_child", vec![], json!(1u64)),
                         ],
                     ),
                 ))
@@ -3163,14 +3236,14 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.if",
                 "if",
-                Scheme::seq(
-                    Scheme::seq(
-                        Scheme::arr_native_lit("proj_child", vec![], json!(0u64)),
-                        Scheme::arr_native("tag", vec![]),
+                Term::seq(
+                    Term::seq(
+                        Term::arr_native_lit("proj_child", vec![], json!(0u64)),
+                        Term::arr_native("tag", vec![]),
                     ),
-                    Scheme::choice(
-                        Scheme::arr_native_lit("proj_child", vec![], json!(1u64)),
-                        Scheme::arr_native_lit("proj_child", vec![], json!(2u64)),
+                    Term::choice(
+                        Term::arr_native_lit("proj_child", vec![], json!(1u64)),
+                        Term::arr_native_lit("proj_child", vec![], json!(2u64)),
                     ),
                 ),
             ))
@@ -3180,7 +3253,7 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.object",
                 "object",
-                Scheme::arr_native("object", vec![]),
+                Term::arr_native("object", vec![]),
             ))
             .unwrap();
         // function -> closure prim
@@ -3188,7 +3261,7 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.function",
                 "function",
-                Scheme::arr_native("closure", vec![]),
+                Term::arr_native("closure", vec![]),
             ))
             .unwrap();
         // return -> proj_child(0) (v0.1: `return v` evaluates to `v`)
@@ -3196,7 +3269,7 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.return",
                 "return",
-                Scheme::arr_native_lit("proj_child", vec![], json!(0u64)),
+                Term::arr_native_lit("proj_child", vec![], json!(0u64)),
             ))
             .unwrap();
         // loop -> Seq(proj_child(0), Loop(loop_step(proj_child(1))))
@@ -3204,11 +3277,11 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.loop",
                 "loop",
-                Scheme::seq(
-                    Scheme::arr_native_lit("proj_child", vec![], json!(0u64)),
-                    Scheme::loop_feedback(Scheme::arr_native(
+                Term::seq(
+                    Term::arr_native_lit("proj_child", vec![], json!(0u64)),
+                    Term::loop_feedback(Term::arr_native(
                         "loop_step",
-                        vec![Scheme::arr_native_lit("proj_child", vec![], json!(1u64))],
+                        vec![Term::arr_native_lit("proj_child", vec![], json!(1u64))],
                     )),
                 ),
             ))
@@ -3378,16 +3451,16 @@ mod tests {
     /// `while_loop(is_pos, dec)` applied to 5.
     #[test]
     fn while_step_countdown() {
-        // Scheme: Seq(const 5, Loop(while_step(is_pos, dec)))
+        // Term: Seq(const 5, Loop(while_step(is_pos, dec)))
         // is_pos: native op, 0 args, uses incoming (checks > 0)
         // dec: native op, 0 args, uses incoming (subtracts 1)
-        let s = Scheme::seq(
-            Scheme::arr_native_lit("const", vec![], json!(5)),
-            Scheme::loop_feedback(Scheme::arr_native(
+        let s = Term::seq(
+            Term::arr_native_lit("const", vec![], json!(5)),
+            Term::loop_feedback(Term::arr_native(
                 "while_step",
                 vec![
-                    Scheme::arr_native("is_pos", vec![]),
-                    Scheme::arr_native("dec", vec![]),
+                    Term::arr_native("is_pos", vec![]),
+                    Term::arr_native("dec", vec![]),
                 ],
             )),
         );
@@ -3398,13 +3471,13 @@ mod tests {
     /// `while` loop with zero iterations: cond is immediately false.
     #[test]
     fn while_step_zero_iterations() {
-        let s = Scheme::seq(
-            Scheme::arr_native_lit("const", vec![], json!(0)),
-            Scheme::loop_feedback(Scheme::arr_native(
+        let s = Term::seq(
+            Term::arr_native_lit("const", vec![], json!(0)),
+            Term::loop_feedback(Term::arr_native(
                 "while_step",
                 vec![
-                    Scheme::arr_native("is_pos", vec![]),
-                    Scheme::arr_native("dec", vec![]),
+                    Term::arr_native("is_pos", vec![]),
+                    Term::arr_native("dec", vec![]),
                 ],
             )),
         );
@@ -3416,11 +3489,11 @@ mod tests {
     /// to pair(5, 0).
     #[test]
     fn for_step_accumulate() {
-        let s = Scheme::seq(
-            Scheme::arr_native_lit("const", vec![], pair(json!(5), json!(0))),
-            Scheme::loop_feedback(Scheme::arr_native(
+        let s = Term::seq(
+            Term::arr_native_lit("const", vec![], pair(json!(5), json!(0))),
+            Term::loop_feedback(Term::arr_native(
                 "for_step",
-                vec![Scheme::arr_native("inc", vec![])],
+                vec![Term::arr_native("inc", vec![])],
             )),
         );
         let result = eval_standalone(&s).unwrap();
@@ -3430,11 +3503,11 @@ mod tests {
     /// `for` loop with zero iterations: counter is 0, return initial.
     #[test]
     fn for_step_zero_iterations() {
-        let s = Scheme::seq(
-            Scheme::arr_native_lit("const", vec![], pair(json!(0), json!(99))),
-            Scheme::loop_feedback(Scheme::arr_native(
+        let s = Term::seq(
+            Term::arr_native_lit("const", vec![], pair(json!(0), json!(99))),
+            Term::loop_feedback(Term::arr_native(
                 "for_step",
-                vec![Scheme::arr_native("inc", vec![])],
+                vec![Term::arr_native("inc", vec![])],
             )),
         );
         let result = eval_standalone(&s).unwrap();
@@ -3445,11 +3518,11 @@ mod tests {
     /// `fix_loop(half_floor)` applied to 100.
     #[test]
     fn fix_step_halve_to_zero() {
-        let s = Scheme::seq(
-            Scheme::arr_native_lit("const", vec![], json!(100)),
-            Scheme::loop_feedback(Scheme::arr_native(
+        let s = Term::seq(
+            Term::arr_native_lit("const", vec![], json!(100)),
+            Term::loop_feedback(Term::arr_native(
                 "fix_step",
-                vec![Scheme::arr_native("half_floor", vec![])],
+                vec![Term::arr_native("half_floor", vec![])],
             )),
         );
         let result = eval_standalone(&s).unwrap();
@@ -3459,11 +3532,11 @@ mod tests {
     /// `fix` loop already at fixpoint: 0 → 0.
     #[test]
     fn fix_step_already_at_fixpoint() {
-        let s = Scheme::seq(
-            Scheme::arr_native_lit("const", vec![], json!(0)),
-            Scheme::loop_feedback(Scheme::arr_native(
+        let s = Term::seq(
+            Term::arr_native_lit("const", vec![], json!(0)),
+            Term::loop_feedback(Term::arr_native(
                 "fix_step",
-                vec![Scheme::arr_native("half_floor", vec![])],
+                vec![Term::arr_native("half_floor", vec![])],
             )),
         );
         let result = eval_standalone(&s).unwrap();
@@ -3479,7 +3552,7 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.var",
                 "var",
-                Scheme::arr_native_lit("proj_env", vec![], "$payload"),
+                Term::arr_native_lit("proj_env", vec![], "$payload"),
             ))
             .unwrap();
         let ast = make_ast(vec![
@@ -3492,9 +3565,9 @@ mod tests {
             "body": 0,
             "env": {},
         });
-        let s = Scheme::app(
-            Scheme::arr_native_lit("const", vec![], closure),
-            vec![Scheme::arr_native_lit("const", vec![], json!(41))],
+        let s = Term::app(
+            Term::arr_native_lit("const", vec![], closure),
+            vec![Term::arr_native_lit("const", vec![], json!(41))],
         );
         let node = ast.at(AstRef::new(1)).unwrap();
         let instrs = compile(&s, &lang, &ast, node).unwrap();
@@ -3507,11 +3580,11 @@ mod tests {
 
     #[test]
     fn native_add() {
-        let s = Scheme::arr_native(
+        let s = Term::arr_native(
             "add",
             vec![
-                Scheme::arr_native_lit("const", vec![], json!(2)),
-                Scheme::arr_native_lit("const", vec![], json!(3)),
+                Term::arr_native_lit("const", vec![], json!(2)),
+                Term::arr_native_lit("const", vec![], json!(3)),
             ],
         );
         let result = eval_standalone(&s).unwrap();
@@ -3520,11 +3593,11 @@ mod tests {
 
     #[test]
     fn native_eq() {
-        let s = Scheme::arr_native(
+        let s = Term::arr_native(
             "eq",
             vec![
-                Scheme::arr_native_lit("const", vec![], json!(2)),
-                Scheme::arr_native_lit("const", vec![], json!(2)),
+                Term::arr_native_lit("const", vec![], json!(2)),
+                Term::arr_native_lit("const", vec![], json!(2)),
             ],
         );
         let result = eval_standalone(&s).unwrap();
@@ -3535,7 +3608,7 @@ mod tests {
 
     #[test]
     fn unknown_native_op_errors() {
-        let s = Scheme::arr_native("bogus", vec![]);
+        let s = Term::arr_native("bogus", vec![]);
         let err = eval_standalone(&s).unwrap_err();
         assert!(
             matches!(err, LangError::Engine { ref message, .. } if message.contains("unknown v2 native op"))
@@ -3578,9 +3651,9 @@ mod tests {
 
     #[test]
     fn foreign_arr_dispatches_to_module() {
-        let s = Scheme::arr_foreign(
+        let s = Term::arr_foreign(
             "double",
-            vec![Scheme::arr_native_lit("const", vec![], json!(21))],
+            vec![Term::arr_native_lit("const", vec![], json!(21))],
         );
         let ast = make_ast(vec![dummy_node()]);
         let lang = Language::new();
@@ -3594,9 +3667,9 @@ mod tests {
 
     #[test]
     fn foreign_arr_no_modules_errors() {
-        let s = Scheme::arr_foreign(
+        let s = Term::arr_foreign(
             "double",
-            vec![Scheme::arr_native_lit("const", vec![], json!(21))],
+            vec![Term::arr_native_lit("const", vec![], json!(21))],
         );
         let err = eval_standalone(&s).unwrap_err();
         assert!(
@@ -3613,11 +3686,11 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.add",
                 "binary.add",
-                Scheme::arr_native(
+                Term::arr_native(
                     "add",
                     vec![
-                        Scheme::arr_native_lit("proj_child", vec![], json!(0u64)),
-                        Scheme::arr_native_lit("proj_child", vec![], json!(1u64)),
+                        Term::arr_native_lit("proj_child", vec![], json!(0u64)),
+                        Term::arr_native_lit("proj_child", vec![], json!(1u64)),
                     ],
                 ),
             ))
@@ -3639,14 +3712,14 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.if",
                 "if",
-                Scheme::seq(
-                    Scheme::seq(
-                        Scheme::arr_native_lit("proj_child", vec![], json!(0u64)),
-                        Scheme::arr_native("tag", vec![]),
+                Term::seq(
+                    Term::seq(
+                        Term::arr_native_lit("proj_child", vec![], json!(0u64)),
+                        Term::arr_native("tag", vec![]),
                     ),
-                    Scheme::choice(
-                        Scheme::arr_native_lit("proj_child", vec![], json!(1u64)),
-                        Scheme::arr_native_lit("proj_child", vec![], json!(2u64)),
+                    Term::choice(
+                        Term::arr_native_lit("proj_child", vec![], json!(1u64)),
+                        Term::arr_native_lit("proj_child", vec![], json!(2u64)),
                     ),
                 ),
             ))
@@ -3669,14 +3742,14 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.if",
                 "if",
-                Scheme::seq(
-                    Scheme::seq(
-                        Scheme::arr_native_lit("proj_child", vec![], json!(0u64)),
-                        Scheme::arr_native("tag", vec![]),
+                Term::seq(
+                    Term::seq(
+                        Term::arr_native_lit("proj_child", vec![], json!(0u64)),
+                        Term::arr_native("tag", vec![]),
                     ),
-                    Scheme::choice(
-                        Scheme::arr_native_lit("proj_child", vec![], json!(1u64)),
-                        Scheme::arr_native_lit("proj_child", vec![], json!(2u64)),
+                    Term::choice(
+                        Term::arr_native_lit("proj_child", vec![], json!(1u64)),
+                        Term::arr_native_lit("proj_child", vec![], json!(2u64)),
                     ),
                 ),
             ))
@@ -3733,7 +3806,7 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.var",
                 "var",
-                Scheme::arr_native_lit("proj_env", vec![], Value::from("$payload")),
+                Term::arr_native_lit("proj_env", vec![], Value::from("$payload")),
             ))
             .unwrap();
         // stmt.import -> import(proj_child(0))
@@ -3741,9 +3814,9 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.stmt.import",
                 "stmt.import",
-                Scheme::arr_native(
+                Term::arr_native(
                     "import",
-                    vec![Scheme::arr_native_lit(
+                    vec![Term::arr_native_lit(
                         "proj_child",
                         vec![],
                         Value::from(0u64),
@@ -3775,9 +3848,9 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.stmt.import",
                 "stmt.import",
-                Scheme::arr_native(
+                Term::arr_native(
                     "import",
-                    vec![Scheme::arr_native_lit(
+                    vec![Term::arr_native_lit(
                         "const",
                         vec![],
                         Value::from("m.hnl"),
@@ -3811,23 +3884,23 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.var",
                 "var",
-                Scheme::arr_native_lit("proj_env", vec![], Value::from("$payload")),
+                Term::arr_native_lit("proj_env", vec![], Value::from("$payload")),
             ))
             .unwrap();
         lang.eval
             .merge(EvalSchemeDef::new(
                 "e.block",
                 "block",
-                Scheme::arr_native("eval_block", vec![]),
+                Term::arr_native("eval_block", vec![]),
             ))
             .unwrap();
         lang.eval
             .merge(EvalSchemeDef::new(
                 "e.stmt.import",
                 "stmt.import",
-                Scheme::arr_native(
+                Term::arr_native(
                     "import",
-                    vec![Scheme::arr_native_lit(
+                    vec![Term::arr_native_lit(
                         "proj_child",
                         vec![],
                         Value::from(0u64),

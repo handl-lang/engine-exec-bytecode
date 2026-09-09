@@ -1,6 +1,6 @@
 //! V2 bytecode instruction set for the arrow-calculus kernel (ADR-0052).
 //!
-//! Each [`Scheme`](handl_language::scheme::Scheme) combinator compiles
+//! Each [`Term`](handl_language::term::Term) combinator compiles
 //! to a flat sequence of [`Instr`] values. The v2 VM executes them against an
 //! operand stack and a scope stack, producing values identical to the v2
 //! tree-walk reference handler.
@@ -33,7 +33,7 @@
 //!
 //! ## Combinator → instruction mapping
 //!
-//! | `Scheme` combinator | Compiled instructions |
+//! | `Term` combinator | Compiled instructions |
 //!|---|---|
 //! | `Arr { op: "const", lit: Some(v), .. }` | `Push(v)` |
 //! | `Arr { op: "proj_env", lit: Some(name), .. }` | `Load(name)` or `LoadPayloadVar` if name is `"$payload"` |

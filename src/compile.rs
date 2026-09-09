@@ -1,7 +1,7 @@
-//! `Scheme` -> v2 bytecode compilation (ADR-0052 Phase B).
+//! `Term` -> v2 bytecode compilation (ADR-0052 Phase B).
 //!
 //! The [`compile`] function translates a
-//! [`Scheme`](handl_language::Scheme) combinator tree into a
+//! [`Term`](handl_language::Term) combinator tree into a
 //! flat [`Vec<Instr>`](crate::Instr) program. Each combinator maps to a
 //! fixed instruction sequence -- see the
 //! [`instr`](crate::instr) module for the full mapping table.
@@ -24,12 +24,12 @@
 
 use std::rc::Rc;
 
-use handl_language::{ArrSource, Language, Scheme};
+use handl_language::{ArrSource, Language, Term};
 use handl_language::{Ast, AstNode, AstRef, LangError, Value};
 
 use crate::instr::Instr;
 
-/// Compile a [`Scheme`] into a v2 bytecode program.
+/// Compile a [`Term`] into a v2 bytecode program.
 ///
 /// The `ast` and `node` parameters enable compile-time optimizations that
 /// inspect the AST node's payload (e.g. pre-extracting static object keys
@@ -38,9 +38,9 @@ use crate::instr::Instr;
 /// # Errors
 ///
 /// Returns [`LangError::Engine`] if a sub-scheme fails to compile. In
-/// practice, every well-formed [`Scheme`] variant compiles successfully.
+/// practice, every well-formed [`Term`] variant compiles successfully.
 pub fn compile(
-    scheme: &Scheme,
+    scheme: &Term,
     lang: &Language,
     ast: &Ast,
     node: &AstNode,
@@ -65,21 +65,21 @@ pub fn compile(
 /// responsible for popping (i.e. `extend_env` was emitted). This mirrors the
 /// tree-walk's `did_push` discipline.
 fn compile_into(
-    scheme: &Scheme,
+    scheme: &Term,
     lang: &Language,
     ast: &Ast,
     node: &AstNode,
     out: &mut Vec<Instr>,
 ) -> Result<bool, LangError> {
     match scheme {
-        Scheme::Arr {
+        Term::Arr {
             op,
             args,
             source,
             lit,
         } => compile_arr(op, args, source, lit.as_ref(), lang, ast, node, out),
 
-        Scheme::Seq { fst, snd } => {
+        Term::Seq { fst, snd } => {
             let fst_pushed = compile_into(fst, lang, ast, node, out)?;
             let snd_pushed = compile_into(snd, lang, ast, node, out)?;
             // Pop the scope `fst` reported (e.g. extend_env as fst), matching
@@ -92,7 +92,7 @@ fn compile_into(
             Ok(snd_pushed)
         }
 
-        Scheme::First { inner } => {
+        Term::First { inner } => {
             // FirstOp(start, end) — the inner sub-program runs on a fresh
             // stack with the pair's first component as incoming. This
             // correctly handles inner arrows like `const` that don't consume
@@ -110,7 +110,7 @@ fn compile_into(
             Ok(false)
         }
 
-        Scheme::Choice { l, r } => {
+        Term::Choice { l, r } => {
             // ChoiceJump(left_target, right_target) -- placeholder.
             let cj_pos = out.len();
             out.push(Instr::ChoiceJump(0, 0));
@@ -135,7 +135,7 @@ fn compile_into(
             Ok(false)
         }
 
-        Scheme::Loop { body } => {
+        Term::Loop { body } => {
             // Optimization: when the body is a `loop_step` Arr, hoist the
             // body closure evaluation outside the loop. The closure captures
             // the definition-time env, which doesn't change between iterations
@@ -144,7 +144,7 @@ fn compile_into(
             // scope via `capture()`) on every iteration. Mirrors the
             // tree-walk optimization at
             // `plugin-engine-exec-tree-walk/src/lib.rs:402-456`.
-            if let Scheme::Arr {
+            if let Term::Arr {
                 op, args, source, ..
             } = body.as_ref()
             {
@@ -219,7 +219,7 @@ fn compile_into(
             Ok(false)
         }
 
-        Scheme::App { callee, args } => {
+        Term::App { callee, args } => {
             let callee_pushed = compile_into(callee, lang, ast, node, out)?;
             if callee_pushed {
                 out.push(Instr::PopScope);
@@ -244,7 +244,7 @@ fn compile_into(
         // handler at compile time, then compile the resulting handler-free
         // scheme. Uses `eliminate_and_check` to surface unhandled
         // capabilities as a compile-time error.
-        Scheme::Handle { .. } => {
+        Term::Handle { .. } => {
             let eliminated = handl_language::eliminate_and_check(scheme)
                 .map_err(|e| LangError::engine_node(e.to_string(), node))?;
             compile_into(&eliminated, lang, ast, node, out)
@@ -256,7 +256,7 @@ fn compile_into(
 /// (`extend_env`), so the caller can emit `PopScope`.
 fn compile_arr(
     op: &str,
-    args: &[Scheme],
+    args: &[Term],
     source: &ArrSource,
     lit: Option<&Value>,
     lang: &Language,
@@ -669,7 +669,7 @@ fn try_extract_closure_params_body(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use handl_language::Scheme;
+    use handl_language::Term;
     use handl_language::{Ast, AstNode, Language};
     use serde_json::json;
 
@@ -689,42 +689,42 @@ mod tests {
 
     #[test]
     fn compile_const() {
-        let s = Scheme::arr_native_lit("const", vec![], json!(42));
+        let s = Term::arr_native_lit("const", vec![], json!(42));
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(instrs, vec![Instr::Push(json!(42)), Instr::Return]);
     }
 
     #[test]
     fn compile_const_no_lit() {
-        let s = Scheme::arr_native("const", vec![]);
+        let s = Term::arr_native("const", vec![]);
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(instrs, vec![Instr::Push(Value::Null), Instr::Return]);
     }
 
     #[test]
     fn compile_proj_env_named() {
-        let s = Scheme::arr_native_lit("proj_env", vec![], "x");
+        let s = Term::arr_native_lit("proj_env", vec![], "x");
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(instrs, vec![Instr::Load("x".into()), Instr::Return]);
     }
 
     #[test]
     fn compile_proj_env_payload() {
-        let s = Scheme::arr_native_lit("proj_env", vec![], "$payload");
+        let s = Term::arr_native_lit("proj_env", vec![], "$payload");
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(instrs, vec![Instr::LoadPayloadVar, Instr::Return]);
     }
 
     #[test]
     fn compile_proj_child() {
-        let s = Scheme::arr_native_lit("proj_child", vec![], json!(2));
+        let s = Term::arr_native_lit("proj_child", vec![], json!(2));
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(instrs, vec![Instr::EvalChild(2), Instr::Return]);
     }
 
     #[test]
     fn compile_extend_env_named() {
-        let s = Scheme::arr_native_lit("extend_env", vec![], "x");
+        let s = Term::arr_native_lit("extend_env", vec![], "x");
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(
             instrs,
@@ -734,7 +734,7 @@ mod tests {
 
     #[test]
     fn compile_extend_env_payload() {
-        let s = Scheme::arr_native_lit("extend_env", vec![], "$payload");
+        let s = Term::arr_native_lit("extend_env", vec![], "$payload");
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(
             instrs,
@@ -744,11 +744,11 @@ mod tests {
 
     #[test]
     fn compile_native_op() {
-        let s = Scheme::arr_native(
+        let s = Term::arr_native(
             "add",
             vec![
-                Scheme::arr_native_lit("proj_child", vec![], json!(0)),
-                Scheme::arr_native_lit("proj_child", vec![], json!(1)),
+                Term::arr_native_lit("proj_child", vec![], json!(0)),
+                Term::arr_native_lit("proj_child", vec![], json!(1)),
             ],
         );
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
@@ -765,9 +765,9 @@ mod tests {
 
     #[test]
     fn compile_foreign_op() {
-        let s = Scheme::arr_foreign(
+        let s = Term::arr_foreign(
             "double",
-            vec![Scheme::arr_native_lit("proj_child", vec![], json!(0))],
+            vec![Term::arr_native_lit("proj_child", vec![], json!(0))],
         );
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(
@@ -784,9 +784,9 @@ mod tests {
 
     #[test]
     fn compile_seq_no_scope() {
-        let s = Scheme::seq(
-            Scheme::arr_native_lit("const", vec![], json!(5)),
-            Scheme::arr_native("id", vec![]),
+        let s = Term::seq(
+            Term::arr_native_lit("const", vec![], json!(5)),
+            Term::arr_native("id", vec![]),
         );
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(
@@ -805,12 +805,12 @@ mod tests {
         // fst (const) does not push a scope. The inner Seq's snd (extend_env)
         // pushes a scope, which propagates to the outer Seq. The outer Seq
         // pops after its snd (proj_env) completes.
-        let s = Scheme::seq(
-            Scheme::seq(
-                Scheme::arr_native_lit("const", vec![], json!(5)),
-                Scheme::arr_native_lit("extend_env", vec![], "x"),
+        let s = Term::seq(
+            Term::seq(
+                Term::arr_native_lit("const", vec![], json!(5)),
+                Term::arr_native_lit("extend_env", vec![], "x"),
             ),
-            Scheme::arr_native_lit("proj_env", vec![], "x"),
+            Term::arr_native_lit("proj_env", vec![], "x"),
         );
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(
@@ -829,7 +829,7 @@ mod tests {
 
     #[test]
     fn compile_first() {
-        let s = Scheme::first(Scheme::arr_native("id", vec![]));
+        let s = Term::first(Term::arr_native("id", vec![]));
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         // FirstOp(1, 2) — inner sub-program at index 1..2 is the `id` op.
         assert_eq!(
@@ -846,9 +846,9 @@ mod tests {
 
     #[test]
     fn compile_choice() {
-        let s = Scheme::choice(
-            Scheme::arr_native_lit("const", vec![], json!(1)),
-            Scheme::arr_native_lit("const", vec![], json!(2)),
+        let s = Term::choice(
+            Term::arr_native_lit("const", vec![], json!(1)),
+            Term::arr_native_lit("const", vec![], json!(2)),
         );
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(
@@ -867,7 +867,7 @@ mod tests {
 
     #[test]
     fn compile_loop() {
-        let s = Scheme::loop_feedback(Scheme::arr_native("inc_fst", vec![]));
+        let s = Term::loop_feedback(Term::arr_native("inc_fst", vec![]));
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(
             instrs,
@@ -885,9 +885,9 @@ mod tests {
 
     #[test]
     fn compile_app() {
-        let s = Scheme::app(
-            Scheme::arr_native_lit("proj_env", vec![], "f"),
-            vec![Scheme::arr_native_lit("const", vec![], json!(41))],
+        let s = Term::app(
+            Term::arr_native_lit("proj_env", vec![], "f"),
+            vec![Term::arr_native_lit("const", vec![], json!(41))],
         );
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(
@@ -903,7 +903,7 @@ mod tests {
 
     #[test]
     fn compile_app_no_args() {
-        let s = Scheme::app(Scheme::arr_native_lit("proj_env", vec![], "f"), vec![]);
+        let s = Term::app(Term::arr_native_lit("proj_env", vec![], "f"), vec![]);
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(
             instrs,
@@ -916,14 +916,14 @@ mod tests {
     #[test]
     fn compile_branch_lowering() {
         // Seq(Seq(const true, tag), Choice(const "yes", const "no"))
-        let s = Scheme::seq(
-            Scheme::seq(
-                Scheme::arr_native_lit("const", vec![], json!(true)),
-                Scheme::arr_native("tag", vec![]),
+        let s = Term::seq(
+            Term::seq(
+                Term::arr_native_lit("const", vec![], json!(true)),
+                Term::arr_native("tag", vec![]),
             ),
-            Scheme::choice(
-                Scheme::arr_native_lit("const", vec![], "yes"),
-                Scheme::arr_native_lit("const", vec![], "no"),
+            Term::choice(
+                Term::arr_native_lit("const", vec![], "yes"),
+                Term::arr_native_lit("const", vec![], "no"),
             ),
         );
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
