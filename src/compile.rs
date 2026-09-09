@@ -260,6 +260,7 @@ fn compile_into(
 
         Term::Iter { .. } => Err(LangError::NotImplemented),
         Term::Child { .. } => Err(LangError::NotImplemented),
+        Term::Path { .. } | Term::Equiv { .. } | Term::Transport { .. } => Err(LangError::NotImplemented),
         Term::Rewrite { .. } => Err(LangError::NotImplemented),
     }
 }
