@@ -258,6 +258,19 @@ fn pair_snd(v: &TaggedValue) -> Option<&TaggedValue> {
     handl_value::pair_snd(v)
 }
 
+/// Flatten a right-nested `Pair` tree into a flat argument list (mirrors
+/// the v2 tree-walk's `flatten_pair`): `Pair(a, Pair(b, c))` → `[a, b, c]`.
+fn flatten_pair(v: &TaggedValue) -> Vec<TaggedValue> {
+    match v {
+        TaggedValue::Pair(p) => {
+            let mut left = flatten_pair(&p.0);
+            left.extend(flatten_pair(&p.1));
+            left
+        }
+        other => vec![other.clone()],
+    }
+}
+
 /// Return the type tag string for a [`TaggedValue`] (ADR-0060).
 fn type_tag(v: &TaggedValue) -> &'static str {
     match v {
@@ -1779,6 +1792,47 @@ impl<'a, 'h> VmFrame<'a, 'h> {
             // ADR-0074: `rec` — recursive computation region, iterated to a
             // fixpoint (mirrors the v2 tree-walk's `eval_rec`).
             "eval_rec" => self.prim_v2_eval_rec(node),
+            // ADR-0074 follow-up #3: `>>>` (`flow`) — function application
+            // with a single input argument. Unlike `call` (which unpacks a
+            // `proj_rest` array of call args), `flow` passes the left
+            // operand through as one argument, only destructuring a
+            // categorical `Pair` (`***`) into multiple positional args.
+            // Mirrors the v2 tree-walk's `flow` arm exactly.
+            "flow" => {
+                if args.len() != 2 {
+                    return Err(LangError::engine_node(
+                        format!("flow: expected 2 args, got {}", args.len()),
+                        node,
+                    ));
+                }
+                let input = &args[0];
+                let callee = &args[1];
+                let actual_args: Vec<TaggedValue> = if matches!(input, TaggedValue::Pair(_)) {
+                    flatten_pair(input)
+                } else {
+                    vec![input.clone()]
+                };
+                if let Some(name) = callee.as_str() {
+                    let modules = self.modules.ok_or_else(|| {
+                        LangError::engine_node("flow: no module registry".to_string(), node)
+                    })?;
+                    let func = modules.lookup(name).ok_or_else(|| {
+                        LangError::engine_node(
+                            format!("flow: function '{}' not found", name),
+                            node,
+                        )
+                    })?;
+                    let call_args: Vec<Value> =
+                        actual_args.iter().map(tagged_to_value).collect();
+                    let mut pctx = handl_platform::EvalContext::new();
+                    let val = func
+                        .call(&call_args, &mut pctx)
+                        .map_err(|e| LangError::engine_node(e.to_string(), node))?;
+                    Ok(TaggedValue::from(val))
+                } else {
+                    self.apply_app(callee, &actual_args)
+                }
+            }
             _ => Err(LangError::engine_node(
                 format!("unknown v2 native op: {}", op),
                 node,
