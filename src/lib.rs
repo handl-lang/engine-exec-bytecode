@@ -138,9 +138,11 @@ impl Default for BytecodeEngine {
     }
 }
 
-impl EvalEngine for BytecodeEngine {
-    fn eval(&self, lang: &Language, req: &EvalRequest) -> Result<Value, LangError> {
-        if req.ast.is_empty() {
+impl BytecodeEngine {
+    /// Evaluate `ast` (borrowed) — shared core of [`EvalEngine::eval`] and
+    /// [`EvalEngine::eval_shared`].
+    fn eval_ast(&self, lang: &Language, ast: &Ast) -> Result<Value, LangError> {
+        if ast.is_empty() {
             return Ok(Value::Null);
         }
         // Scheme version check -- the engine supports v2 only.
@@ -155,18 +157,19 @@ impl EvalEngine for BytecodeEngine {
         // specific AST shapes (e.g. object entry key kinds) before the VM
         // compiles and executes the program.  It is disabled by default to
         // preserve existing behavior; opt in with `with_lowering`.
-        let (ast, root_ref) = if self.lowering {
-            let root = AstRef::new(req.ast.len() - 1);
+        let (lowered, root_ref) = if self.lowering {
+            let root = AstRef::new(ast.len() - 1);
             let engine = RewriteEngine::new()
                 .with_native_registry(Arc::new(lower_natives()) as Arc<dyn NativeRewrite>);
-            let out = engine.run_pass(lang, &req.ast, root, "lower")?;
-            (out.ast, out.root)
+            let out = engine.run_pass(lang, ast, root, "lower")?;
+            (Some(out.ast), out.root)
         } else {
-            (req.ast.clone(), AstRef::new(req.ast.len() - 1))
+            (None, AstRef::new(ast.len() - 1))
         };
+        let ast = lowered.as_ref().unwrap_or(ast);
 
         let mut frame = VmFrame::new(
-            &ast,
+            ast,
             lang,
             self.modules.as_ref(),
             self.import_resolver.as_ref(),
@@ -175,6 +178,20 @@ impl EvalEngine for BytecodeEngine {
             frame.define_global(name, val.clone());
         }
         frame.exec_node(root_ref)
+    }
+}
+
+impl EvalEngine for BytecodeEngine {
+    fn eval(&self, lang: &Language, req: &EvalRequest) -> Result<Value, LangError> {
+        self.eval_ast(lang, &req.ast)
+    }
+
+    /// Borrow the caller's `Rc<Ast>` arena instead of deep-cloning it into
+    /// an [`EvalRequest`] — the VM only reads the arena, so per-call
+    /// re-evaluation of a cached AST (e.g. `plugin-lib-handl`'s
+    /// `HandlFunction` bridge) costs zero clones.
+    fn eval_shared(&self, lang: &Language, ast: &Rc<Ast>) -> Result<Value, LangError> {
+        self.eval_ast(lang, ast)
     }
 
     fn box_clone(&self) -> Box<dyn EvalEngine> {

@@ -762,7 +762,12 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     // they also consume the loop pair `(in, state)` that the
                     // enclosing `Loop` left on the stack below those args.
                     // Pop the args first, then pop the pair as `incoming`.
-                    let is_derived_step = op_is_derived_step(op);
+                    // `call_host` (ADR-0060 `call` scheme) also consumes a
+                    // stack-carried incoming below its args: `ChoiceJump`
+                    // pushes the routed callee, then `proj_rest` pushes the
+                    // arg array — so the callee sits beneath the args, like
+                    // a derived step op's loop pair.
+                    let is_derived_step = op_is_derived_step(op) || op == "call_host";
                     let inc = if is_derived_step {
                         // Filled below after popping args (the pair sits
                         // beneath the args on the stack).
@@ -1401,9 +1406,19 @@ impl<'a, 'h> VmFrame<'a, 'h> {
             // registry, and invokes the host function with the array
             // elements as individual arguments.
             "call_host" => {
-                let callee = args.first().and_then(|v| v.as_str()).ok_or_else(|| {
-                    LangError::engine_node("call_host: callee must be a string".to_string(), node)
-                })?;
+                // Mirror the tree-walk: the callee (e.g. `str.length`
+                // evaluating to the string "str.length") arrives as
+                // `incoming`; `args[0]` is the `proj_rest` arg array.
+                let callee = incoming
+                    .as_ref()
+                    .and_then(|v| v.as_str())
+                    .or_else(|| args.first().and_then(|v| v.as_str()))
+                    .ok_or_else(|| {
+                        LangError::engine_node(
+                            "call_host: callee must be a string".to_string(),
+                            node,
+                        )
+                    })?;
                 let modules = self.modules.ok_or_else(|| {
                     LangError::engine_node("call_host: no module registry".to_string(), node)
                 })?;
@@ -1413,8 +1428,15 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                         node,
                     )
                 })?;
-                let call_args: Vec<Value> = args
-                    .get(1)
+                // Arg array position: when the callee arrives as `incoming`
+                // (canonical `call` scheme), the `proj_rest` arg array is
+                // `args[0]`; the legacy convention puts it at `args[1]`.
+                let arg_src = if incoming.as_ref().and_then(|v| v.as_str()).is_some() {
+                    args.first()
+                } else {
+                    args.get(1)
+                };
+                let call_args: Vec<Value> = arg_src
                     .and_then(|v| v.as_array())
                     .map(|arr| arr.iter().map(tagged_to_value).collect())
                     .unwrap_or_default();
@@ -1780,6 +1802,56 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 } else {
                     let field_val = input.get(field_name).cloned().unwrap_or(TaggedValue::Null);
                     Ok(handl_value::tval!({"_tag": "Some", "value": field_val}))
+                }
+            }
+            // `field_access` — dynamic field access `target[field]`, native
+            // on `TaggedValue` (mirrors the tree-walk arm and
+            // `FieldAccessHostFn` in fp.rs): object+string → lookup,
+            // array+int → index, string+string → `a.b` concat for
+            // module-path construction. Keeping this in-engine avoids
+            // forcing closure-carrying records through `tagged_to_value`.
+            "field_access" => {
+                let target = args.first().cloned().unwrap_or(TaggedValue::Null);
+                let field = args.get(1).cloned().unwrap_or(TaggedValue::Null);
+                match (target, field) {
+                    (TaggedValue::Obj(map), TaggedValue::Str(key)) => {
+                        Ok(map.get(key.as_ref()).cloned().unwrap_or(TaggedValue::Null))
+                    }
+                    (TaggedValue::Arr(arr), field) => {
+                        let i = field
+                            .as_f64()
+                            .filter(|n| *n >= 0.0 && n.fract() == 0.0)
+                            .map(|n| n as usize)
+                            .ok_or_else(|| {
+                                LangError::engine_node(
+                                    "field_access: array index must be a non-negative integer"
+                                        .to_string(),
+                                    node,
+                                )
+                            })?;
+                        arr.get(i).cloned().ok_or_else(|| {
+                            LangError::engine_node(
+                                format!(
+                                    "field_access: index {i} out of bounds (len {})",
+                                    arr.len()
+                                ),
+                                node,
+                            )
+                        })
+                    }
+                    (TaggedValue::Str(s), TaggedValue::Str(key)) => {
+                        let joined: Rc<str> =
+                            Rc::from(format!("{}.{}", s.as_ref(), key.as_ref()));
+                        Ok(TaggedValue::Str(joined))
+                    }
+                    (target, field) => Err(LangError::engine_node(
+                        format!(
+                            "field_access: target must be object/array, field must be string/number; got {} and {}",
+                            type_tag(&target),
+                            type_tag(&field),
+                        ),
+                        node,
+                    )),
                 }
             }
             // Phase 9.5: `import "path"` loads a module via the configured
