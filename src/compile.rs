@@ -72,8 +72,12 @@ fn compile_into(
     out: &mut Vec<Instr>,
 ) -> Result<bool, LangError> {
     match scheme {
-        Term::Arr {
-            op,
+        Term::Arr { value } => {
+            out.push(Instr::Push(value.clone()));
+            Ok(false)
+        }
+
+        Term::Op { name: op,
             args,
             source,
             lit,
@@ -144,8 +148,7 @@ fn compile_into(
             // scope via `capture()`) on every iteration. Mirrors the
             // tree-walk optimization at
             // `plugin-engine-exec-tree-walk/src/lib.rs:402-456`.
-            if let Term::Arr {
-                op, args, source, ..
+            if let Term::Op { name: op, args, source, ..
             } = body.as_ref()
             {
                 if *source == ArrSource::Native && op == "loop_step" && !args.is_empty() {
@@ -250,6 +253,8 @@ fn compile_into(
             compile_into(&eliminated, lang, ast, node, out)
         }
 
+        Term::Iter { .. } => Err(LangError::NotImplemented),
+        Term::Child { .. } => Err(LangError::NotImplemented),
         Term::Rewrite { .. } => Err(LangError::NotImplemented),
     }
 }
