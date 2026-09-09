@@ -2074,6 +2074,49 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     ))
                 }
             }
+            // `paren` — parentheses/grouping: evaluate children from the
+            // current node, falling back to the supplied args/incoming.
+            "paren" => {
+                if let Some(children) = node
+                    .payload
+                    .get("children")
+                    .and_then(|c| c.as_array())
+                {
+                    if children.is_empty() {
+                        Ok(incoming.unwrap_or(TaggedValue::Null))
+                    } else if children.len() == 1 {
+                        let idx = children[0]
+                            .as_u64()
+                            .ok_or_else(|| {
+                                LangError::engine_node(
+                                    "paren: child index must be a number".to_string(),
+                                    node,
+                                )
+                            })? as usize;
+                        self.exec_node_inner(AstRef::new(idx))
+                    } else {
+                        let mut vals = Vec::with_capacity(children.len());
+                        for c in children {
+                            let idx = c
+                                .as_u64()
+                                .ok_or_else(|| {
+                                    LangError::engine_node(
+                                        "paren: child index must be a number".to_string(),
+                                        node,
+                                    )
+                                })? as usize;
+                            vals.push(self.exec_node_inner(AstRef::new(idx))?);
+                        }
+                        Ok(TaggedValue::Arr(Rc::from(vals)))
+                    }
+                } else if args.is_empty() {
+                    Ok(incoming.unwrap_or(TaggedValue::Null))
+                } else if args.len() == 1 {
+                    Ok(args[0].clone())
+                } else {
+                    Ok(TaggedValue::Arr(Rc::from(args.to_vec())))
+                }
+            }
             _ => Err(LangError::engine_node(
                 format!("unknown v2 native op: {}", op),
                 node,

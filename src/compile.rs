@@ -262,19 +262,21 @@ fn compile_into(
         Term::Child { .. } => Err(LangError::NotImplemented),
         Term::Path { .. } => Err(LangError::NotImplemented),
         Term::Equiv { .. } => Err(LangError::NotImplemented),
-        Term::Transport { .. } => Err(LangError::NotImplemented), // frontier: Transport not yet compiled
-        Term::CellId { .. } => Err(LangError::NotImplemented), // frontier: CellId not yet compiled
-        Term::CellCompV { .. } => Err(LangError::NotImplemented), // frontier: CellCompV not yet compiled
-        Term::CellCompH { .. } => Err(LangError::NotImplemented), // frontier: CellCompH not yet compiled
-        Term::Whisker { .. } => Err(LangError::NotImplemented), // frontier: Whisker not yet compiled
-        Term::Univalence { .. } => Err(LangError::NotImplemented), // frontier: Univalence not yet compiled
-        Term::Glue { .. } => Err(LangError::NotImplemented), // frontier: Glue not yet compiled
-        Term::Fibrant { .. } => Err(LangError::NotImplemented), // frontier: Fibrant not yet compiled
-        Term::JElim { .. } => Err(LangError::NotImplemented), // frontier: JElim not yet compiled
-        Term::Witness { .. } => Err(LangError::NotImplemented), // frontier: Witness not yet compiled
-        Term::Refine { .. } => Err(LangError::NotImplemented), // frontier: Refine not yet compiled
-        Term::Cobind { .. } => Err(LangError::NotImplemented), // frontier: Cobind not yet compiled
-        Term::Cobox { .. } => Err(LangError::NotImplemented), // frontier: Cobox not yet compiled
+        Term::CellId { .. } => Err(LangError::NotImplemented),
+        Term::Src { .. } => Err(LangError::NotImplemented),
+        Term::Tgt { .. } => Err(LangError::NotImplemented),
+        Term::CellCompV { .. } => Err(LangError::NotImplemented),
+        Term::Whisker { .. } => Err(LangError::NotImplemented),
+        Term::Const { .. } => Err(LangError::NotImplemented),
+        Term::RecordProj { .. } => Err(LangError::NotImplemented),
+        Term::RecordWith { .. } => Err(LangError::NotImplemented),
+        Term::Tag { .. } => Err(LangError::NotImplemented),
+        Term::Univalence { .. } => Err(LangError::NotImplemented),
+        Term::Glue { .. } => Err(LangError::NotImplemented),
+        Term::Fibrant { .. } => Err(LangError::NotImplemented),
+        Term::JElim { .. } => Err(LangError::NotImplemented),
+        Term::Refine { .. } => Err(LangError::NotImplemented),
+        Term::Cobind { .. } => Err(LangError::NotImplemented),
         Term::Rewrite { .. } => Err(LangError::NotImplemented),
     }
 }
