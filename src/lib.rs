@@ -58,7 +58,7 @@ pub mod instr;
 mod vm;
 
 pub use compile::compile;
-pub use instr::Instr;
+pub use instr::{ArithOp, Instr};
 
 use handl_language::{Ast, AstRef, LangError, Language, SchemeVersion, Value};
 use handl_plugin_engine_exec::{EvalEngine, EvalRequest};
@@ -899,7 +899,10 @@ mod tests {
         let req = EvalRequest::new(ast);
         let err = engine.eval(&lang, &req).unwrap_err();
         let msg = format!("{}", err);
-        assert!(msg.contains("unregistered foreign"));
+        // ADR-0103: foreign ops now compile to `Ffi`, so the not-found
+        // error is reported as "unregistered ffi" (the `Ffi` handler's
+        // fallback message) rather than "unregistered foreign".
+        assert!(msg.contains("unregistered ffi"));
     }
 
     #[test]

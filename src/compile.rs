@@ -27,7 +27,7 @@ use std::rc::Rc;
 use handl_language::{ArrSource, Language, Side, Term};
 use handl_language::{Ast, AstNode, AstRef, LangError, Value};
 
-use crate::instr::Instr;
+use crate::instr::{ArithOp, Instr};
 
 /// Compile a [`Term`] into a v2 bytecode program.
 ///
@@ -526,12 +526,28 @@ fn compile_arr(
             // path.
             if let Some(typed) = typed_binary_instr(op) {
                 out.push(typed);
+            } else if let Some(arith) = arith_instr(op) {
+                // ADR-0103: migrate the remaining arithmetic/logic ops
+                // (`neg`/`and`/`or`/`not`) that currently go through
+                // `NativeOp` to the consolidated `Arith` hardware-boundary
+                // instruction. Results are identical to the `NativeOp` path.
+                out.push(Instr::Arith(arith));
             } else {
                 out.push(Instr::NativeOp(op.to_string(), args.len()));
             }
         }
         ArrSource::Foreign(name) => {
-            out.push(Instr::ForeignOp(name.clone(), args.len()));
+            // ADR-0103: emit the `Ffi` hardware-boundary instruction instead
+            // of `ForeignOp`. The VM's `Ffi` handler looks up `(module,
+            // name)` in its foreign-function registry, falling back to the
+            // existing `ModuleLookup` dispatch (treating `name` as the
+            // qualified/flat host name) so already-registered host functions
+            // keep working. `ForeignOp` is retained as a fallback variant.
+            out.push(Instr::Ffi {
+                module: "host".to_string(),
+                name: name.clone(),
+                n: args.len(),
+            });
         }
         ArrSource::DynamicForeign => {
             // ADR-0060: DynamicForeign ops (e.g. call_host) are dispatched
@@ -577,6 +593,26 @@ fn typed_binary_instr(op: &str) -> Option<Instr> {
         "lte" => Instr::Lte,
         "gt" => Instr::Gt,
         "gte" => Instr::Gte,
+        _ => return None,
+    })
+}
+
+/// Map a native op name to an [`ArithOp`] for the ADR-0103 `Arith`
+/// hardware-boundary instruction, if the op is one of the arithmetic/logic
+/// ops not already covered by [`typed_binary_instr`].
+///
+/// Returns `Some` for `neg` (unary), `and`/`or` (binary logic), and `not`
+/// (unary). These currently go through `NativeOp`; emitting `Arith`
+/// instead begins the migration to the target minimal ISA. The common
+/// binary numeric ops (`add`/`sub`/`mul`/…) remain on the dedicated typed
+/// bytecodes for now (hot-path optimization); they will migrate to `Arith`
+/// in a later step. All other native ops fall through to `NativeOp`.
+fn arith_instr(op: &str) -> Option<ArithOp> {
+    Some(match op {
+        "neg" => ArithOp::Neg,
+        "and" => ArithOp::And,
+        "or" => ArithOp::Or,
+        "not" => ArithOp::Not,
         _ => return None,
     })
 }
@@ -887,11 +923,19 @@ mod tests {
             vec![Term::arr_native_lit("proj_child", vec![], json!(0))],
         );
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
+        // ADR-0103: foreign ops now compile to the `Ffi` hardware-boundary
+        // instruction (module "host") instead of `ForeignOp`. The VM's `Ffi`
+        // handler falls back to `ModuleLookup` dispatch, so behavior is
+        // identical.
         assert_eq!(
             instrs,
             vec![
                 Instr::EvalChild(0),
-                Instr::ForeignOp("double".into(), 1),
+                Instr::Ffi {
+                    module: "host".to_string(),
+                    name: "double".to_string(),
+                    n: 1,
+                },
                 Instr::Return,
             ]
         );
@@ -1054,6 +1098,47 @@ mod tests {
                 Instr::Jump(6),                   // 4: skip right
                 Instr::Push(json!("no")),         // 5: right (else)
                 Instr::Return,                    // 6: end
+            ]
+        );
+    }
+
+    // --- ADR-0103 Arith compilation ---
+
+    #[test]
+    fn compile_arith_and_emits_arith_instr() {
+        // `and` currently goes through `NativeOp`; ADR-0103 migrates it to
+        // the consolidated `Arith(ArithOp::And)` hardware-boundary
+        // instruction.
+        let s = Term::arr_native(
+            "and",
+            vec![
+                Term::arr_native_lit("proj_child", vec![], json!(0)),
+                Term::arr_native_lit("proj_child", vec![], json!(1)),
+            ],
+        );
+        let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
+        assert_eq!(
+            instrs,
+            vec![
+                Instr::EvalChild(0),
+                Instr::EvalChild(1),
+                Instr::Arith(ArithOp::And),
+                Instr::Return,
+            ]
+        );
+    }
+
+    #[test]
+    fn compile_arith_neg_emits_arith_instr() {
+        // `neg` is unary; it migrates to `Arith(ArithOp::Neg)`.
+        let s = Term::arr_native("neg", vec![Term::arr_native_lit("proj_child", vec![], json!(0))]);
+        let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
+        assert_eq!(
+            instrs,
+            vec![
+                Instr::EvalChild(0),
+                Instr::Arith(ArithOp::Neg),
+                Instr::Return,
             ]
         );
     }

@@ -77,6 +77,48 @@ use std::rc::Rc;
 
 use handl_language::Value;
 
+/// An ALU operation selected by the [`Instr::Arith`] hardware-boundary
+/// instruction (ADR-0103 §2.4).
+///
+/// These map directly to CPU arithmetic/logic operations — they are the
+/// irreducible arithmetic boundary of the kernel. `Neg` and `Not` are unary
+/// (pop one value); all others are binary (pop two values). Semantics mirror
+/// the corresponding `NativeOp` arms in [`crate::vm`] exactly, so results are
+/// identical to the `NativeOp`/typed-bytecode paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithOp {
+    /// Addition (`add`).
+    Add,
+    /// Subtraction (`sub`).
+    Sub,
+    /// Multiplication (`mul`).
+    Mul,
+    /// Division (`div`).
+    Div,
+    /// Modulo (`mod`).
+    Mod,
+    /// Equality (`eq`).
+    Eq,
+    /// Inequality (`neq`).
+    Neq,
+    /// Less-than (`lt`).
+    Lt,
+    /// Less-than-or-equal (`lte`/`Le`).
+    Le,
+    /// Greater-than (`gt`).
+    Gt,
+    /// Greater-than-or-equal (`gte`/`Ge`).
+    Ge,
+    /// Logical and (`and`).
+    And,
+    /// Logical or (`or`).
+    Or,
+    /// Logical not (`not`) — unary.
+    Not,
+    /// Numeric negation (`neg`) — unary.
+    Neg,
+}
+
 /// A single bytecode instruction in the v2 eval VM's instruction set.
 ///
 /// See the [module-level documentation](self) for the full ISA table,
@@ -362,5 +404,46 @@ pub enum Instr {
         body: usize,
         /// Whether the params node is an array-destructuring pattern.
         array_pattern: bool,
+    },
+
+    // --- ADR-0103 hardware-boundary instructions ---
+    //
+    // `Arith` and `Ffi` are the two hardware-boundary instructions from the
+    // target minimal ISA (ADR-0103 §2.4). `Arith` consolidates the typed
+    // arithmetic/comparison bytecodes and the arithmetic `NativeOp` arms into
+    // a single ALU instruction; `Ffi` is the host/OS syscall boundary,
+    // generalizing `ForeignOp` with a `module` field. The existing
+    // `NativeOp`/`ForeignOp`/typed-bytecode variants remain as fallbacks for
+    // ops not yet migrated.
+
+    /// Pop the operands and apply the ALU operation `op`, pushing the result.
+    ///
+    /// Binary ops (`Add`/`Sub`/`Mul`/`Div`/`Mod`/`Eq`/`Neq`/`Lt`/`Le`/`Gt`/
+    /// `Ge`/`And`/`Or`) pop two values (`b` on top, `a` below). Unary ops
+    /// (`Neg`/`Not`) pop one value. Semantics are identical to the
+    /// corresponding typed bytecodes ([`Instr::Add`], [`Instr::Eq`], …) and
+    /// `NativeOp` arms. This is the ADR-0103 target form; the dedicated
+    /// bytecodes are retained as hot-path optimizations.
+    Arith(ArithOp),
+
+    /// Pop `n` argument values, call the host/OS function `module::name`, and
+    /// push the result.
+    ///
+    /// This is the hardware-boundary instruction for effects (ADR-0103
+    /// §2.4). The VM looks up `(module, name)` in its foreign-function
+    /// registry; if absent, it falls back to the existing `ForeignOp`
+    /// dispatch (looking up `name` in the [`ModuleLookup`] registry) so
+    /// already-registered host functions keep working. Generalizes
+    /// [`Instr::ForeignOp`] with a `module` field for routing to different
+    /// host registries (`"host"`, `"io"`, `"fs"`, …).
+    ///
+    /// [`ModuleLookup`]: handl_platform::ModuleLookup
+    Ffi {
+        /// The host module name (e.g. `"host"`, `"io"`, `"fs"`).
+        module: String,
+        /// The function name within `module`.
+        name: String,
+        /// The number of argument values to pop from the operand stack.
+        n: usize,
     },
 }

@@ -69,7 +69,53 @@ use handl_value::{
 use rustc_hash::FxHashMap;
 
 use crate::compile::compile;
-use crate::instr::Instr;
+use crate::instr::{ArithOp, Instr};
+
+// ---------------------------------------------------------------------------
+// Ffi registry — the host/OS function table for `Instr::Ffi` (ADR-0103 §2.4)
+// ---------------------------------------------------------------------------
+
+/// A foreign-function entry for the [`Instr::Ffi`] hardware boundary.
+///
+/// Each entry is a closure that receives the popped argument values (as
+/// `serde_json::Value`) and returns a result value or an error message. The
+/// registry is keyed by `(module, name)`; when `Ffi` does not find an entry
+/// it falls back to the existing [`Instr::ForeignOp`] dispatch via
+/// [`ModuleLookup`](handl_platform::ModuleLookup).
+pub(crate) type FfiFn = Rc<dyn Fn(&[Value]) -> Result<Value, String>>;
+
+/// A registry of `(module, name)` -> host function mappings for `Ffi`.
+///
+/// Minimal in-process table; the VM owns one per frame (empty by default).
+/// Tests register mock foreign functions via [`VmFrame::register_ffi`].
+#[derive(Default)]
+pub(crate) struct FfiRegistry {
+    fns: FxHashMap<(String, String), FfiFn>,
+}
+
+impl FfiRegistry {
+    /// Create an empty registry.
+    pub(crate) fn new() -> Self {
+        Self {
+            fns: FxHashMap::default(),
+        }
+    }
+
+    /// Register a host function under `(module, name)`.
+    pub(crate) fn register(
+        &mut self,
+        module: &str,
+        name: &str,
+        f: FfiFn,
+    ) {
+        self.fns.insert((module.to_string(), name.to_string()), f);
+    }
+
+    /// Look up the host function for `(module, name)`.
+    pub(crate) fn lookup(&self, module: &str, name: &str) -> Option<&FfiFn> {
+        self.fns.get(&(module.to_string(), name.to_string()))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Scope stack — identical semantics to the tree-walk interpreter
@@ -410,6 +456,11 @@ pub(crate) struct VmFrame<'a, 'h> {
     /// correct (the inner call's stack is discarded when the outer call
     /// puts its own stack back).
     scratch_stack: Vec<TaggedValue>,
+    /// The foreign-function registry for [`Instr::Ffi`] (ADR-0103 §2.4).
+    /// Empty by default; tests register mock host functions via
+    /// [`VmFrame::register_ffi`]. When `Ffi` finds no entry here it falls
+    /// back to [`Instr::ForeignOp`] dispatch via `modules`.
+    ffi_registry: FfiRegistry,
 }
 
 impl<'a, 'h> VmFrame<'a, 'h> {
@@ -428,12 +479,26 @@ impl<'a, 'h> VmFrame<'a, 'h> {
             cache: FxHashMap::default(),
             scopes: ScopeStack::new(),
             scratch_stack: Vec::new(),
+            ffi_registry: FfiRegistry::new(),
         }
     }
 
     /// Define a global variable in the root scope (for unit tests).
     pub(crate) fn define_global(&mut self, name: &str, value: TaggedValue) {
         self.scopes.define(name, value);
+    }
+
+    /// Register a mock foreign function for [`Instr::Ffi`] (for unit tests).
+    ///
+    /// The function receives the popped argument values (as `serde_json::
+    /// Value`) and returns a result value or an error message.
+    pub(crate) fn register_ffi(
+        &mut self,
+        module: &str,
+        name: &str,
+        f: impl Fn(&[Value]) -> Result<Value, String> + 'static,
+    ) {
+        self.ffi_registry.register(module, name, Rc::new(f));
     }
 
     /// Set the host-provided globals map (e.g. `self`, `__arg_N`).
@@ -1034,6 +1099,89 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                         home: None,
                         array_pattern: *array_pattern,
                     });
+                }
+                // --- ADR-0103 hardware-boundary instructions ---
+                //
+                // `Arith(op)` is the consolidated ALU instruction. It mirrors
+                // the typed bytecodes (`Add`/`Sub`/…/`Eq`/`Lt`/…) and the
+                // arithmetic `NativeOp` arms exactly, so results are
+                // identical. Unary ops (`Neg`/`Not`) pop one value; all
+                // others pop two (`b` on top, `a` below).
+                Instr::Arith(op) => {
+                    let result = match op {
+                        ArithOp::Neg | ArithOp::Not => {
+                            let a = stack.pop().ok_or_else(|| {
+                                LangError::engine_node(
+                                    "stack underflow on Arith".to_string(),
+                                    node,
+                                )
+                            })?;
+                            eval_arith_unary(*op, a)?
+                        }
+                        _ => {
+                            let b = stack.pop().ok_or_else(|| {
+                                LangError::engine_node(
+                                    "stack underflow on Arith".to_string(),
+                                    node,
+                                )
+                            })?;
+                            let a = stack.pop().ok_or_else(|| {
+                                LangError::engine_node(
+                                    "stack underflow on Arith".to_string(),
+                                    node,
+                                )
+                            })?;
+                            eval_arith_bin(*op, a, b)?
+                        }
+                    };
+                    stack.push(result);
+                }
+                Instr::Ffi { module, name, n } => {
+                    let mut args = Vec::with_capacity(*n);
+                    for _ in 0..*n {
+                        args.push(stack.pop().ok_or_else(|| {
+                            LangError::engine_node(
+                                "stack underflow on Ffi".to_string(),
+                                node,
+                            )
+                        })?);
+                    }
+                    args.reverse();
+                    // First, consult the Ffi registry (ADR-0103 host/OS
+                    // boundary). If no entry is registered, fall back to the
+                    // existing `ForeignOp` dispatch via `ModuleLookup` so
+                    // already-registered host functions keep working.
+                    if let Some(f) = self.ffi_registry.lookup(module, name) {
+                        let val_args: Vec<Value> =
+                            args.iter().map(tagged_to_value).collect();
+                        let result = f(&val_args).map_err(|e| {
+                            LangError::engine_node(
+                                format!("ffi {}::{}: {}", module, name, e),
+                                node,
+                            )
+                        })?;
+                        stack.push(TaggedValue::from(result));
+                    } else {
+                        let modules = self.modules.ok_or_else(|| {
+                            LangError::engine_node(
+                                format!("unregistered ffi: {}::{}", module, name),
+                                node,
+                            )
+                        })?;
+                        let func = modules.lookup(name).ok_or_else(|| {
+                            LangError::engine_node(
+                                format!("unregistered ffi: {}::{}", module, name),
+                                node,
+                            )
+                        })?;
+                        let val_args: Vec<Value> =
+                            args.iter().map(tagged_to_value).collect();
+                        let mut pctx = handl_platform::EvalContext::new();
+                        let result = func
+                            .call(&val_args, &mut pctx)
+                            .map_err(|e| LangError::engine_node(e.to_string(), node))?;
+                        stack.push(TaggedValue::from(result));
+                    }
                 }
                 Instr::DerivedStepOp(op, ranges) => {
                     // Pop the loop pair (in, state) from the stack — left
@@ -1675,8 +1823,23 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 })?;
                 let current = if state.is_null() { in_val } else { state };
                 let call_args: Vec<TaggedValue> = if let Some(obj_state) = current.as_object() {
-                    if let TaggedValue::Arrow { params, .. } = body_proc {
-                        if params.len() > 1 {
+                    if let TaggedValue::Arrow { params, array_pattern, .. } = body_proc {
+                        if *array_pattern {
+                            if params.len() == 1 {
+                                vec![TaggedValue::Arr(Rc::from([current.clone()]))]
+                            } else {
+                                let arr: Vec<TaggedValue> = params
+                                    .iter()
+                                    .map(|p| {
+                                        obj_state
+                                            .get(p.as_str())
+                                            .cloned()
+                                            .unwrap_or(TaggedValue::Null)
+                                    })
+                                    .collect();
+                                vec![TaggedValue::Arr(arr.into())]
+                            }
+                        } else if params.len() > 1 {
                             params
                                 .iter()
                                 .map(|p| {
@@ -3122,6 +3285,113 @@ fn eval_bin_cmp(instr: &Instr, a: TaggedValue, b: TaggedValue) -> Result<TaggedV
     }
 }
 
+/// Evaluate a binary [`ArithOp`] (ADR-0103 `Arith` instruction).
+///
+/// `a` is the first argument (popped second), `b` is the second argument
+/// (popped first/top). Mirrors the typed bytecodes (`Add`/`Sub`/`Mul`/`Div`/
+/// `Mod`) and the comparison bytecodes (`Eq`/`Neq`/`Lt`/`Le`/`Gt`/`Ge`) plus
+/// the `and`/`or` `NativeOp` arms exactly, so results are identical.
+fn eval_arith_bin(op: ArithOp, a: TaggedValue, b: TaggedValue) -> Result<TaggedValue, LangError> {
+    match op {
+        ArithOp::Add => Ok(num_value({
+            let a = as_num(&a)?;
+            let b = as_num(&b)?;
+            match (a, b) {
+                (Num::Int(a), Num::Int(b)) => Num::Int((a as f64 + b as f64) as i64),
+                (a, b) => Num::Float(a.to_f64() + b.to_f64()),
+            }
+        })),
+        ArithOp::Sub => Ok(num_value({
+            let a = as_num(&a)?;
+            let b = as_num(&b)?;
+            match (a, b) {
+                (Num::Int(a), Num::Int(b)) => Num::Int((a as f64 - b as f64) as i64),
+                (a, b) => Num::Float(a.to_f64() - b.to_f64()),
+            }
+        })),
+        ArithOp::Mul => Ok(num_value({
+            let a = as_num(&a)?;
+            let b = as_num(&b)?;
+            match (a, b) {
+                (Num::Int(a), Num::Int(b)) => Num::Int((a as f64 * b as f64) as i64),
+                (a, b) => Num::Float(a.to_f64() * b.to_f64()),
+            }
+        })),
+        ArithOp::Div => {
+            let a = as_num(&a)?;
+            let b = as_num(&b)?;
+            if b.to_f64() == 0.0 {
+                return Err(LangError::engine("division by zero".to_string()));
+            }
+            Ok(match (a, b) {
+                (Num::Int(a), Num::Int(b)) => TaggedValue::Int(a / b),
+                (a, b) => TaggedValue::Float(a.to_f64() / b.to_f64()),
+            })
+        }
+        ArithOp::Mod => {
+            let a = as_num(&a)?;
+            let b = as_num(&b)?;
+            if b.to_f64() == 0.0 {
+                return Err(LangError::engine("modulo by zero".to_string()));
+            }
+            Ok(num_value(match (a, b) {
+                (Num::Int(a), Num::Int(b)) => Num::Int(a % b),
+                (a, b) => Num::Float(a.to_f64() % b.to_f64()),
+            }))
+        }
+        ArithOp::Eq => Ok(TaggedValue::Bool(handl_value::eq(&a, &b))),
+        ArithOp::Neq => Ok(TaggedValue::Bool(!handl_value::eq(&a, &b))),
+        ArithOp::Lt => {
+            let a = as_num(&a)?;
+            let b = as_num(&b)?;
+            Ok(TaggedValue::Bool(a.to_f64() < b.to_f64()))
+        }
+        ArithOp::Le => {
+            let a = as_num(&a)?;
+            let b = as_num(&b)?;
+            Ok(TaggedValue::Bool(a.to_f64() <= b.to_f64()))
+        }
+        ArithOp::Gt => {
+            let a = as_num(&a)?;
+            let b = as_num(&b)?;
+            Ok(TaggedValue::Bool(a.to_f64() > b.to_f64()))
+        }
+        ArithOp::Ge => {
+            let a = as_num(&a)?;
+            let b = as_num(&b)?;
+            Ok(TaggedValue::Bool(a.to_f64() >= b.to_f64()))
+        }
+        ArithOp::And => Ok(TaggedValue::Bool(is_truthy(&a) && is_truthy(&b))),
+        ArithOp::Or => Ok(TaggedValue::Bool(is_truthy(&a) || is_truthy(&b))),
+        // Unary ops are handled by `eval_arith_unary`.
+        ArithOp::Neg | ArithOp::Not => Err(LangError::engine(format!(
+            "eval_arith_bin: not a binary ArithOp: {:?}",
+            op
+        ))),
+    }
+}
+
+/// Evaluate a unary [`ArithOp`] (`Neg`/`Not`) for the `Arith` instruction.
+///
+/// Mirrors the `neg` and `not` `NativeOp` arms exactly.
+fn eval_arith_unary(op: ArithOp, a: TaggedValue) -> Result<TaggedValue, LangError> {
+    match op {
+        ArithOp::Neg => {
+            let a = as_num(&a)?;
+            Ok(num_value(match a {
+                Num::Int(i) => Num::Int(-i),
+                Num::Float(f) => Num::Float(-f),
+            }))
+        }
+        ArithOp::Not => Ok(TaggedValue::Bool(!is_truthy(&a))),
+        // Binary ops are handled by `eval_arith_bin`.
+        _ => Err(LangError::engine(format!(
+            "eval_arith_unary: not a unary ArithOp: {:?}",
+            op
+        ))),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -3840,8 +4110,11 @@ mod tests {
             vec![Term::arr_native_lit("const", vec![], json!(21))],
         );
         let err = eval_standalone(&s).unwrap_err();
+        // ADR-0103: foreign ops now compile to `Ffi`, so the no-modules
+        // error is reported as "unregistered ffi" (the `Ffi` handler's
+        // fallback message) rather than "unregistered foreign".
         assert!(
-            matches!(err, LangError::Engine { ref message, .. } if message.contains("unregistered foreign"))
+            matches!(err, LangError::Engine { ref message, .. } if message.contains("unregistered ffi"))
         );
     }
 
@@ -4083,5 +4356,144 @@ mod tests {
         let mut frame = VmFrame::new(&ast, &lang, None, Some(&resolver));
         let result = frame.exec_node(AstRef::new(3)).unwrap();
         assert_eq!(result, json!(42));
+    }
+
+    // --- ADR-0103 Arith hardware-boundary instruction tests ---
+    //
+    // These construct raw instruction sequences and execute them via
+    // `exec_instrs`, verifying the consolidated `Arith(op)` ALU instruction
+    // produces results identical to the typed bytecodes / `NativeOp` arms.
+
+    /// Execute a raw instruction sequence against a fresh frame and return
+    /// the result `Value`.
+    fn eval_instrs(instrs: &[Instr]) -> Value {
+        let ast = make_ast(vec![dummy_node()]);
+        let lang = Language::new();
+        let node = ast.at(AstRef::new(0)).unwrap();
+        let mut frame = VmFrame::new(&ast, &lang, None, None);
+        frame.exec_instrs(instrs, node, None).unwrap()
+    }
+
+    #[test]
+    fn arith_add_computes_sum() {
+        let instrs = vec![
+            Instr::Push(json!(3)),
+            Instr::Push(json!(4)),
+            Instr::Arith(ArithOp::Add),
+            Instr::Return,
+        ];
+        assert_eq!(eval_instrs(&instrs), json!(7));
+    }
+
+    #[test]
+    fn arith_sub_computes_difference() {
+        let instrs = vec![
+            Instr::Push(json!(10)),
+            Instr::Push(json!(3)),
+            Instr::Arith(ArithOp::Sub),
+            Instr::Return,
+        ];
+        assert_eq!(eval_instrs(&instrs), json!(7));
+    }
+
+    #[test]
+    fn arith_mul_computes_product() {
+        let instrs = vec![
+            Instr::Push(json!(3)),
+            Instr::Push(json!(4)),
+            Instr::Arith(ArithOp::Mul),
+            Instr::Return,
+        ];
+        assert_eq!(eval_instrs(&instrs), json!(12));
+    }
+
+    #[test]
+    fn arith_eq_returns_true_for_equal() {
+        let instrs = vec![
+            Instr::Push(json!(3)),
+            Instr::Push(json!(3)),
+            Instr::Arith(ArithOp::Eq),
+            Instr::Return,
+        ];
+        assert_eq!(eval_instrs(&instrs), json!(true));
+    }
+
+    #[test]
+    fn arith_lt_returns_true_for_less() {
+        let instrs = vec![
+            Instr::Push(json!(3)),
+            Instr::Push(json!(5)),
+            Instr::Arith(ArithOp::Lt),
+            Instr::Return,
+        ];
+        assert_eq!(eval_instrs(&instrs), json!(true));
+    }
+
+    #[test]
+    fn arith_neg_is_unary() {
+        let instrs = vec![
+            Instr::Push(json!(5)),
+            Instr::Arith(ArithOp::Neg),
+            Instr::Return,
+        ];
+        assert_eq!(eval_instrs(&instrs), json!(-5));
+    }
+
+    #[test]
+    fn arith_not_is_unary() {
+        let instrs = vec![
+            Instr::Push(json!(false)),
+            Instr::Arith(ArithOp::Not),
+            Instr::Return,
+        ];
+        assert_eq!(eval_instrs(&instrs), json!(true));
+    }
+
+    // --- ADR-0103 Ffi hardware-boundary instruction test ---
+
+    #[test]
+    fn ffi_calls_registered_foreign_function() {
+        let instrs = vec![
+            Instr::Push(json!(21)),
+            Instr::Ffi {
+                module: "test".to_string(),
+                name: "double".to_string(),
+                n: 1,
+            },
+            Instr::Return,
+        ];
+        let ast = make_ast(vec![dummy_node()]);
+        let lang = Language::new();
+        let node = ast.at(AstRef::new(0)).unwrap();
+        let mut frame = VmFrame::new(&ast, &lang, None, None);
+        frame.register_ffi("test", "double", |args| {
+            let n = args[0].as_i64().ok_or("expected integer")?;
+            Ok(Value::from(n * 2))
+        });
+        let result = frame.exec_instrs(&instrs, node, None).unwrap();
+        assert_eq!(result, json!(42));
+    }
+
+    #[test]
+    fn ffi_falls_back_to_module_lookup() {
+        // When no Ffi registry entry exists, `Ffi { module: "host", name,
+        // n }` falls back to the existing `ForeignOp` dispatch via
+        // `ModuleLookup` — so a registered host function still resolves.
+        let instrs = vec![
+            Instr::Push(json!(3)),
+            Instr::Ffi {
+                module: "host".to_string(),
+                name: "double".to_string(),
+                n: 1,
+            },
+            Instr::Return,
+        ];
+        let ast = make_ast(vec![dummy_node()]);
+        let lang = Language::new();
+        let node = ast.at(AstRef::new(0)).unwrap();
+        let registry = double_registry();
+        let mut frame = VmFrame::new(&ast, &lang, Some(&registry), None);
+        let result = frame.exec_instrs(&instrs, node, None).unwrap();
+        assert_eq!(result, json!(6));
     }
 }
