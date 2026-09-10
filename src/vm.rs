@@ -62,7 +62,10 @@ use std::rc::Rc;
 use handl_language::{Ast, AstNode, AstRef, LangError, Language, Value};
 use handl_plugin_engine_exec::pattern_match::{self, PatternMatchCtx};
 use handl_plugin_engine_exec_tree_walk::home_frame;
-use handl_value::{TaggedValue, tagged_to_value};
+use handl_value::{
+    TaggedValue, cell2_comp_v, cell2_id, cell2_src, cell2_tgt, cell2_whisker, record_proj,
+    tagged_to_value,
+};
 use rustc_hash::FxHashMap;
 
 use crate::compile::compile;
@@ -144,6 +147,7 @@ impl ScopeStack {
     }
 
     /// Define a variable in the current (innermost) scope.
+    #[inline]
     pub(crate) fn define(&mut self, name: &str, value: TaggedValue) {
         self.bindings.push((Rc::from(name), value));
     }
@@ -2077,34 +2081,26 @@ impl<'a, 'h> VmFrame<'a, 'h> {
             // `paren` — parentheses/grouping: evaluate children from the
             // current node, falling back to the supplied args/incoming.
             "paren" => {
-                if let Some(children) = node
-                    .payload
-                    .get("children")
-                    .and_then(|c| c.as_array())
-                {
+                if let Some(children) = node.payload.get("children").and_then(|c| c.as_array()) {
                     if children.is_empty() {
                         Ok(incoming.unwrap_or(TaggedValue::Null))
                     } else if children.len() == 1 {
-                        let idx = children[0]
-                            .as_u64()
-                            .ok_or_else(|| {
+                        let idx = children[0].as_u64().ok_or_else(|| {
+                            LangError::engine_node(
+                                "paren: child index must be a number".to_string(),
+                                node,
+                            )
+                        })? as usize;
+                        self.exec_node_inner(AstRef::new(idx))
+                    } else {
+                        let mut vals = Vec::with_capacity(children.len());
+                        for c in children {
+                            let idx = c.as_u64().ok_or_else(|| {
                                 LangError::engine_node(
                                     "paren: child index must be a number".to_string(),
                                     node,
                                 )
                             })? as usize;
-                        self.exec_node_inner(AstRef::new(idx))
-                    } else {
-                        let mut vals = Vec::with_capacity(children.len());
-                        for c in children {
-                            let idx = c
-                                .as_u64()
-                                .ok_or_else(|| {
-                                    LangError::engine_node(
-                                        "paren: child index must be a number".to_string(),
-                                        node,
-                                    )
-                                })? as usize;
                             vals.push(self.exec_node_inner(AstRef::new(idx))?);
                         }
                         Ok(TaggedValue::Arr(Rc::from(vals)))
@@ -2119,22 +2115,38 @@ impl<'a, 'h> VmFrame<'a, 'h> {
             }
             // Frontier: transport a value along a path.
             "transport" => Ok(args.get(1).cloned().unwrap_or(TaggedValue::Null)),
-            // Frontier: horizontal cell composition.
-            "cell_hcomp" => {
-                let mut map = FxHashMap::default();
-                map.insert(
-                    Rc::from("__tag__"),
-                    TaggedValue::Str(Rc::from("CellCompH")),
-                );
-                map.insert(
-                    Rc::from("left"),
-                    args.first().cloned().unwrap_or(TaggedValue::Null),
-                );
-                map.insert(
-                    Rc::from("right"),
-                    args.get(1).cloned().unwrap_or(TaggedValue::Null),
-                );
-                Ok(TaggedValue::Obj(Rc::new(map)))
+            // ADR-0104b: 2-cell runtime value helpers.
+            "cell2_id" => {
+                let arrow = args.first().cloned().unwrap_or(TaggedValue::Null);
+                Ok(cell2_id(&arrow))
+            }
+            "cell2_comp_v" => {
+                let first = args.first().cloned().unwrap_or(TaggedValue::Null);
+                let second = args.get(1).cloned().unwrap_or(TaggedValue::Null);
+                Ok(cell2_comp_v(&first, &second))
+            }
+            "cell2_whisker_left" => {
+                let arrow = args.first().cloned().unwrap_or(TaggedValue::Null);
+                let cell = args.get(1).cloned().unwrap_or(TaggedValue::Null);
+                Ok(cell2_whisker("Left", &arrow, &cell))
+            }
+            "cell2_whisker_right" => {
+                let arrow = args.first().cloned().unwrap_or(TaggedValue::Null);
+                let cell = args.get(1).cloned().unwrap_or(TaggedValue::Null);
+                Ok(cell2_whisker("Right", &arrow, &cell))
+            }
+            "cell2_src" => {
+                let cell = args.first().cloned().unwrap_or(TaggedValue::Null);
+                Ok(cell2_src(&cell))
+            }
+            "cell2_tgt" => {
+                let cell = args.first().cloned().unwrap_or(TaggedValue::Null);
+                Ok(cell2_tgt(&cell))
+            }
+            "record_proj" => {
+                let record = args.first().cloned().unwrap_or(TaggedValue::Null);
+                let field = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+                Ok(record_proj(&record, field))
             }
             _ => Err(LangError::engine_node(
                 format!("unknown v2 native op: {}", op),
