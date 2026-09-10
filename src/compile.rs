@@ -24,8 +24,9 @@
 
 use std::rc::Rc;
 
-use handl_language::{ArrSource, Language, Side, Term};
+use handl_language::{ArrSource, Language, Term};
 use handl_language::{Ast, AstNode, AstRef, LangError, Value};
+use plugin_engine::TermData;
 
 use crate::instr::{ArithOp, Instr};
 
@@ -64,6 +65,10 @@ pub fn compile(
 /// Returns `Ok(true)` if the compiled code pushes a scope that the caller is
 /// responsible for popping (i.e. `extend_env` was emitted). This mirrors the
 /// tree-walk's `did_push` discipline.
+///
+/// This is the `&Term` entry point: it converts the scheme to [`TermData`]
+/// (ADR-0103 Phase 6) and delegates to [`compile_into_td`], which dispatches
+/// on the `__tag__` field instead of matching the `Term` enum.
 fn compile_into(
     scheme: &Term,
     lang: &Language,
@@ -71,22 +76,53 @@ fn compile_into(
     node: &AstNode,
     out: &mut Vec<Instr>,
 ) -> Result<bool, LangError> {
-    match scheme {
-        Term::Arr { value } => {
-            out.push(Instr::Push(value.clone()));
+    let td = TermData::from_term(scheme);
+    compile_into_td(&td, lang, ast, node, out)
+}
+
+/// The [`TermData`]-driven counterpart of [`compile_into`].
+///
+/// Dispatches on [`TermData::tag`] and reads variant fields via the
+/// `get`/`get_str`/`get_term`/`get_term_list` accessors. Derived forms
+/// (`CellId`/`Src`/`Tgt`/`CellCompV`/`Whisker`/`Const`/`RecordProj`) are
+/// rewritten to their `Op`/`Arr` lowering using [`TermData`] constructors and
+/// recompiled recursively, so no `Term` enum value is constructed for them.
+fn compile_into_td(
+    td: &TermData,
+    lang: &Language,
+    ast: &Ast,
+    node: &AstNode,
+    out: &mut Vec<Instr>,
+) -> Result<bool, LangError> {
+    match td.tag() {
+        "Arr" => {
+            let value = td
+                .get("value")
+                .cloned()
+                .expect("Arr term missing 'value' field");
+            out.push(Instr::Push(value));
             Ok(false)
         }
 
-        Term::Op {
-            name: op,
-            args,
-            source,
-            lit,
-        } => compile_arr(op, args, source, lit.as_ref(), lang, ast, node, out),
+        "Op" => {
+            let op = td
+                .get_str("name")
+                .expect("Op term missing 'name' field")
+                .to_string();
+            let args = td.get_term_list("args");
+            let source = td
+                .arr_source()
+                .expect("Op term missing or malformed 'source' field");
+            // `lit` is stored as `null` when `None`; treat Null as absent.
+            let lit = td.get("lit").filter(|v| !v.is_null());
+            compile_arr(&op, &args, &source, lit, lang, ast, node, out)
+        }
 
-        Term::Seq { fst, snd } => {
-            let fst_pushed = compile_into(fst, lang, ast, node, out)?;
-            let snd_pushed = compile_into(snd, lang, ast, node, out)?;
+        "Seq" => {
+            let fst = td.get_term("fst").expect("Seq term missing 'fst' field");
+            let snd = td.get_term("snd").expect("Seq term missing 'snd' field");
+            let fst_pushed = compile_into_td(&fst, lang, ast, node, out)?;
+            let snd_pushed = compile_into_td(&snd, lang, ast, node, out)?;
             // Pop the scope `fst` reported (e.g. extend_env as fst), matching
             // the tree-walk's Seq scope discipline.
             if fst_pushed {
@@ -97,7 +133,10 @@ fn compile_into(
             Ok(snd_pushed)
         }
 
-        Term::First { inner } => {
+        "First" => {
+            let inner = td
+                .get_term("inner")
+                .expect("First term missing 'inner' field");
             // FirstOp(start, end) — the inner sub-program runs on a fresh
             // stack with the pair's first component as incoming. This
             // correctly handles inner arrows like `const` that don't consume
@@ -106,7 +145,7 @@ fn compile_into(
             let firstop_pos = out.len();
             out.push(Instr::FirstOp(0, 0)); // placeholder
             let inner_start = out.len();
-            let inner_pushed = compile_into(inner, lang, ast, node, out)?;
+            let inner_pushed = compile_into_td(&inner, lang, ast, node, out)?;
             if inner_pushed {
                 out.push(Instr::PopScope);
             }
@@ -115,13 +154,15 @@ fn compile_into(
             Ok(false)
         }
 
-        Term::Choice { l, r } => {
+        "Choice" => {
+            let l = td.get_term("l").expect("Choice term missing 'l' field");
+            let r = td.get_term("r").expect("Choice term missing 'r' field");
             // ChoiceJump(left_target, right_target) -- placeholder.
             let cj_pos = out.len();
             out.push(Instr::ChoiceJump(0, 0));
             // Left branch.
             let left_target = out.len();
-            let l_pushed = compile_into(l, lang, ast, node, out)?;
+            let l_pushed = compile_into_td(&l, lang, ast, node, out)?;
             if l_pushed {
                 out.push(Instr::PopScope);
             }
@@ -129,7 +170,7 @@ fn compile_into(
             out.push(Instr::Jump(0)); // placeholder -- skip right branch
             // Right branch.
             let right_target = out.len();
-            let r_pushed = compile_into(r, lang, ast, node, out)?;
+            let r_pushed = compile_into_td(&r, lang, ast, node, out)?;
             if r_pushed {
                 out.push(Instr::PopScope);
             }
@@ -140,7 +181,10 @@ fn compile_into(
             Ok(false)
         }
 
-        Term::Loop { body } => {
+        "Loop" => {
+            let body = td
+                .get_term("body")
+                .expect("Loop term missing 'body' field");
             // Optimization: when the body is a `loop_step` Arr, hoist the
             // body closure evaluation outside the loop. The closure captures
             // the definition-time env, which doesn't change between iterations
@@ -149,19 +193,16 @@ fn compile_into(
             // scope via `capture()`) on every iteration. Mirrors the
             // tree-walk optimization at
             // `plugin-engine-exec-tree-walk/src/lib.rs:402-456`.
-            if let Term::Op {
-                name: op,
-                args,
-                source,
-                ..
-            } = body.as_ref()
-            {
-                if *source == ArrSource::Native && op == "loop_step" && !args.is_empty() {
+            if body.tag() == "Op" {
+                let op = body.get_str("name").unwrap_or("");
+                let source = body.arr_source().unwrap_or(ArrSource::Native);
+                let args = body.get_term_list("args");
+                if source == ArrSource::Native && op == "loop_step" && !args.is_empty() {
                     let body_proc = &args[0];
                     // Compile the body closure once, before the loop. This
                     // evaluates the `function`/`closure` child once,
                     // producing a `TaggedValue::Arrow` on the operand stack.
-                    let bp_pushed = compile_into(body_proc, lang, ast, node, out)?;
+                    let bp_pushed = compile_into_td(body_proc, lang, ast, node, out)?;
                     if bp_pushed {
                         out.push(Instr::PopScope);
                     }
@@ -184,7 +225,7 @@ fn compile_into(
                     // closure creation.
                     out.push(Instr::Load(Rc::from("__loop_closure__")));
                     for arg in &args[1..] {
-                        let arg_pushed = compile_into(arg, lang, ast, node, out)?;
+                        let arg_pushed = compile_into_td(arg, lang, ast, node, out)?;
                         if arg_pushed {
                             out.push(Instr::PopScope);
                         }
@@ -216,7 +257,7 @@ fn compile_into(
             out.push(Instr::Push(Value::Null));
             out.push(Instr::Pair);
             let loop_back = out.len();
-            let body_pushed = compile_into(body, lang, ast, node, out)?;
+            let body_pushed = compile_into_td(&body, lang, ast, node, out)?;
             // The tree-walk pops any scope the body pushed after each
             // iteration. In the VM, we emit PopScope after the body code
             // but before LoopCheck, so it runs each iteration.
@@ -227,13 +268,17 @@ fn compile_into(
             Ok(false)
         }
 
-        Term::App { callee, args } => {
-            let callee_pushed = compile_into(callee, lang, ast, node, out)?;
+        "App" => {
+            let callee = td
+                .get_term("callee")
+                .expect("App term missing 'callee' field");
+            let args = td.get_term_list("args");
+            let callee_pushed = compile_into_td(&callee, lang, ast, node, out)?;
             if callee_pushed {
                 out.push(Instr::PopScope);
             }
-            for arg in args {
-                let arg_pushed = compile_into(arg, lang, ast, node, out)?;
+            for arg in &args {
+                let arg_pushed = compile_into_td(arg, lang, ast, node, out)?;
                 if arg_pushed {
                     out.push(Instr::PopScope);
                 }
@@ -251,126 +296,163 @@ fn compile_into(
         // `handle body with target = impl_` (ADR-0076): eliminate the
         // handler at compile time, then compile the resulting handler-free
         // scheme. Uses `eliminate_and_check` to surface unhandled
-        // capabilities as a compile-time error.
-        Term::Handle { .. } => {
-            let eliminated = handl_language::eliminate_and_check(scheme)
+        // capabilities as a compile-time error. `eliminate_and_check`
+        // operates on the `Term` enum, so the `TermData` is converted back
+        // via [`TermData::to_term`] for this one case.
+        "Handle" => {
+            let term = td
+                .to_term()
+                .map_err(|e| LangError::engine_node(e, node))?;
+            let eliminated = handl_language::eliminate_and_check(&term)
                 .map_err(|e| LangError::engine_node(e.to_string(), node))?;
             compile_into(&eliminated, lang, ast, node, out)
         }
 
-        Term::Iter { .. } => Err(LangError::NotImplemented),
-        Term::Child { .. } => Err(LangError::NotImplemented),
-        Term::Path { .. } => Err(LangError::NotImplemented),
-        Term::Equiv { .. } => Err(LangError::NotImplemented),
-        Term::CellId { arrow } => compile_into(
-            &Term::Op {
-                name: "cell2_id".to_string(),
-                args: vec![arrow.as_ref().clone()],
-                source: ArrSource::Native,
-                lit: None,
-            },
-            lang,
-            ast,
-            node,
-            out,
-        ),
-        Term::Src { cell } => compile_into(
-            &Term::Op {
-                name: "cell2_src".to_string(),
-                args: vec![cell.as_ref().clone()],
-                source: ArrSource::Native,
-                lit: None,
-            },
-            lang,
-            ast,
-            node,
-            out,
-        ),
-        Term::Tgt { cell } => compile_into(
-            &Term::Op {
-                name: "cell2_tgt".to_string(),
-                args: vec![cell.as_ref().clone()],
-                source: ArrSource::Native,
-                lit: None,
-            },
-            lang,
-            ast,
-            node,
-            out,
-        ),
-        Term::CellCompV { first, second } => compile_into(
-            &Term::Op {
-                name: "cell2_comp_v".to_string(),
-                args: vec![first.as_ref().clone(), second.as_ref().clone()],
-                source: ArrSource::Native,
-                lit: None,
-            },
-            lang,
-            ast,
-            node,
-            out,
-        ),
-        Term::Whisker { side, arrow, cell } => {
-            let op = match side {
-                Side::Left => "cell2_whisker_left",
-                Side::Right => "cell2_whisker_right",
-            };
-            compile_into(
-                &Term::Op {
-                    name: op.to_string(),
-                    args: vec![arrow.as_ref().clone(), cell.as_ref().clone()],
-                    source: ArrSource::Native,
-                    lit: None,
-                },
+        "Iter" => Err(LangError::NotImplemented),
+        "Child" => Err(LangError::NotImplemented),
+        "Path" => Err(LangError::NotImplemented),
+        "Equiv" => Err(LangError::NotImplemented),
+        // HoTT/cell combinators lower to native `cell2_*` ops. The lowering
+        // is expressed with [`TermData`] constructors and recompiled, so no
+        // `Term` enum value is built.
+        "CellId" => {
+            let arrow = td
+                .get_term("arrow")
+                .expect("CellId term missing 'arrow' field");
+            compile_into_td(
+                &TermData::op("cell2_id", vec![arrow], &ArrSource::Native, None),
                 lang,
                 ast,
                 node,
                 out,
             )
         }
-        Term::Const { value } => compile_into(
-            &Term::Arr {
-                value: value.clone(),
-            },
-            lang,
-            ast,
+        "Src" => {
+            let cell = td
+                .get_term("cell")
+                .expect("Src term missing 'cell' field");
+            compile_into_td(
+                &TermData::op("cell2_src", vec![cell], &ArrSource::Native, None),
+                lang,
+                ast,
+                node,
+                out,
+            )
+        }
+        "Tgt" => {
+            let cell = td
+                .get_term("cell")
+                .expect("Tgt term missing 'cell' field");
+            compile_into_td(
+                &TermData::op("cell2_tgt", vec![cell], &ArrSource::Native, None),
+                lang,
+                ast,
+                node,
+                out,
+            )
+        }
+        "CellCompV" => {
+            let first = td
+                .get_term("first")
+                .expect("CellCompV term missing 'first' field");
+            let second = td
+                .get_term("second")
+                .expect("CellCompV term missing 'second' field");
+            compile_into_td(
+                &TermData::op(
+                    "cell2_comp_v",
+                    vec![first, second],
+                    &ArrSource::Native,
+                    None,
+                ),
+                lang,
+                ast,
+                node,
+                out,
+            )
+        }
+        "Whisker" => {
+            let arrow = td
+                .get_term("arrow")
+                .expect("Whisker term missing 'arrow' field");
+            let cell = td
+                .get_term("cell")
+                .expect("Whisker term missing 'cell' field");
+            let op = match td.get_str("side").unwrap_or("") {
+                "Left" => "cell2_whisker_left",
+                "Right" => "cell2_whisker_right",
+                other => {
+                    return Err(LangError::engine_node(
+                        format!("Whisker: unknown side '{other}'"),
+                        node,
+                    ))
+                }
+            };
+            compile_into_td(
+                &TermData::op(
+                    op,
+                    vec![arrow, cell],
+                    &ArrSource::Native,
+                    None,
+                ),
+                lang,
+                ast,
+                node,
+                out,
+            )
+        }
+        "Const" => {
+            let value = td
+                .get("value")
+                .cloned()
+                .expect("Const term missing 'value' field");
+            compile_into_td(&TermData::arr(value), lang, ast, node, out)
+        }
+        "RecordProj" => {
+            let record = td
+                .get_term("record")
+                .expect("RecordProj term missing 'record' field");
+            let field = td
+                .get_str("field")
+                .expect("RecordProj term missing 'field' field")
+                .to_string();
+            compile_into_td(
+                &TermData::op(
+                    "record_proj",
+                    vec![record, TermData::arr(Value::String(field))],
+                    &ArrSource::Native,
+                    None,
+                ),
+                lang,
+                ast,
+                node,
+                out,
+            )
+        }
+        "RecordWith" => Err(LangError::NotImplemented),
+        "Tag" => Err(LangError::NotImplemented),
+        "Univalence" => Err(LangError::NotImplemented),
+        "Glue" => Err(LangError::NotImplemented),
+        "Fibrant" => Err(LangError::NotImplemented),
+        "JElim" => Err(LangError::NotImplemented),
+        "Refine" => Err(LangError::NotImplemented),
+        "Cobind" => Err(LangError::NotImplemented),
+        "Rewrite" => Err(LangError::NotImplemented),
+        other => Err(LangError::engine_node(
+            format!("compile: unknown Term tag '{other}'"),
             node,
-            out,
-        ),
-        Term::RecordProj { record, field } => compile_into(
-            &Term::Op {
-                name: "record_proj".to_string(),
-                args: vec![
-                    record.as_ref().clone(),
-                    Term::Arr {
-                        value: Value::String(field.clone()),
-                    },
-                ],
-                source: ArrSource::Native,
-                lit: None,
-            },
-            lang,
-            ast,
-            node,
-            out,
-        ),
-        Term::RecordWith { .. } => Err(LangError::NotImplemented),
-        Term::Tag { .. } => Err(LangError::NotImplemented),
-        Term::Univalence { .. } => Err(LangError::NotImplemented),
-        Term::Glue { .. } => Err(LangError::NotImplemented),
-        Term::Fibrant { .. } => Err(LangError::NotImplemented),
-        Term::JElim { .. } => Err(LangError::NotImplemented),
-        Term::Refine { .. } => Err(LangError::NotImplemented),
-        Term::Cobind { .. } => Err(LangError::NotImplemented),
-        Term::Rewrite { .. } => Err(LangError::NotImplemented),
+        )),
     }
 }
 
 /// Compile an `Arr` combinator. Returns `Ok(true)` if this Arr pushes a scope
 /// (`extend_env`), so the caller can emit `PopScope`.
+///
+/// `args` are the op's sub-schemes as [`TermData`] values (ADR-0103 Phase 6);
+/// each is compiled recursively via [`compile_into_td`].
 fn compile_arr(
     op: &str,
-    args: &[Term],
+    args: &[TermData],
     source: &ArrSource,
     lit: Option<&Value>,
     lang: &Language,
@@ -425,7 +507,7 @@ fn compile_arr(
         // (the type tag string). Compile the arg, then emit RouteOnType.
         "route_on_type" => {
             for arg in args {
-                let arg_pushed = compile_into(arg, lang, ast, node, out)?;
+                let arg_pushed = compile_into_td(arg, lang, ast, node, out)?;
                 if arg_pushed {
                     out.push(Instr::PopScope);
                 }
@@ -455,7 +537,7 @@ fn compile_arr(
         let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(args.len());
         for arg in args {
             let start = out.len();
-            let arg_pushed = compile_into(arg, lang, ast, node, out)?;
+            let arg_pushed = compile_into_td(arg, lang, ast, node, out)?;
             if arg_pushed {
                 out.push(Instr::PopScope);
             }
@@ -512,7 +594,7 @@ fn compile_arr(
     }
 
     for arg in args {
-        let arg_pushed = compile_into(arg, lang, ast, node, out)?;
+        let arg_pushed = compile_into_td(arg, lang, ast, node, out)?;
         if arg_pushed {
             out.push(Instr::PopScope);
         }

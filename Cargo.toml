@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 handl-language = {path = "../handl-language" }
 handl-platform = {path = "../platform" }
+plugin-engine = {path = "../plugin-engine" }
 handl-plugin-engine-exec = {path = "../plugin-engine-exec" }
 handl-plugin-engine-exec-tree-walk = {path = "../plugin-engine-exec-tree-walk" }
 handl-plugin-engine-transform = {path = "../plugin-engine-transform" }
