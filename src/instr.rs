@@ -360,5 +360,7 @@ pub enum Instr {
         rest: Option<Rc<str>>,
         /// AST node index for the closure body.
         body: usize,
+        /// Whether the params node is an array-destructuring pattern.
+        array_pattern: bool,
     },
 }

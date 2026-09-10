@@ -678,21 +678,31 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     // ADR-0060: unpack single array arg for variable-arity
                     // call. When Call receives a single argument that is an
                     // array, unpack it into individual arguments.
-                    let actual_args: Vec<TaggedValue> = if args.len() == 1 && args[0].is_array() {
-                        args[0]
-                            .as_array()
-                            .ok_or_else(|| {
-                                LangError::engine_node(
-                                    "Call: expected array argument".to_string(),
-                                    node,
-                                )
-                            })?
-                            .iter()
-                            .cloned()
-                            .collect()
-                    } else {
-                        args
-                    };
+                    // Array-pattern arrows receive the array as a single
+                    // argument, so they must not be unpacked.
+                    let is_array_pattern = matches!(
+                        &callee,
+                        TaggedValue::Arrow {
+                            array_pattern: true,
+                            ..
+                        }
+                    );
+                    let actual_args: Vec<TaggedValue> =
+                        if !is_array_pattern && args.len() == 1 && args[0].is_array() {
+                            args[0]
+                                .as_array()
+                                .ok_or_else(|| {
+                                    LangError::engine_node(
+                                        "Call: expected array argument".to_string(),
+                                        node,
+                                    )
+                                })?
+                                .iter()
+                                .cloned()
+                                .collect()
+                        } else {
+                            args
+                        };
                     let result = self.apply_app(&callee, &actual_args)?;
                     stack.push(result);
                 }
@@ -709,8 +719,16 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                         LangError::engine_node("stack underflow on Call1".to_string(), node)
                     })?;
                     // ADR-0060: unpack single array arg for variable-arity
-                    // call.
-                    let result = if arg0.is_array() {
+                    // call. Array-pattern arrows receive the array as a
+                    // single argument, so they must not be unpacked.
+                    let is_array_pattern = matches!(
+                        &callee,
+                        TaggedValue::Arrow {
+                            array_pattern: true,
+                            ..
+                        }
+                    );
+                    let result = if !is_array_pattern && arg0.is_array() {
                         let actual: Vec<TaggedValue> = arg0
                             .as_array()
                             .ok_or_else(|| {
@@ -995,7 +1013,12 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     stack.push(TaggedValue::Obj(Rc::new(obj)));
                 }
                 // --- Closure construction bytecode ---
-                Instr::Closure { params, rest, body } => {
+                Instr::Closure {
+                    params,
+                    rest,
+                    body,
+                    array_pattern,
+                } => {
                     // Capture the current environment and construct a
                     // `TaggedValue::Arrow`. Identical to the `closure`
                     // native op, but avoids the per-call `Vec` allocation
@@ -1009,6 +1032,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                         body: *body,
                         env: Rc::new(captured),
                         home: None,
+                        array_pattern: *array_pattern,
                     });
                 }
                 Instr::DerivedStepOp(op, ranges) => {
@@ -1097,7 +1121,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
             }
             "closure" => {
                 let payload = &node.payload;
-                let (params, rest, body) = if let (Some(p), Some(b)) = (
+                let (params, rest, body, array_pattern) = if let (Some(p), Some(b)) = (
                     payload.get("params").and_then(|v| v.as_array()),
                     payload.get("body").and_then(|v| v.as_u64()),
                 ) {
@@ -1118,7 +1142,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                         .get("rest")
                         .and_then(|v| v.as_str())
                         .map(String::from);
-                    (param_names, rest_name, b as usize)
+                    (param_names, rest_name, b as usize, false)
                 } else if let Some(children) = payload.get("children").and_then(|c| c.as_array()) {
                     let param_idx = children.first().and_then(|v| v.as_u64()).ok_or_else(|| {
                         LangError::engine_node("closure: missing param child".to_string(), node)
@@ -1134,7 +1158,8 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                         .lang
                         .param_names(self.ast, param_node)
                         .map_err(|e| LangError::engine_node(e.to_string(), node))?;
-                    (param_names, rest_name, body_idx)
+                    let array_pattern = self.lang.is_array_pattern(param_node);
+                    (param_names, rest_name, body_idx, array_pattern)
                 } else {
                     return Err(LangError::engine(
                         "closure: missing params/body in payload".to_string(),
@@ -1147,6 +1172,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     body,
                     env: Rc::new(captured),
                     home: None,
+                    array_pattern,
                 })
             }
             "array" => {
@@ -2797,14 +2823,22 @@ impl<'a, 'h> VmFrame<'a, 'h> {
         args: &[TaggedValue],
     ) -> Result<TaggedValue, LangError> {
         // Closure application — match on TaggedValue::Arrow directly.
-        let (params, rest_param, body_idx, captured_env, home) = match callee {
+        let (params, rest_param, body_idx, captured_env, home, array_pattern) = match callee {
             TaggedValue::Arrow {
                 params,
                 rest,
                 body,
                 env,
                 home,
-            } => (params.clone(), rest.clone(), *body, Rc::clone(env), *home),
+                array_pattern,
+            } => (
+                params.clone(),
+                rest.clone(),
+                *body,
+                Rc::clone(env),
+                *home,
+                *array_pattern,
+            ),
             _ => {
                 return Err(LangError::engine(
                     "callee is not an arrow-value".to_string(),
@@ -2827,26 +2861,84 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 home_vm.scopes.set_globals(Rc::clone(g));
             }
             let local_callee = TaggedValue::Arrow {
-                params,
-                rest: rest_param,
+                params: params.clone(),
+                rest: rest_param.clone(),
                 body: body_idx,
-                env: captured_env,
+                env: captured_env.clone(),
                 home: None,
+                array_pattern,
             };
             return home_vm.apply_app(&local_callee, args);
         }
+        // Array-pattern arrows (`[x, y] ~> body`) consume a single array
+        // argument and destructure it by position.
+        if array_pattern {
+            if args.len() != 1 {
+                return Err(LangError::engine(format!(
+                    "array-pattern arrow expects 1 array argument, got {}",
+                    args.len()
+                )));
+            }
+            let arr = args[0].as_array().ok_or_else(|| {
+                LangError::engine("array-pattern arrow expects an array argument".to_string())
+            })?;
+            let fixed = params.len();
+            if arr.len() < fixed {
+                return Err(LangError::engine(format!(
+                    "array-pattern arrow expects at least {} element(s), got {}",
+                    fixed,
+                    arr.len()
+                )));
+            }
+            if rest_param.is_none() && arr.len() != fixed {
+                return Err(LangError::engine(format!(
+                    "array-pattern arrow expects exactly {} element(s), got {}",
+                    fixed,
+                    arr.len()
+                )));
+            }
+            let (head, tail) = arr.split_at(fixed);
+            let saved_captured = self.scopes.captured_root.take();
+            let saved_marks_len = self.scopes.marks.len();
+            let saved_bindings_len = self.scopes.bindings.len();
+            self.scopes.captured_root = Some(captured_env);
+            self.scopes.push_scope();
+            for (param, arg) in params.iter().zip(head.iter()) {
+                self.scopes.define(param, arg.clone());
+            }
+            if let Some(rest_name) = &rest_param {
+                self.scopes.define(
+                    rest_name.as_ref(),
+                    TaggedValue::Arr(Rc::from(tail.to_vec())),
+                );
+            }
+            let result = self.exec_node_inner(body_ref);
+            self.scopes.bindings.truncate(saved_bindings_len);
+            self.scopes.marks.truncate(saved_marks_len);
+            self.scopes.captured_root = saved_captured;
+            return result;
+        }
+        // Positional arrows: ADR-0074 multi-param arrows may receive a
+        // single `Pair` (product `***`) and destructure it into individual
+        // args. `(a, b) ~> body` applied to `Pair(x, y)` binds `a=x, b=y`.
+        let actual_args: Vec<TaggedValue> =
+            if params.len() > 1 && args.len() == 1 && matches!(args[0], TaggedValue::Pair(_)) {
+                flatten_pair(&args[0])
+            } else {
+                args.to_vec()
+            };
         // Rest param (`[a, ...rest] ~> body`): surplus args bind to the rest
         // name as an array, so `args.len() >= params.len()` is required.
         let arity_ok = if rest_param.is_some() {
-            args.len() >= params.len()
+            actual_args.len() >= params.len()
         } else {
-            params.len() == args.len()
+            params.len() == actual_args.len()
         };
         if !arity_ok {
             return Err(LangError::engine(format!(
                 "arrow-value expects {} args, got {}",
                 params.len(),
-                args.len()
+                actual_args.len()
             )));
         }
         // Arrow-value invocation (ADR-0052): the arrow carries its
@@ -2863,14 +2955,14 @@ impl<'a, 'h> VmFrame<'a, 'h> {
         let saved_bindings_len = self.scopes.bindings.len();
         self.scopes.captured_root = Some(captured_env);
         self.scopes.push_scope();
-        for (param, arg) in params.iter().zip(args.iter()) {
+        for (param, arg) in params.iter().zip(actual_args.iter()) {
             self.scopes.define(param, arg.clone());
         }
         // Bind the rest param to the surplus args as an array.
         if let Some(rest_name) = &rest_param {
             self.scopes.define(
                 rest_name.as_ref(),
-                TaggedValue::Arr(Rc::from(args[params.len()..].to_vec())),
+                TaggedValue::Arr(Rc::from(actual_args[params.len()..].to_vec())),
             );
         }
         let result = self.exec_node_inner(body_ref);

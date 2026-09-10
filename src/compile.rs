@@ -505,6 +505,7 @@ fn compile_arr(
                 params: closure.params,
                 rest: closure.rest,
                 body: closure.body,
+                array_pattern: closure.array_pattern,
             });
             return Ok(false);
         }
@@ -697,6 +698,8 @@ struct StaticClosure {
     /// Rest/variadic param name (`[a, ...rest] ~> body`), if declared.
     rest: Option<Rc<str>>,
     body: usize,
+    /// Whether the params node is an array-destructuring pattern.
+    array_pattern: bool,
 }
 
 /// Try to extract the param names and body node index from a `function`
@@ -740,6 +743,7 @@ fn try_extract_closure_params_body(
             params: Rc::from(names),
             rest,
             body: b as usize,
+            array_pattern: false,
         }));
     }
 
@@ -766,10 +770,12 @@ fn try_extract_closure_params_body(
             Ok(v) => v,
             Err(_) => return Ok(None),
         };
+        let array_pattern = lang.is_array_pattern(param_node);
         return Ok(Some(StaticClosure {
             params: Rc::from(names),
             rest: rest.map(Rc::from),
             body: body_idx,
+            array_pattern,
         }));
     }
 
