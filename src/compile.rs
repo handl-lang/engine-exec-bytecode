@@ -904,8 +904,8 @@ fn try_extract_closure_params_body(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use handl_language::Term;
-    use handl_language::{Ast, AstNode, Language};
+    use handl_language::{ArrSource, Ast, AstNode, Language};
+    use plugin_engine::TermData;
     use serde_json::json;
 
     /// A dummy node used by compilation tests (the node is not inspected).
@@ -924,42 +924,42 @@ mod tests {
 
     #[test]
     fn compile_const() {
-        let s = Term::arr_native_lit("const", vec![], json!(42));
+        let s = TermData::op("const", vec![], &ArrSource::Native, Some(json!(42).into())).to_term().unwrap();
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(instrs, vec![Instr::Push(json!(42)), Instr::Return]);
     }
 
     #[test]
     fn compile_const_no_lit() {
-        let s = Term::arr_native("const", vec![]);
+        let s = TermData::op("const", vec![], &ArrSource::Native, None).to_term().unwrap();
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(instrs, vec![Instr::Push(Value::Null), Instr::Return]);
     }
 
     #[test]
     fn compile_proj_env_named() {
-        let s = Term::arr_native_lit("proj_env", vec![], "x");
+        let s = TermData::op("proj_env", vec![], &ArrSource::Native, Some("x".into())).to_term().unwrap();
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(instrs, vec![Instr::Load("x".into()), Instr::Return]);
     }
 
     #[test]
     fn compile_proj_env_payload() {
-        let s = Term::arr_native_lit("proj_env", vec![], "$payload");
+        let s = TermData::op("proj_env", vec![], &ArrSource::Native, Some("$payload".into())).to_term().unwrap();
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(instrs, vec![Instr::LoadPayloadVar, Instr::Return]);
     }
 
     #[test]
     fn compile_proj_child() {
-        let s = Term::arr_native_lit("proj_child", vec![], json!(2));
+        let s = TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(2).into())).to_term().unwrap();
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(instrs, vec![Instr::EvalChild(2), Instr::Return]);
     }
 
     #[test]
     fn compile_extend_env_named() {
-        let s = Term::arr_native_lit("extend_env", vec![], "x");
+        let s = TermData::op("extend_env", vec![], &ArrSource::Native, Some("x".into())).to_term().unwrap();
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(
             instrs,
@@ -969,7 +969,7 @@ mod tests {
 
     #[test]
     fn compile_extend_env_payload() {
-        let s = Term::arr_native_lit("extend_env", vec![], "$payload");
+        let s = TermData::op("extend_env", vec![], &ArrSource::Native, Some("$payload".into())).to_term().unwrap();
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(
             instrs,
@@ -979,13 +979,10 @@ mod tests {
 
     #[test]
     fn compile_native_op() {
-        let s = Term::arr_native(
-            "add",
-            vec![
-                Term::arr_native_lit("proj_child", vec![], json!(0)),
-                Term::arr_native_lit("proj_child", vec![], json!(1)),
-            ],
-        );
+        let s = TermData::op("add", vec![
+                TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0).into())),
+                TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1).into())),
+            ], &ArrSource::Native, None).to_term().unwrap();
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(
             instrs,
@@ -1000,10 +997,7 @@ mod tests {
 
     #[test]
     fn compile_foreign_op() {
-        let s = Term::arr_foreign(
-            "double",
-            vec![Term::arr_native_lit("proj_child", vec![], json!(0))],
-        );
+        let s = TermData::op("double", vec![TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0).into()))], &ArrSource::Foreign("double".into()), None).to_term().unwrap();
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         // ADR-0103: foreign ops now compile to the `Ffi` hardware-boundary
         // instruction (module "host") instead of `ForeignOp`. The VM's `Ffi`
@@ -1027,10 +1021,7 @@ mod tests {
 
     #[test]
     fn compile_seq_no_scope() {
-        let s = Term::seq(
-            Term::arr_native_lit("const", vec![], json!(5)),
-            Term::arr_native("id", vec![]),
-        );
+        let s = TermData::seq(TermData::op("const", vec![], &ArrSource::Native, Some(json!(5).into())), TermData::op("id", vec![], &ArrSource::Native, None)).to_term().unwrap();
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(
             instrs,
@@ -1048,13 +1039,7 @@ mod tests {
         // fst (const) does not push a scope. The inner Seq's snd (extend_env)
         // pushes a scope, which propagates to the outer Seq. The outer Seq
         // pops after its snd (proj_env) completes.
-        let s = Term::seq(
-            Term::seq(
-                Term::arr_native_lit("const", vec![], json!(5)),
-                Term::arr_native_lit("extend_env", vec![], "x"),
-            ),
-            Term::arr_native_lit("proj_env", vec![], "x"),
-        );
+        let s = TermData::seq(TermData::seq(TermData::op("const", vec![], &ArrSource::Native, Some(json!(5).into())), TermData::op("extend_env", vec![], &ArrSource::Native, Some("x".into()))), TermData::op("proj_env", vec![], &ArrSource::Native, Some("x".into()))).to_term().unwrap();
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(
             instrs,
@@ -1072,7 +1057,7 @@ mod tests {
 
     #[test]
     fn compile_first() {
-        let s = Term::first(Term::arr_native("id", vec![]));
+        let s = TermData::first(TermData::op("id", vec![], &ArrSource::Native, None)).to_term().unwrap();
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         // FirstOp(1, 2) — inner sub-program at index 1..2 is the `id` op.
         assert_eq!(
@@ -1089,10 +1074,7 @@ mod tests {
 
     #[test]
     fn compile_choice() {
-        let s = Term::choice(
-            Term::arr_native_lit("const", vec![], json!(1)),
-            Term::arr_native_lit("const", vec![], json!(2)),
-        );
+        let s = TermData::choice(TermData::op("const", vec![], &ArrSource::Native, Some(json!(1).into())), TermData::op("const", vec![], &ArrSource::Native, Some(json!(2).into()))).to_term().unwrap();
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(
             instrs,
@@ -1110,7 +1092,7 @@ mod tests {
 
     #[test]
     fn compile_loop() {
-        let s = Term::loop_feedback(Term::arr_native("inc_fst", vec![]));
+        let s = TermData::loop_feedback(TermData::op("inc_fst", vec![], &ArrSource::Native, None)).to_term().unwrap();
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(
             instrs,
@@ -1128,10 +1110,7 @@ mod tests {
 
     #[test]
     fn compile_app() {
-        let s = Term::app(
-            Term::arr_native_lit("proj_env", vec![], "f"),
-            vec![Term::arr_native_lit("const", vec![], json!(41))],
-        );
+        let s = TermData::app(TermData::op("proj_env", vec![], &ArrSource::Native, Some("f".into())), vec![TermData::op("const", vec![], &ArrSource::Native, Some(json!(41).into()))]).to_term().unwrap();
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(
             instrs,
@@ -1146,7 +1125,7 @@ mod tests {
 
     #[test]
     fn compile_app_no_args() {
-        let s = Term::app(Term::arr_native_lit("proj_env", vec![], "f"), vec![]);
+        let s = TermData::app(TermData::op("proj_env", vec![], &ArrSource::Native, Some("f".into())), vec![]).to_term().unwrap();
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(
             instrs,
@@ -1159,16 +1138,7 @@ mod tests {
     #[test]
     fn compile_branch_lowering() {
         // Seq(Seq(const true, tag), Choice(const "yes", const "no"))
-        let s = Term::seq(
-            Term::seq(
-                Term::arr_native_lit("const", vec![], json!(true)),
-                Term::arr_native("tag", vec![]),
-            ),
-            Term::choice(
-                Term::arr_native_lit("const", vec![], "yes"),
-                Term::arr_native_lit("const", vec![], "no"),
-            ),
-        );
+        let s = TermData::seq(TermData::seq(TermData::op("const", vec![], &ArrSource::Native, Some(json!(true).into())), TermData::op("tag", vec![], &ArrSource::Native, None)), TermData::choice(TermData::op("const", vec![], &ArrSource::Native, Some("yes".into())), TermData::op("const", vec![], &ArrSource::Native, Some("no".into())))).to_term().unwrap();
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(
             instrs,
@@ -1191,13 +1161,10 @@ mod tests {
         // `and` currently goes through `NativeOp`; ADR-0103 migrates it to
         // the consolidated `Arith(ArithOp::And)` hardware-boundary
         // instruction.
-        let s = Term::arr_native(
-            "and",
-            vec![
-                Term::arr_native_lit("proj_child", vec![], json!(0)),
-                Term::arr_native_lit("proj_child", vec![], json!(1)),
-            ],
-        );
+        let s = TermData::op("and", vec![
+                TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0).into())),
+                TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1).into())),
+            ], &ArrSource::Native, None).to_term().unwrap();
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(
             instrs,
@@ -1213,7 +1180,7 @@ mod tests {
     #[test]
     fn compile_arith_neg_emits_arith_instr() {
         // `neg` is unary; it migrates to `Arith(ArithOp::Neg)`.
-        let s = Term::arr_native("neg", vec![Term::arr_native_lit("proj_child", vec![], json!(0))]);
+        let s = TermData::op("neg", vec![TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0).into()))], &ArrSource::Native, None).to_term().unwrap();
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(
             instrs,

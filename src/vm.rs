@@ -3399,7 +3399,8 @@ fn eval_arith_unary(op: ArithOp, a: TaggedValue) -> Result<TaggedValue, LangErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use handl_language::{Ast, AstNode, EvalSchemeDef, Language, SchemeVersion, Term};
+    use handl_language::{ArrSource, Ast, AstNode, EvalSchemeDef, Language, SchemeVersion, Term};
+    use plugin_engine::TermData;
     use handl_platform::{EvalContext, Function, Module, ModuleLookup};
     use handl_plugin_engine_exec::ImportResolver;
     use handl_plugin_module::ModuleRegistry;
@@ -3450,14 +3451,14 @@ mod tests {
 
     #[test]
     fn arr_const_returns_literal() {
-        let s = Term::arr_native_lit("const", vec![], json!(42));
+        let s = TermData::op("const", vec![], &ArrSource::Native, Some(json!(42).into())).to_term().unwrap();
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, json!(42));
     }
 
     #[test]
     fn arr_const_null_when_no_literal() {
-        let s = Term::arr_native("const", vec![]);
+        let s = TermData::op("const", vec![], &ArrSource::Native, None).to_term().unwrap();
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, Value::Null);
     }
@@ -3466,7 +3467,7 @@ mod tests {
 
     #[test]
     fn arr_proj_env_bound_lookup() {
-        let s = Term::arr_native_lit("proj_env", vec![], "x");
+        let s = TermData::op("proj_env", vec![], &ArrSource::Native, Some("x".into())).to_term().unwrap();
         let ast = make_ast(vec![dummy_node()]);
         let lang = Language::new();
         let node = ast.at(AstRef::new(0)).unwrap();
@@ -3479,7 +3480,7 @@ mod tests {
 
     #[test]
     fn arr_proj_env_unbound_returns_name() {
-        let s = Term::arr_native_lit("proj_env", vec![], "unknown");
+        let s = TermData::op("proj_env", vec![], &ArrSource::Native, Some("unknown".into())).to_term().unwrap();
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, Value::from("unknown"));
     }
@@ -3488,10 +3489,7 @@ mod tests {
 
     #[test]
     fn seq_const_then_id() {
-        let s = Term::seq(
-            Term::arr_native_lit("const", vec![], json!(5)),
-            Term::arr_native("id", vec![]),
-        );
+        let s = TermData::seq(TermData::op("const", vec![], &ArrSource::Native, Some(json!(5).into())), TermData::op("id", vec![], &ArrSource::Native, None)).to_term().unwrap();
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, json!(5));
     }
@@ -3500,13 +3498,7 @@ mod tests {
 
     #[test]
     fn bind_shape_extend_env_then_proj_env() {
-        let s = Term::seq(
-            Term::seq(
-                Term::arr_native_lit("const", vec![], json!(5)),
-                Term::arr_native_lit("extend_env", vec![], "x"),
-            ),
-            Term::arr_native_lit("proj_env", vec![], "x"),
-        );
+        let s = TermData::seq(TermData::seq(TermData::op("const", vec![], &ArrSource::Native, Some(json!(5).into())), TermData::op("extend_env", vec![], &ArrSource::Native, Some("x".into()))), TermData::op("proj_env", vec![], &ArrSource::Native, Some("x".into()))).to_term().unwrap();
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, json!(5));
     }
@@ -3515,20 +3507,14 @@ mod tests {
 
     #[test]
     fn first_id_on_pair() {
-        let s = Term::seq(
-            Term::arr_native_lit("const", vec![], pair(json!(3), json!(7))),
-            Term::first(Term::arr_native("id", vec![])),
-        );
+        let s = TermData::seq(TermData::op("const", vec![], &ArrSource::Native, Some(pair(json!(3), json!(7)).into())), TermData::first(TermData::op("id", vec![], &ArrSource::Native, None))).to_term().unwrap();
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, pair(json!(3), json!(7)));
     }
 
     #[test]
     fn first_const_on_pair() {
-        let s = Term::seq(
-            Term::arr_native_lit("const", vec![], pair(json!(3), json!(7))),
-            Term::first(Term::arr_native_lit("const", vec![], json!(99))),
-        );
+        let s = TermData::seq(TermData::op("const", vec![], &ArrSource::Native, Some(pair(json!(3), json!(7)).into())), TermData::first(TermData::op("const", vec![], &ArrSource::Native, Some(json!(99).into())))).to_term().unwrap();
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, pair(json!(99), json!(7)));
     }
@@ -3537,26 +3523,14 @@ mod tests {
 
     #[test]
     fn choice_left() {
-        let s = Term::seq(
-            Term::arr_native_lit("const", vec![], either_left(json!(5))),
-            Term::choice(
-                Term::arr_native_lit("const", vec![], json!(1)),
-                Term::arr_native_lit("const", vec![], json!(2)),
-            ),
-        );
+        let s = TermData::seq(TermData::op("const", vec![], &ArrSource::Native, Some(either_left(json!(5)).into())), TermData::choice(TermData::op("const", vec![], &ArrSource::Native, Some(json!(1).into())), TermData::op("const", vec![], &ArrSource::Native, Some(json!(2).into())))).to_term().unwrap();
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, json!(1));
     }
 
     #[test]
     fn choice_right() {
-        let s = Term::seq(
-            Term::arr_native_lit("const", vec![], either_right(json!(5))),
-            Term::choice(
-                Term::arr_native_lit("const", vec![], json!(1)),
-                Term::arr_native_lit("const", vec![], json!(2)),
-            ),
-        );
+        let s = TermData::seq(TermData::op("const", vec![], &ArrSource::Native, Some(either_right(json!(5)).into())), TermData::choice(TermData::op("const", vec![], &ArrSource::Native, Some(json!(1).into())), TermData::op("const", vec![], &ArrSource::Native, Some(json!(2).into())))).to_term().unwrap();
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, json!(2));
     }
@@ -3565,32 +3539,14 @@ mod tests {
 
     #[test]
     fn tag_choice_true_yields_then() {
-        let s = Term::seq(
-            Term::seq(
-                Term::arr_native_lit("const", vec![], json!(true)),
-                Term::arr_native("tag", vec![]),
-            ),
-            Term::choice(
-                Term::arr_native_lit("const", vec![], "yes"),
-                Term::arr_native_lit("const", vec![], "no"),
-            ),
-        );
+        let s = TermData::seq(TermData::seq(TermData::op("const", vec![], &ArrSource::Native, Some(json!(true).into())), TermData::op("tag", vec![], &ArrSource::Native, None)), TermData::choice(TermData::op("const", vec![], &ArrSource::Native, Some("yes".into())), TermData::op("const", vec![], &ArrSource::Native, Some("no".into())))).to_term().unwrap();
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, json!("yes"));
     }
 
     #[test]
     fn tag_choice_false_yields_else() {
-        let s = Term::seq(
-            Term::seq(
-                Term::arr_native_lit("const", vec![], json!(false)),
-                Term::arr_native("tag", vec![]),
-            ),
-            Term::choice(
-                Term::arr_native_lit("const", vec![], "yes"),
-                Term::arr_native_lit("const", vec![], "no"),
-            ),
-        );
+        let s = TermData::seq(TermData::seq(TermData::op("const", vec![], &ArrSource::Native, Some(json!(false).into())), TermData::op("tag", vec![], &ArrSource::Native, None)), TermData::choice(TermData::op("const", vec![], &ArrSource::Native, Some("yes".into())), TermData::op("const", vec![], &ArrSource::Native, Some("no".into())))).to_term().unwrap();
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, json!("no"));
     }
@@ -3599,10 +3555,7 @@ mod tests {
 
     #[test]
     fn loop_causal_single_step() {
-        let s = Term::seq(
-            Term::arr_native_lit("const", vec![], json!(10)),
-            Term::loop_feedback(Term::arr_native("inc_fst", vec![])),
-        );
+        let s = TermData::seq(TermData::op("const", vec![], &ArrSource::Native, Some(json!(10).into())), TermData::loop_feedback(TermData::op("inc_fst", vec![], &ArrSource::Native, None))).to_term().unwrap();
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, json!(11));
     }
@@ -3611,20 +3564,14 @@ mod tests {
 
     #[test]
     fn loop_multi_step_either_countdown() {
-        let s = Term::seq(
-            Term::arr_native_lit("const", vec![], pair(json!(42), json!(5))),
-            Term::loop_feedback(Term::arr_native("countdown_step", vec![])),
-        );
+        let s = TermData::seq(TermData::op("const", vec![], &ArrSource::Native, Some(pair(json!(42), json!(5)).into())), TermData::loop_feedback(TermData::op("countdown_step", vec![], &ArrSource::Native, None))).to_term().unwrap();
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, json!(42));
     }
 
     #[test]
     fn loop_multi_step_max_iterations_guard() {
-        let s = Term::seq(
-            Term::arr_native_lit("const", vec![], json!(1)),
-            Term::loop_feedback(Term::arr_native("infinite_step", vec![])),
-        );
+        let s = TermData::seq(TermData::op("const", vec![], &ArrSource::Native, Some(json!(1).into())), TermData::loop_feedback(TermData::op("infinite_step", vec![], &ArrSource::Native, None))).to_term().unwrap();
         let err = eval_standalone(&s).unwrap_err();
         assert!(
             matches!(err, LangError::Engine { ref message, .. } if message.contains("max iterations"))
@@ -3646,7 +3593,7 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.var",
                 "var",
-                Term::arr_native_lit("proj_env", vec![], Value::String("$payload".into())),
+                TermData::op("proj_env", vec![], &ArrSource::Native, Some(Value::String("$payload".into()).into())).to_term().unwrap(),
             ))
             .unwrap();
         // binary.eq / sub / mul -> native op over the two children
@@ -3659,13 +3606,10 @@ mod tests {
                 .merge(EvalSchemeDef::new(
                     id,
                     kind,
-                    Term::arr_native(
-                        op,
-                        vec![
-                            Term::arr_native_lit("proj_child", vec![], json!(0u64)),
-                            Term::arr_native_lit("proj_child", vec![], json!(1u64)),
-                        ],
-                    ),
+                    TermData::op(op, vec![
+                            TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64).into())),
+                            TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64).into())),
+                        ], &ArrSource::Native, None).to_term().unwrap(),
                 ))
                 .unwrap();
         }
@@ -3674,16 +3618,7 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.if",
                 "if",
-                Term::seq(
-                    Term::seq(
-                        Term::arr_native_lit("proj_child", vec![], json!(0u64)),
-                        Term::arr_native("tag", vec![]),
-                    ),
-                    Term::choice(
-                        Term::arr_native_lit("proj_child", vec![], json!(1u64)),
-                        Term::arr_native_lit("proj_child", vec![], json!(2u64)),
-                    ),
-                ),
+                TermData::seq(TermData::seq(TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64).into())), TermData::op("tag", vec![], &ArrSource::Native, None)), TermData::choice(TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64).into())), TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(2u64).into())))).to_term().unwrap(),
             ))
             .unwrap();
         // object -> native `object` prim (reads the node's children payload)
@@ -3691,7 +3626,7 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.object",
                 "object",
-                Term::arr_native("object", vec![]),
+                TermData::op("object", vec![], &ArrSource::Native, None).to_term().unwrap(),
             ))
             .unwrap();
         // function -> closure prim
@@ -3699,7 +3634,7 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.function",
                 "function",
-                Term::arr_native("closure", vec![]),
+                TermData::op("closure", vec![], &ArrSource::Native, None).to_term().unwrap(),
             ))
             .unwrap();
         // return -> proj_child(0) (v0.1: `return v` evaluates to `v`)
@@ -3707,7 +3642,7 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.return",
                 "return",
-                Term::arr_native_lit("proj_child", vec![], json!(0u64)),
+                TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64).into())).to_term().unwrap(),
             ))
             .unwrap();
         // loop -> Seq(proj_child(0), Loop(loop_step(proj_child(1))))
@@ -3715,13 +3650,7 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.loop",
                 "loop",
-                Term::seq(
-                    Term::arr_native_lit("proj_child", vec![], json!(0u64)),
-                    Term::loop_feedback(Term::arr_native(
-                        "loop_step",
-                        vec![Term::arr_native_lit("proj_child", vec![], json!(1u64))],
-                    )),
-                ),
+                TermData::seq(TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64).into())), TermData::loop_feedback(TermData::op("loop_step", vec![TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64).into()))], &ArrSource::Native, None))).to_term().unwrap(),
             ))
             .unwrap();
         lang
@@ -3892,16 +3821,10 @@ mod tests {
         // Term: Seq(const 5, Loop(while_step(is_pos, dec)))
         // is_pos: native op, 0 args, uses incoming (checks > 0)
         // dec: native op, 0 args, uses incoming (subtracts 1)
-        let s = Term::seq(
-            Term::arr_native_lit("const", vec![], json!(5)),
-            Term::loop_feedback(Term::arr_native(
-                "while_step",
-                vec![
-                    Term::arr_native("is_pos", vec![]),
-                    Term::arr_native("dec", vec![]),
-                ],
-            )),
-        );
+        let s = TermData::seq(TermData::op("const", vec![], &ArrSource::Native, Some(json!(5).into())), TermData::loop_feedback(TermData::op("while_step", vec![
+                    TermData::op("is_pos", vec![], &ArrSource::Native, None),
+                    TermData::op("dec", vec![], &ArrSource::Native, None),
+                ], &ArrSource::Native, None))).to_term().unwrap();
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, json!(0));
     }
@@ -3909,16 +3832,10 @@ mod tests {
     /// `while` loop with zero iterations: cond is immediately false.
     #[test]
     fn while_step_zero_iterations() {
-        let s = Term::seq(
-            Term::arr_native_lit("const", vec![], json!(0)),
-            Term::loop_feedback(Term::arr_native(
-                "while_step",
-                vec![
-                    Term::arr_native("is_pos", vec![]),
-                    Term::arr_native("dec", vec![]),
-                ],
-            )),
-        );
+        let s = TermData::seq(TermData::op("const", vec![], &ArrSource::Native, Some(json!(0).into())), TermData::loop_feedback(TermData::op("while_step", vec![
+                    TermData::op("is_pos", vec![], &ArrSource::Native, None),
+                    TermData::op("dec", vec![], &ArrSource::Native, None),
+                ], &ArrSource::Native, None))).to_term().unwrap();
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, json!(0));
     }
@@ -3927,13 +3844,7 @@ mod tests {
     /// to pair(5, 0).
     #[test]
     fn for_step_accumulate() {
-        let s = Term::seq(
-            Term::arr_native_lit("const", vec![], pair(json!(5), json!(0))),
-            Term::loop_feedback(Term::arr_native(
-                "for_step",
-                vec![Term::arr_native("inc", vec![])],
-            )),
-        );
+        let s = TermData::seq(TermData::op("const", vec![], &ArrSource::Native, Some(pair(json!(5), json!(0)).into())), TermData::loop_feedback(TermData::op("for_step", vec![TermData::op("inc", vec![], &ArrSource::Native, None)], &ArrSource::Native, None))).to_term().unwrap();
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, json!(5));
     }
@@ -3941,13 +3852,7 @@ mod tests {
     /// `for` loop with zero iterations: counter is 0, return initial.
     #[test]
     fn for_step_zero_iterations() {
-        let s = Term::seq(
-            Term::arr_native_lit("const", vec![], pair(json!(0), json!(99))),
-            Term::loop_feedback(Term::arr_native(
-                "for_step",
-                vec![Term::arr_native("inc", vec![])],
-            )),
-        );
+        let s = TermData::seq(TermData::op("const", vec![], &ArrSource::Native, Some(pair(json!(0), json!(99)).into())), TermData::loop_feedback(TermData::op("for_step", vec![TermData::op("inc", vec![], &ArrSource::Native, None)], &ArrSource::Native, None))).to_term().unwrap();
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, json!(99));
     }
@@ -3956,13 +3861,7 @@ mod tests {
     /// `fix_loop(half_floor)` applied to 100.
     #[test]
     fn fix_step_halve_to_zero() {
-        let s = Term::seq(
-            Term::arr_native_lit("const", vec![], json!(100)),
-            Term::loop_feedback(Term::arr_native(
-                "fix_step",
-                vec![Term::arr_native("half_floor", vec![])],
-            )),
-        );
+        let s = TermData::seq(TermData::op("const", vec![], &ArrSource::Native, Some(json!(100).into())), TermData::loop_feedback(TermData::op("fix_step", vec![TermData::op("half_floor", vec![], &ArrSource::Native, None)], &ArrSource::Native, None))).to_term().unwrap();
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, json!(0));
     }
@@ -3970,13 +3869,7 @@ mod tests {
     /// `fix` loop already at fixpoint: 0 → 0.
     #[test]
     fn fix_step_already_at_fixpoint() {
-        let s = Term::seq(
-            Term::arr_native_lit("const", vec![], json!(0)),
-            Term::loop_feedback(Term::arr_native(
-                "fix_step",
-                vec![Term::arr_native("half_floor", vec![])],
-            )),
-        );
+        let s = TermData::seq(TermData::op("const", vec![], &ArrSource::Native, Some(json!(0).into())), TermData::loop_feedback(TermData::op("fix_step", vec![TermData::op("half_floor", vec![], &ArrSource::Native, None)], &ArrSource::Native, None))).to_term().unwrap();
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, json!(0));
     }
@@ -3990,7 +3883,7 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.var",
                 "var",
-                Term::arr_native_lit("proj_env", vec![], "$payload"),
+                TermData::op("proj_env", vec![], &ArrSource::Native, Some("$payload".into())).to_term().unwrap(),
             ))
             .unwrap();
         let ast = make_ast(vec![
@@ -4003,10 +3896,7 @@ mod tests {
             "body": 0,
             "env": {},
         });
-        let s = Term::app(
-            Term::arr_native_lit("const", vec![], closure),
-            vec![Term::arr_native_lit("const", vec![], json!(41))],
-        );
+        let s = TermData::app(TermData::op("const", vec![], &ArrSource::Native, Some(closure.into())), vec![TermData::op("const", vec![], &ArrSource::Native, Some(json!(41).into()))]).to_term().unwrap();
         let node = ast.at(AstRef::new(1)).unwrap();
         let instrs = compile(&s, &lang, &ast, node).unwrap();
         let mut frame = VmFrame::new(&ast, &lang, None, None);
@@ -4018,26 +3908,20 @@ mod tests {
 
     #[test]
     fn native_add() {
-        let s = Term::arr_native(
-            "add",
-            vec![
-                Term::arr_native_lit("const", vec![], json!(2)),
-                Term::arr_native_lit("const", vec![], json!(3)),
-            ],
-        );
+        let s = TermData::op("add", vec![
+                TermData::op("const", vec![], &ArrSource::Native, Some(json!(2).into())),
+                TermData::op("const", vec![], &ArrSource::Native, Some(json!(3).into())),
+            ], &ArrSource::Native, None).to_term().unwrap();
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, json!(5));
     }
 
     #[test]
     fn native_eq() {
-        let s = Term::arr_native(
-            "eq",
-            vec![
-                Term::arr_native_lit("const", vec![], json!(2)),
-                Term::arr_native_lit("const", vec![], json!(2)),
-            ],
-        );
+        let s = TermData::op("eq", vec![
+                TermData::op("const", vec![], &ArrSource::Native, Some(json!(2).into())),
+                TermData::op("const", vec![], &ArrSource::Native, Some(json!(2).into())),
+            ], &ArrSource::Native, None).to_term().unwrap();
         let result = eval_standalone(&s).unwrap();
         assert_eq!(result, json!(true));
     }
@@ -4046,7 +3930,7 @@ mod tests {
 
     #[test]
     fn unknown_native_op_errors() {
-        let s = Term::arr_native("bogus", vec![]);
+        let s = TermData::op("bogus", vec![], &ArrSource::Native, None).to_term().unwrap();
         let err = eval_standalone(&s).unwrap_err();
         assert!(
             matches!(err, LangError::Engine { ref message, .. } if message.contains("unknown v2 native op"))
@@ -4089,10 +3973,7 @@ mod tests {
 
     #[test]
     fn foreign_arr_dispatches_to_module() {
-        let s = Term::arr_foreign(
-            "double",
-            vec![Term::arr_native_lit("const", vec![], json!(21))],
-        );
+        let s = TermData::op("double", vec![TermData::op("const", vec![], &ArrSource::Native, Some(json!(21).into()))], &ArrSource::Foreign("double".into()), None).to_term().unwrap();
         let ast = make_ast(vec![dummy_node()]);
         let lang = Language::new();
         let node = ast.at(AstRef::new(0)).unwrap();
@@ -4105,10 +3986,7 @@ mod tests {
 
     #[test]
     fn foreign_arr_no_modules_errors() {
-        let s = Term::arr_foreign(
-            "double",
-            vec![Term::arr_native_lit("const", vec![], json!(21))],
-        );
+        let s = TermData::op("double", vec![TermData::op("const", vec![], &ArrSource::Native, Some(json!(21).into()))], &ArrSource::Foreign("double".into()), None).to_term().unwrap();
         let err = eval_standalone(&s).unwrap_err();
         // ADR-0103: foreign ops now compile to `Ffi`, so the no-modules
         // error is reported as "unregistered ffi" (the `Ffi` handler's
@@ -4127,13 +4005,10 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.add",
                 "binary.add",
-                Term::arr_native(
-                    "add",
-                    vec![
-                        Term::arr_native_lit("proj_child", vec![], json!(0u64)),
-                        Term::arr_native_lit("proj_child", vec![], json!(1u64)),
-                    ],
-                ),
+                TermData::op("add", vec![
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64).into())),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64).into())),
+                    ], &ArrSource::Native, None).to_term().unwrap(),
             ))
             .unwrap();
         let ast = make_ast(vec![
@@ -4153,16 +4028,7 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.if",
                 "if",
-                Term::seq(
-                    Term::seq(
-                        Term::arr_native_lit("proj_child", vec![], json!(0u64)),
-                        Term::arr_native("tag", vec![]),
-                    ),
-                    Term::choice(
-                        Term::arr_native_lit("proj_child", vec![], json!(1u64)),
-                        Term::arr_native_lit("proj_child", vec![], json!(2u64)),
-                    ),
-                ),
+                TermData::seq(TermData::seq(TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64).into())), TermData::op("tag", vec![], &ArrSource::Native, None)), TermData::choice(TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64).into())), TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(2u64).into())))).to_term().unwrap(),
             ))
             .unwrap();
         let ast = make_ast(vec![
@@ -4183,16 +4049,7 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.if",
                 "if",
-                Term::seq(
-                    Term::seq(
-                        Term::arr_native_lit("proj_child", vec![], json!(0u64)),
-                        Term::arr_native("tag", vec![]),
-                    ),
-                    Term::choice(
-                        Term::arr_native_lit("proj_child", vec![], json!(1u64)),
-                        Term::arr_native_lit("proj_child", vec![], json!(2u64)),
-                    ),
-                ),
+                TermData::seq(TermData::seq(TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64).into())), TermData::op("tag", vec![], &ArrSource::Native, None)), TermData::choice(TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64).into())), TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(2u64).into())))).to_term().unwrap(),
             ))
             .unwrap();
         let ast = make_ast(vec![
@@ -4247,7 +4104,7 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.var",
                 "var",
-                Term::arr_native_lit("proj_env", vec![], Value::from("$payload")),
+                TermData::op("proj_env", vec![], &ArrSource::Native, Some(Value::from("$payload").into())).to_term().unwrap(),
             ))
             .unwrap();
         // stmt.import -> import(proj_child(0))
@@ -4255,14 +4112,7 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.stmt.import",
                 "stmt.import",
-                Term::arr_native(
-                    "import",
-                    vec![Term::arr_native_lit(
-                        "proj_child",
-                        vec![],
-                        Value::from(0u64),
-                    )],
-                ),
+                TermData::op("import", vec![TermData::op("proj_child", vec![], &ArrSource::Native, Some(Value::from(0u64).into()))], &ArrSource::Native, None).to_term().unwrap(),
             ))
             .unwrap();
 
@@ -4289,10 +4139,7 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.stmt.import",
                 "stmt.import",
-                Term::arr_native(
-                    "import",
-                    vec![Term::arr_native_lit("const", vec![], Value::from("m.hnl"))],
-                ),
+                TermData::op("import", vec![TermData::op("const", vec![], &ArrSource::Native, Some(Value::from("m.hnl").into()))], &ArrSource::Native, None).to_term().unwrap(),
             ))
             .unwrap();
         let ast = make_ast(vec![AstNode::new("stmt.import").with_payload(json!({}))]);
@@ -4321,28 +4168,21 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.var",
                 "var",
-                Term::arr_native_lit("proj_env", vec![], Value::from("$payload")),
+                TermData::op("proj_env", vec![], &ArrSource::Native, Some(Value::from("$payload").into())).to_term().unwrap(),
             ))
             .unwrap();
         lang.eval
             .merge(EvalSchemeDef::new(
                 "e.block",
                 "block",
-                Term::arr_native("eval_block", vec![]),
+                TermData::op("eval_block", vec![], &ArrSource::Native, None).to_term().unwrap(),
             ))
             .unwrap();
         lang.eval
             .merge(EvalSchemeDef::new(
                 "e.stmt.import",
                 "stmt.import",
-                Term::arr_native(
-                    "import",
-                    vec![Term::arr_native_lit(
-                        "proj_child",
-                        vec![],
-                        Value::from(0u64),
-                    )],
-                ),
+                TermData::op("import", vec![TermData::op("proj_child", vec![], &ArrSource::Native, Some(Value::from(0u64).into()))], &ArrSource::Native, None).to_term().unwrap(),
             ))
             .unwrap();
 

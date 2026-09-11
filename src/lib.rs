@@ -423,7 +423,8 @@ fn stamp_home(value: &mut Value, frame_id: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use handl_language::{AstNode, EvalSchemeDef, Language, Term, Value};
+    use handl_language::{ArrSource, AstNode, EvalSchemeDef, Language, Value};
+    use plugin_engine::TermData;
     use handl_platform::{EvalContext, Function, Module, ModuleLookup};
     use handl_plugin_engine_exec::EvalRequest;
     use handl_plugin_module::ModuleRegistry;
@@ -502,7 +503,7 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.const",
                 "const",
-                Term::arr_native_lit("const", vec![], json!(99)),
+                TermData::op("const", vec![], &ArrSource::Native, Some(json!(99).into())).to_term().unwrap(),
             ))
             .unwrap();
         let ast = make_ast(vec![AstNode::new("const")]);
@@ -518,13 +519,10 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.add",
                 "binary.add",
-                Term::arr_native(
-                    "add",
-                    vec![
-                        Term::arr_native_lit("proj_child", vec![], json!(0u64)),
-                        Term::arr_native_lit("proj_child", vec![], json!(1u64)),
-                    ],
-                ),
+                TermData::op("add", vec![
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64).into())),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64).into())),
+                    ], &ArrSource::Native, None).to_term().unwrap(),
             ))
             .unwrap();
         let ast = make_ast(vec![
@@ -544,20 +542,14 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.var",
                 "var",
-                Term::arr_native_lit("proj_env", vec![], "$payload"),
+                TermData::op("proj_env", vec![], &ArrSource::Native, Some("$payload".into())).to_term().unwrap(),
             ))
             .unwrap();
         lang.eval
             .merge(EvalSchemeDef::new(
                 "e.let",
                 "let",
-                Term::seq(
-                    Term::seq(
-                        Term::arr_native_lit("proj_child", vec![], json!(0u64)),
-                        Term::arr_native_lit("extend_env", vec![], "$payload"),
-                    ),
-                    Term::arr_native_lit("proj_child", vec![], json!(1u64)),
-                ),
+                TermData::seq(TermData::seq(TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64).into())), TermData::op("extend_env", vec![], &ArrSource::Native, Some("$payload".into()))), TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64).into()))).to_term().unwrap(),
             ))
             .unwrap();
         let ast = make_ast(vec![
@@ -577,16 +569,7 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.if",
                 "if",
-                Term::seq(
-                    Term::seq(
-                        Term::arr_native_lit("proj_child", vec![], json!(0u64)),
-                        Term::arr_native("tag", vec![]),
-                    ),
-                    Term::choice(
-                        Term::arr_native_lit("proj_child", vec![], json!(1u64)),
-                        Term::arr_native_lit("proj_child", vec![], json!(2u64)),
-                    ),
-                ),
+                TermData::seq(TermData::seq(TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64).into())), TermData::op("tag", vec![], &ArrSource::Native, None)), TermData::choice(TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64).into())), TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(2u64).into())))).to_term().unwrap(),
             ))
             .unwrap();
         let ast = make_ast(vec![
@@ -607,16 +590,7 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.if",
                 "if",
-                Term::seq(
-                    Term::seq(
-                        Term::arr_native_lit("proj_child", vec![], json!(0u64)),
-                        Term::arr_native("tag", vec![]),
-                    ),
-                    Term::choice(
-                        Term::arr_native_lit("proj_child", vec![], json!(1u64)),
-                        Term::arr_native_lit("proj_child", vec![], json!(2u64)),
-                    ),
-                ),
+                TermData::seq(TermData::seq(TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64).into())), TermData::op("tag", vec![], &ArrSource::Native, None)), TermData::choice(TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64).into())), TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(2u64).into())))).to_term().unwrap(),
             ))
             .unwrap();
         let ast = make_ast(vec![
@@ -637,10 +611,7 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.dbl",
                 "dbl",
-                Term::arr_foreign(
-                    "double",
-                    vec![Term::arr_native_lit("proj_child", vec![], json!(0u64))],
-                ),
+                TermData::op("double", vec![TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64).into()))], &ArrSource::Foreign("double".into()), None).to_term().unwrap(),
             ))
             .unwrap();
         let ast = make_ast(vec![
@@ -659,10 +630,7 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.dbl",
                 "dbl",
-                Term::arr_foreign(
-                    "double",
-                    vec![Term::arr_native_lit("proj_child", vec![], json!(0u64))],
-                ),
+                TermData::op("double", vec![TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64).into()))], &ArrSource::Foreign("double".into()), None).to_term().unwrap(),
             ))
             .unwrap();
         let ast = make_ast(vec![
@@ -682,33 +650,24 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.var",
                 "var",
-                Term::arr_native_lit("proj_env", vec![], "$payload"),
+                TermData::op("proj_env", vec![], &ArrSource::Native, Some("$payload".into())).to_term().unwrap(),
             ))
             .unwrap();
         lang.eval
             .merge(EvalSchemeDef::new(
                 "e.let",
                 "let",
-                Term::seq(
-                    Term::seq(
-                        Term::arr_native_lit("proj_child", vec![], json!(0u64)),
-                        Term::arr_native_lit("extend_env", vec![], "$payload"),
-                    ),
-                    Term::arr_native_lit("proj_child", vec![], json!(1u64)),
-                ),
+                TermData::seq(TermData::seq(TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64).into())), TermData::op("extend_env", vec![], &ArrSource::Native, Some("$payload".into()))), TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64).into()))).to_term().unwrap(),
             ))
             .unwrap();
         lang.eval
             .merge(EvalSchemeDef::new(
                 "e.add",
                 "binary.add",
-                Term::arr_native(
-                    "add",
-                    vec![
-                        Term::arr_native_lit("proj_child", vec![], json!(0u64)),
-                        Term::arr_native_lit("proj_child", vec![], json!(1u64)),
-                    ],
-                ),
+                TermData::op("add", vec![
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64).into())),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64).into())),
+                    ], &ArrSource::Native, None).to_term().unwrap(),
             ))
             .unwrap();
         let ast = make_ast(vec![
@@ -762,37 +721,31 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.fn",
                 "function",
-                Term::arr_native("closure", vec![]),
+                TermData::op("closure", vec![], &ArrSource::Native, None).to_term().unwrap(),
             ))
             .unwrap();
         lang.eval
             .merge(EvalSchemeDef::new(
                 "e.var",
                 "var",
-                Term::arr_native_lit("proj_env", vec![], "$payload"),
+                TermData::op("proj_env", vec![], &ArrSource::Native, Some("$payload".into())).to_term().unwrap(),
             ))
             .unwrap();
         lang.eval
             .merge(EvalSchemeDef::new(
                 "e.add",
                 "binary.add",
-                Term::arr_native(
-                    "add",
-                    vec![
-                        Term::arr_native_lit("proj_child", vec![], json!(0u64)),
-                        Term::arr_native_lit("proj_child", vec![], json!(1u64)),
-                    ],
-                ),
+                TermData::op("add", vec![
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64).into())),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64).into())),
+                    ], &ArrSource::Native, None).to_term().unwrap(),
             ))
             .unwrap();
         lang.eval
             .merge(EvalSchemeDef::new(
                 "e.call",
                 "call",
-                Term::app(
-                    Term::arr_native_lit("proj_child", vec![], json!(0u64)),
-                    vec![Term::arr_native_lit("proj_child", vec![], json!(1u64))],
-                ),
+                TermData::app(TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64).into())), vec![TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64).into()))]).to_term().unwrap(),
             ))
             .unwrap();
         let ast = make_ast(vec![
@@ -815,50 +768,38 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.var",
                 "var",
-                Term::arr_native_lit("proj_env", vec![], "$payload"),
+                TermData::op("proj_env", vec![], &ArrSource::Native, Some("$payload".into())).to_term().unwrap(),
             ))
             .unwrap();
         lang.eval
             .merge(EvalSchemeDef::new(
                 "e.let",
                 "let",
-                Term::seq(
-                    Term::seq(
-                        Term::arr_native_lit("proj_child", vec![], json!(0u64)),
-                        Term::arr_native_lit("extend_env", vec![], "$payload"),
-                    ),
-                    Term::arr_native_lit("proj_child", vec![], json!(1u64)),
-                ),
+                TermData::seq(TermData::seq(TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64).into())), TermData::op("extend_env", vec![], &ArrSource::Native, Some("$payload".into()))), TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64).into()))).to_term().unwrap(),
             ))
             .unwrap();
         lang.eval
             .merge(EvalSchemeDef::new(
                 "e.add",
                 "binary.add",
-                Term::arr_native(
-                    "add",
-                    vec![
-                        Term::arr_native_lit("proj_child", vec![], json!(0u64)),
-                        Term::arr_native_lit("proj_child", vec![], json!(1u64)),
-                    ],
-                ),
+                TermData::op("add", vec![
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64).into())),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64).into())),
+                    ], &ArrSource::Native, None).to_term().unwrap(),
             ))
             .unwrap();
         lang.eval
             .merge(EvalSchemeDef::new(
                 "e.fn",
                 "function",
-                Term::arr_native("closure", vec![]),
+                TermData::op("closure", vec![], &ArrSource::Native, None).to_term().unwrap(),
             ))
             .unwrap();
         lang.eval
             .merge(EvalSchemeDef::new(
                 "e.call",
                 "call",
-                Term::app(
-                    Term::arr_native_lit("proj_child", vec![], json!(0u64)),
-                    vec![Term::arr_native_lit("proj_child", vec![], json!(1u64))],
-                ),
+                TermData::app(TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64).into())), vec![TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64).into()))]).to_term().unwrap(),
             ))
             .unwrap();
         // let x = 10 in let f = fn(y) { x + y } in f(5) → 15
@@ -886,10 +827,7 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.triple",
                 "triple",
-                Term::arr_foreign(
-                    "triple",
-                    vec![Term::arr_native_lit("proj_child", vec![], json!(0u64))],
-                ),
+                TermData::op("triple", vec![TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64).into()))], &ArrSource::Foreign("triple".into()), None).to_term().unwrap(),
             ))
             .unwrap();
         let ast = make_ast(vec![
@@ -915,27 +853,24 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.var",
                 "var",
-                Term::arr_native_lit("proj_env", vec![], "$payload"),
+                TermData::op("proj_env", vec![], &ArrSource::Native, Some("$payload".into())).to_term().unwrap(),
             ))
             .unwrap();
         lang.eval
             .merge(EvalSchemeDef::new(
                 "e.add",
                 "binary.add",
-                Term::arr_native(
-                    "add",
-                    vec![
-                        Term::arr_native_lit("proj_child", vec![], json!(0u64)),
-                        Term::arr_native_lit("proj_child", vec![], json!(1u64)),
-                    ],
-                ),
+                TermData::op("add", vec![
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64).into())),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64).into())),
+                    ], &ArrSource::Native, None).to_term().unwrap(),
             ))
             .unwrap();
         lang.eval
             .merge(EvalSchemeDef::new(
                 "e.bind",
                 "bind",
-                Term::arr_native("bind", vec![]),
+                TermData::op("bind", vec![], &ArrSource::Native, None).to_term().unwrap(),
             ))
             .unwrap();
         let ast = make_ast(vec![
