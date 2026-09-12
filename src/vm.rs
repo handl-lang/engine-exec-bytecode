@@ -1100,6 +1100,10 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                         env: Rc::new(captured),
                         home: None,
                         array_pattern: *array_pattern,
+                        // ADR-0106 item 2 step 1: the bytecode engine's body is
+                        // an instruction index, not an AST node, so no
+                        // self-describing definition is minted yet (step 3).
+                        body_def: None,
                     });
                 }
                 // --- ADR-0103 hardware-boundary instructions ---
@@ -1323,6 +1327,8 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     env: Rc::new(captured),
                     home: None,
                     array_pattern,
+                    // ADR-0106 item 2 step 1: see `body_def` on `TaggedValue`.
+                    body_def: None,
                 })
             }
             "array" => {
@@ -3034,6 +3040,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 env,
                 home,
                 array_pattern,
+                ..
             } => (
                 params.clone(),
                 rest.clone(),
@@ -3070,6 +3077,8 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 env: captured_env.clone(),
                 home: None,
                 array_pattern,
+                // ADR-0106 item 2 step 1: re-wrap of an existing body.
+                body_def: None,
             };
             return home_vm.apply_app(&local_callee, args);
         }
