@@ -368,6 +368,8 @@ fn type_tag(v: &TaggedValue) -> &'static str {
         TaggedValue::Bytes(_) => "bytes",
         // ADR-0083 §2.2: opaque foreign resource handle.
         TaggedValue::Resource(_) => "resource",
+        // ADR-0106: nominal identity object (`sym()` / `sym(A)`).
+        TaggedValue::Sym(_) => "sym",
     }
 }
 
