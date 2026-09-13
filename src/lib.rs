@@ -184,6 +184,7 @@ impl BytecodeEngine {
             lang: Rc::clone(&lang),
             modules: self.modules.clone(),
             globals: Some(Rc::clone(&globals_rc)),
+            import_resolver: self.import_resolver.clone(),
         };
 
         eval_frame.enter(|| {
@@ -259,6 +260,7 @@ impl EvalEngine for BytecodeEngine {
             Rc::new(lang.clone()),
             self.modules.clone(),
             globals,
+            self.import_resolver.clone(),
         );
         let mut value = value;
         stamp_home(&mut value, frame_id);
