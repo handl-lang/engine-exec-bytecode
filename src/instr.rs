@@ -415,7 +415,6 @@ pub enum Instr {
     // generalizing `ForeignOp` with a `module` field. The existing
     // `NativeOp`/`ForeignOp`/typed-bytecode variants remain as fallbacks for
     // ops not yet migrated.
-
     /// Pop the operands and apply the ALU operation `op`, pushing the result.
     ///
     /// Binary ops (`Add`/`Sub`/`Mul`/`Div`/`Mod`/`Eq`/`Neq`/`Lt`/`Le`/`Gt`/
