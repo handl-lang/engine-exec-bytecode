@@ -144,6 +144,24 @@ impl BytecodeEngine {
     /// install the `ast`/`lang`/`modules` in the home-frame thread-locals,
     /// compile/execute the arena root, and return a `Value`.
     fn eval_ast_rc(&self, lang: Rc<Language>, ast: Rc<Ast>) -> Result<Value, LangError> {
+        self.eval_ast_rc_with_args(lang, ast, &[])
+    }
+
+    /// Shared core of [`EvalEngine::eval_shared_with_call_args`] (ADR-0106):
+    /// like [`eval_ast_rc`](Self::eval_ast_rc), but merges `call_args`
+    /// directly into the call frame's `ScopeStack::globals` map — without
+    /// cloning the engine via [`with_global`](Self::with_global).
+    ///
+    /// The call args live in the same `globals` field as host-provided
+    /// globals (e.g. `self`), so they are resolvable by name lookup but
+    /// excluded from closure capture ("no env capture") and never leak
+    /// between calls.
+    fn eval_ast_rc_with_args(
+        &self,
+        lang: Rc<Language>,
+        ast: Rc<Ast>,
+        call_args: &[(String, Value)],
+    ) -> Result<Value, LangError> {
         if ast.is_empty() {
             return Ok(Value::Null);
         }
@@ -170,14 +188,22 @@ impl BytecodeEngine {
         };
         let ast_ref: &Ast = lowered.as_ref().unwrap_or(&ast);
 
-        // Host-provided globals (e.g. `self`, `__arg_N`). Kept in a separate
-        // `ScopeStack::globals` map so they are not captured into closures.
-        let globals_rc: Rc<FxHashMap<Rc<str>, TaggedValue>> = Rc::new(
-            self.globals
+        // Host-provided globals (e.g. `self`, `__arg_N`) merged with the
+        // per-call argument bindings. Both live in the `ScopeStack::globals`
+        // map so they are resolvable via lookup but not captured into
+        // closures. Per-call args are inserted after engine globals so they
+        // shadow same-named ambient globals for this eval only.
+        let globals_rc: Rc<FxHashMap<Rc<str>, TaggedValue>> = Rc::new({
+            let mut globals: FxHashMap<Rc<str>, TaggedValue> = self
+                .globals
                 .iter()
                 .map(|(k, v)| (Rc::from(k.as_str()), TaggedValue::from(v.clone())))
-                .collect(),
-        );
+                .collect();
+            for (name, val) in call_args {
+                globals.insert(Rc::from(name.as_str()), TaggedValue::from(val.clone()));
+            }
+            globals
+        });
 
         let eval_frame = TreeWalkEvalFrame {
             ast: Rc::clone(&ast),
@@ -211,6 +237,22 @@ impl EvalEngine for BytecodeEngine {
     /// `HandlFunction` bridge) costs zero clones.
     fn eval_shared(&self, lang: &Language, ast: &Rc<Ast>) -> Result<Value, LangError> {
         self.eval_ast_rc(Rc::new(lang.clone()), Rc::clone(ast))
+    }
+
+    /// Bytecode override (ADR-0106): bind `args` directly into the call
+    /// frame's `ScopeStack::globals` alongside host-provided globals, without
+    /// cloning the engine or persisting the args into [`BytecodeEngine::globals`].
+    ///
+    /// This mirrors the tree-walk engine's zero-clone path: args are
+    /// resolvable by name lookup, excluded from closure capture, and scoped to
+    /// this single `eval_shared` call.
+    fn eval_shared_with_call_args(
+        &self,
+        lang: &Language,
+        ast: &Rc<Ast>,
+        args: &[(String, Value)],
+    ) -> Result<Value, LangError> {
+        self.eval_ast_rc_with_args(Rc::new(lang.clone()), Rc::clone(ast), args)
     }
 
     fn box_clone(&self) -> Box<dyn EvalEngine> {
