@@ -299,8 +299,7 @@ fn compile_into_td(
         // via [`TermData::to_term`] for this one case.
         "Handle" => {
             let term = td.to_term().map_err(|e| LangError::engine_node(e, node))?;
-            let eliminated = handl_language::eliminate_and_check(&term)
-                .map_err(|e| LangError::engine_node(e.to_string(), node))?;
+            let eliminated = term.eliminate_handlers();
             compile_into(&eliminated, lang, ast, node, out)
         }
 
