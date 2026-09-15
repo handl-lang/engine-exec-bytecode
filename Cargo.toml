@@ -4,19 +4,19 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-handl-language = {path = "../handl-language" }
-handl-platform = {path = "../platform" }
-plugin-engine = {path = "../plugin-engine" }
-handl-plugin-engine-exec = {path = "../plugin-engine-exec" }
-handl-plugin-engine-exec-tree-walk = {path = "../plugin-engine-exec-tree-walk" }
-handl-plugin-engine-transform = {path = "../plugin-engine-transform" }
-handl-plugin-engine-transform-rewrite = {path = "../plugin-engine-transform-rewrite" }
-handl-runtime = {path = "../handl-runtime" }
-handl-value = {path = "../handl-value" }
+handl-language = { path = "../handl-language" }
+handl-platform = { path = "../platform" }
+plugin-engine = { path = "../plugin-engine" }
+handl-plugin-engine-exec = { path = "../plugin-engine-exec" }
+handl-plugin-engine-exec-tree-walk = { path = "../plugin-engine-exec-tree-walk" }
+handl-plugin-engine-transform = { path = "../plugin-engine-transform" }
+handl-plugin-engine-transform-rewrite = { path = "../plugin-engine-transform-rewrite" }
+handl-runtime = { path = "../handl-runtime" }
+handl-value = { path = "../handl-value" }
 serde_json = { workspace = true }
 rustc-hash = "2"
 
 [dev-dependencies]
-handl-test-utils = {path = "../handl-test-utils" }
-handl-plugin-module = {path = "../plugin-module" }
+handl-test-utils = { path = "../handl-test-utils" }
+handl-plugin-module = { path = "../plugin-module" }
 serde_json = { workspace = true }
