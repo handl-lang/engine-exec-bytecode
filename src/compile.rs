@@ -195,7 +195,10 @@ fn compile_into_td(
                 let op = body.get_str("name").unwrap_or("");
                 let source = body.arr_source().unwrap_or(ArrSource::Native);
                 let args = body.get_term_list("args");
-                if source == ArrSource::Native && op == "loop_step" && !args.is_empty() {
+                if source == ArrSource::Native
+                    && matches!(op, "loop_step" | "fold_step")
+                    && !args.is_empty()
+                {
                     let body_proc = &args[0];
                     // Compile the body closure once, before the loop. This
                     // evaluates the `function`/`closure` child once,
@@ -216,8 +219,8 @@ fn compile_into_td(
 
                     // Loop body: load the hoisted closure instead of
                     // re-creating it, compile any remaining args, then emit
-                    // the `loop_step` native op. The VM's `loop_step`
-                    // handler receives the pre-computed closure as args[0]
+                    // the step native op. The VM's `loop_step`/`fold_step`
+                    // handlers receive the pre-computed closure as args[0]
                     // and the loop pair as `incoming` — identical to the
                     // non-hoisted path, just without the per-iteration
                     // closure creation.
@@ -228,7 +231,7 @@ fn compile_into_td(
                             out.push(Instr::PopScope);
                         }
                     }
-                    out.push(Instr::NativeOp("loop_step".to_string(), args.len()));
+                    out.push(Instr::NativeOp(op.to_string(), args.len()));
                     out.push(Instr::LoopCheck(loop_back));
 
                     // Pop the scope pushed by `Store("__loop_closure__")`.
