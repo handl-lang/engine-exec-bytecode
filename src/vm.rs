@@ -60,12 +60,13 @@
 use std::rc::Rc;
 
 use handl_language::{Ast, AstNode, AstRef, LangError, Language, Value};
+use handl_plugin_engine_exec::native_ops::{
+    self, NativeOpCtx, Num, OpService, as_num, bin_add, build_loop_step_args, is_truthy,
+    loop_step_outcome, num_value, step_decision, type_tag,
+};
 use handl_plugin_engine_exec::pattern_match::{self, PatternMatchCtx};
 use handl_plugin_engine_exec_tree_walk::home_frame;
-use handl_value::{
-    TaggedValue, cell2_comp_v, cell2_id, cell2_src, cell2_tgt, cell2_whisker, record_proj,
-    tagged_to_value,
-};
+use handl_value::{TaggedValue, tagged_to_value};
 use rustc_hash::FxHashMap;
 
 use crate::compile::compile;
@@ -262,60 +263,6 @@ impl ScopeStack {
 }
 
 // ---------------------------------------------------------------------------
-// Numeric helpers — identical semantics to the tree-walk interpreter
-// ---------------------------------------------------------------------------
-
-/// A number that can be either integer or float.
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
-pub(crate) enum Num {
-    /// Integer value.
-    Int(i64),
-    /// Float value.
-    Float(f64),
-}
-
-impl Num {
-    /// Convert to `f64`.
-    pub(crate) fn to_f64(self) -> f64 {
-        match self {
-            Num::Int(i) => i as f64,
-            Num::Float(f) => f,
-        }
-    }
-}
-
-/// Extract a number from a [`TaggedValue`].
-pub(crate) fn as_num(v: &TaggedValue) -> Result<Num, LangError> {
-    match v {
-        TaggedValue::Int(i) => Ok(Num::Int(*i)),
-        TaggedValue::Float(f) => Ok(Num::Float(*f)),
-        _ => Err(LangError::engine(format!("expected number, got {:?}", v))),
-    }
-}
-
-/// Convert a [`Num`] back to a [`TaggedValue`].
-pub(crate) fn num_value(n: Num) -> TaggedValue {
-    match n {
-        Num::Int(i) => TaggedValue::Int(i),
-        Num::Float(f) => TaggedValue::Float(f),
-    }
-}
-
-/// Whether a [`TaggedValue`] is truthy.
-///
-/// `false`, `null`, `0`, and `""` are falsy; everything else is truthy.
-pub(crate) fn is_truthy(v: &TaggedValue) -> bool {
-    match v {
-        TaggedValue::Bool(b) => *b,
-        TaggedValue::Null => false,
-        TaggedValue::Int(i) => *i != 0,
-        TaggedValue::Float(f) => *f != 0.0,
-        TaggedValue::Str(s) => !s.is_empty(),
-        _ => true,
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Pair / Either value-shape helpers (mirror the v2 tree-walk)
 // ---------------------------------------------------------------------------
 
@@ -344,27 +291,6 @@ fn flatten_pair(v: &TaggedValue) -> Vec<TaggedValue> {
             left
         }
         other => vec![other.clone()],
-    }
-}
-
-/// Return the type tag string for a [`TaggedValue`] (ADR-0060).
-fn type_tag(v: &TaggedValue) -> &'static str {
-    match v {
-        TaggedValue::Null => "null",
-        TaggedValue::Bool(_) => "bool",
-        TaggedValue::Int(_) | TaggedValue::Float(_) => "number",
-        TaggedValue::Str(_) => "string",
-        TaggedValue::Arr(_) => "array",
-        TaggedValue::Obj(_) => "object",
-        TaggedValue::Pair(..) => "object",
-        TaggedValue::EitherLeft(_) | TaggedValue::EitherRight(_) => "object",
-        TaggedValue::Arrow { .. } => "object",
-        // ADR-0083 §2.1: `Bytes` is a scalar type in `value_types.yaml`.
-        TaggedValue::Bytes(_) => "bytes",
-        // ADR-0083 §2.2: opaque foreign resource handle.
-        TaggedValue::Resource(_) => "resource",
-        // ADR-0106: nominal identity object (`sym()` / `sym(A)`).
-        TaggedValue::Sym(_) => "sym",
     }
 }
 
@@ -518,6 +444,10 @@ impl<'a, 'h> PatternMatchCtx for VmFrame<'a, 'h> {
     fn eval_pattern_node(&mut self, _ast: &Ast, node_ref: AstRef) -> Result<Value, LangError> {
         let val = self.exec_node_inner(node_ref)?;
         Ok(tagged_to_value(&val))
+    }
+
+    fn global_value(&self, name: &str) -> Option<Value> {
+        self.scopes.globals.get(name).map(tagged_to_value)
     }
 }
 
@@ -1225,11 +1155,19 @@ impl<'a, 'h> VmFrame<'a, 'h> {
         })
     }
 
-    /// Apply a native v2 op. Mirrors the v2 tree-walk's `apply_native` exactly.
+    /// Apply a native v2 op.
     ///
     /// `incoming` is the value flowing through the arrow (used by `id`,
     /// `tag`, `is_pos`, `dec`, `inc`, `half_floor`, `inc_fst`,
     /// `countdown_step`, `infinite_step`).
+    ///
+    /// The op semantics are defined once in
+    /// `plugin-engine-exec::native_ops` (ADR-0044 §7): this engine supplies
+    /// only the globals — the scope stack, AST-node execution, and arrow
+    /// application — through [`VmCtx`]. The residual `match` below owns
+    /// ops that still require this engine's machinery (imports, module
+    /// calls, `eval_block`, closures, FFI) and are migrated to the shared
+    /// table as their services are declared.
     fn apply_native_v2(
         &mut self,
         op: &str,
@@ -1237,20 +1175,15 @@ impl<'a, 'h> VmFrame<'a, 'h> {
         node: &AstNode,
         incoming: Option<TaggedValue>,
     ) -> Result<TaggedValue, LangError> {
-        match op {
-            "id" => Ok(incoming
-                .or_else(|| args.first().cloned())
-                .unwrap_or(TaggedValue::Null)),
-            "tag" => {
-                let v = incoming
-                    .or_else(|| args.first().cloned())
-                    .unwrap_or(TaggedValue::Null);
-                if is_truthy(&v) {
-                    Ok(either_left(v))
-                } else {
-                    Ok(either_right(v))
-                }
+        {
+            let mut ctx = VmCtx { frame: self, node };
+            match native_ops::apply_native_op(op, args, None, incoming.clone(), &mut ctx) {
+                Ok(Some((v, _pushed))) => return Ok(v),
+                Ok(None) => {}
+                Err(e) => return Err(e.with_node(node)),
             }
+        }
+        match op {
             "closure" => {
                 let payload = &node.payload;
                 let (params, rest, body, array_pattern) = if let (Some(p), Some(b)) = (
@@ -1474,71 +1407,6 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     ))
                 }
             }
-            "index" => {
-                // `index { children: [target, index] }` — evaluate the two
-                // child nodes, matching the tree-walk/cranelift `index`
-                // dispatch. Falls back to legacy `payload.target`/
-                // `payload.index` for hand-built ASTs.
-                let (target, index) = if let Some(children) =
-                    node.payload.get("children").and_then(|c| c.as_array())
-                {
-                    if children.len() < 2 {
-                        return Err(LangError::engine_node(
-                            "index: expected at least 2 children".to_string(),
-                            node,
-                        ));
-                    }
-                    let target_idx = children[0].as_u64().ok_or_else(|| {
-                        LangError::engine_node(
-                            "index: target index must be a number".to_string(),
-                            node,
-                        )
-                    })? as usize;
-                    let index_idx = children[1].as_u64().ok_or_else(|| {
-                        LangError::engine_node(
-                            "index: index index must be a number".to_string(),
-                            node,
-                        )
-                    })? as usize;
-                    let target = self.exec_node_inner(AstRef::new(target_idx))?;
-                    let index = self.exec_node_inner(AstRef::new(index_idx))?;
-                    (tagged_to_value(&target), tagged_to_value(&index))
-                } else {
-                    let target = node.payload.get("target").ok_or_else(|| {
-                        LangError::engine_node("index: missing target in payload".to_string(), node)
-                    })?;
-                    let index = node.payload.get("index").ok_or_else(|| {
-                        LangError::engine_node("index: missing index in payload".to_string(), node)
-                    })?;
-                    (target.clone(), index.clone())
-                };
-                match (target, index) {
-                    (Value::Array(arr), Value::Number(n)) => {
-                        let i = n.as_u64().ok_or_else(|| {
-                            LangError::engine(
-                                "index: index must be a non-negative integer".to_string(),
-                            )
-                        })? as usize;
-                        let v = arr.get(i).cloned().ok_or_else(|| {
-                            LangError::engine_node(
-                                format!("index: index {} out of bounds", i),
-                                node,
-                            )
-                        })?;
-                        Ok(TaggedValue::from(v))
-                    }
-                    (Value::Object(obj), Value::String(key)) => {
-                        let v = obj.get(&key).cloned().ok_or_else(|| {
-                            LangError::engine_node(format!("index: key '{}' not found", key), node)
-                        })?;
-                        Ok(TaggedValue::from(v))
-                    }
-                    _ => Err(LangError::engine(
-                        "index: target must be array/object and index must be number/string"
-                            .to_string(),
-                    )),
-                }
-            }
             "assign" => {
                 // ADR-0053: `assign { children: [var, value] }` — evaluate
                 // child 1 (value) and return it. Fall back to legacy
@@ -1559,65 +1427,6 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 })?;
                 Ok(TaggedValue::from(value.clone()))
             }
-            "add" => bin_num(args, |a, b| a + b),
-            "sub" => bin_num(args, |a, b| a - b),
-            "mul" => bin_num(args, |a, b| a * b),
-            "div" => {
-                let a = as_num(&args[0])?;
-                let b = as_num(&args[1])?;
-                if b.to_f64() == 0.0 {
-                    return Err(LangError::engine_node("division by zero".to_string(), node));
-                }
-                match (a, b) {
-                    (Num::Int(a), Num::Int(b)) => Ok(TaggedValue::Int(a / b)),
-                    (a, b) => Ok(TaggedValue::Float(a.to_f64() / b.to_f64())),
-                }
-            }
-            "mod" => {
-                let a = as_num(&args[0])?;
-                let b = as_num(&args[1])?;
-                if b.to_f64() == 0.0 {
-                    return Err(LangError::engine_node("modulo by zero".to_string(), node));
-                }
-                Ok(num_value(match (a, b) {
-                    (Num::Int(a), Num::Int(b)) => Num::Int(a % b),
-                    (a, b) => Num::Float(a.to_f64() % b.to_f64()),
-                }))
-            }
-            "neg" => {
-                let a = as_num(&args[0])?;
-                Ok(num_value(match a {
-                    Num::Int(i) => Num::Int(-i),
-                    Num::Float(f) => Num::Float(-f),
-                }))
-            }
-            "eq" => Ok(TaggedValue::Bool(handl_value::eq(&args[0], &args[1]))),
-            "neq" => Ok(TaggedValue::Bool(!handl_value::eq(&args[0], &args[1]))),
-            "lt" => cmp_num(args, |a, b| a < b),
-            "gt" => cmp_num(args, |a, b| a > b),
-            "lte" => cmp_num(args, |a, b| a <= b),
-            "gte" => cmp_num(args, |a, b| a >= b),
-            "pow" => {
-                let a = as_num(&args[0])?;
-                let b = as_num(&args[1])?;
-                Ok(num_value(Num::Float(a.to_f64().powf(b.to_f64()))))
-            }
-            "compare" => {
-                let a = as_num(&args[0])?;
-                let b = as_num(&args[1])?;
-                let cmp = a.to_f64().partial_cmp(&b.to_f64()).ok_or_else(|| {
-                    LangError::engine_node("compare: incomparable values".to_string(), node)
-                })?;
-                Ok(num_value(Num::Int(match cmp {
-                    std::cmp::Ordering::Less => -1,
-                    std::cmp::Ordering::Equal => 0,
-                    std::cmp::Ordering::Greater => 1,
-                })))
-            }
-            // ADR-0060: call_host — takes a string callee (args[0]) and an
-            // args array (args[1]), looks up the callee in the module
-            // registry, and invokes the host function with the array
-            // elements as individual arguments.
             "call_host" => {
                 // Mirror the tree-walk: the callee (e.g. `str.length`
                 // evaluating to the string "str.length") arrives as
@@ -1683,123 +1492,11 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 }
                 Ok(TaggedValue::Arr(Rc::from(vals)))
             }
-            "typeof" => {
-                let arg = args
-                    .first()
-                    .or(incoming.as_ref())
-                    .unwrap_or(&TaggedValue::Null);
-                Ok(TaggedValue::Str(Rc::from(type_tag(arg))))
-            }
-            "not" => Ok(TaggedValue::Bool(!is_truthy(&args[0]))),
-            "and" => Ok(TaggedValue::Bool(
-                is_truthy(&args[0]) && is_truthy(&args[1]),
-            )),
-            "or" => Ok(TaggedValue::Bool(
-                is_truthy(&args[0]) || is_truthy(&args[1]),
-            )),
-            "is_pos" => {
-                let v = incoming.unwrap_or(TaggedValue::Null);
-                let n = as_num(&v)?;
-                Ok(TaggedValue::Bool(n.to_f64() > 0.0))
-            }
-            "dec" => {
-                let v = incoming.unwrap_or(TaggedValue::Null);
-                let n = as_num(&v)?;
-                Ok(num_value(match n {
-                    Num::Int(i) => Num::Int(i - 1),
-                    Num::Float(f) => Num::Float(f - 1.0),
-                }))
-            }
-            "inc" => {
-                let v = incoming.unwrap_or(TaggedValue::Null);
-                let n = as_num(&v)?;
-                Ok(num_value(match n {
-                    Num::Int(i) => Num::Int(i + 1),
-                    Num::Float(f) => Num::Float(f + 1.0),
-                }))
-            }
-            "half_floor" => {
-                let v = incoming.unwrap_or(TaggedValue::Null);
-                let n = as_num(&v)?;
-                Ok(num_value(match n {
-                    Num::Int(i) => Num::Int(i / 2),
-                    Num::Float(f) => Num::Float((f / 2.0).floor()),
-                }))
-            }
-            "inc_fst" => {
-                let inc = args
-                    .first()
-                    .cloned()
-                    .or(incoming)
-                    .unwrap_or(TaggedValue::Null);
-                let a = pair_fst(&inc)
-                    .ok_or_else(|| {
-                        LangError::engine_node("inc_fst: input is not a pair".to_string(), node)
-                    })?
-                    .clone();
-                let b = pair_snd(&inc)
-                    .ok_or_else(|| {
-                        LangError::engine_node("inc_fst: input is not a pair".to_string(), node)
-                    })?
-                    .clone();
-                let a_n = as_num(&a)?;
-                Ok(pair(
-                    num_value(match a_n {
-                        Num::Int(i) => Num::Int(i + 1),
-                        Num::Float(f) => Num::Float(f + 1.0),
-                    }),
-                    b,
-                ))
-            }
-            "countdown_step" => {
-                let inc = args
-                    .first()
-                    .cloned()
-                    .or(incoming)
-                    .unwrap_or(TaggedValue::Null);
-                let a = pair_fst(&inc).cloned().ok_or_else(|| {
-                    LangError::engine_node("countdown_step: input is not a pair".to_string(), node)
-                })?;
-                let b = pair_snd(&inc).cloned().unwrap_or(TaggedValue::Null);
-                let result_val = pair_fst(&a).cloned().ok_or_else(|| {
-                    LangError::engine(
-                        "countdown_step: in must be pair(result, initial)".to_string(),
-                    )
-                })?;
-                let initial = pair_snd(&a).cloned().unwrap_or(TaggedValue::Null);
-                let state = if b.is_null() { initial } else { b };
-                let n = as_num(&state)?;
-                if n.to_f64() > 0.0 {
-                    Ok(either_right(num_value(match n {
-                        Num::Int(i) => Num::Int(i - 1),
-                        Num::Float(f) => Num::Float(f - 1.0),
-                    })))
-                } else {
-                    Ok(either_left(result_val))
-                }
-            }
-            "infinite_step" => {
-                let inc = args
-                    .first()
-                    .cloned()
-                    .or(incoming)
-                    .unwrap_or(TaggedValue::Null);
-                let b = pair_snd(&inc).cloned().unwrap_or(TaggedValue::Null);
-                Ok(either_right(b))
-            }
-            // Ergonomic `loop` surface lowering (ADR-0052). args = [body_proc]
-            // — the body closure, evaluated from the carried sub-scheme
-            // arg. `incoming` is the loop pair `(in, state)` popped from the
-            // operand stack by the `NativeOp` handler (see `op_is_derived_step`).
-            // The body closure is applied to the current state (in on the first
-            // step, state thereafter); it returns:
-            //   { state: v }  → either_right(v) (continue)
-            //   { out: v }    → either_left(v)  (terminate, backward compat)
-            //   bare value    → either_left(v)  (terminate, v0.1 `return v`)
-            // Param destructuring: if the body closure has >1 params and the
-            // current state is an object, bind each param to the corresponding
-            // field by name. Mirrors the v2 tree-walk's `eval_derived_step`
-            // `loop_step` arm exactly.
+            // `loop_step` — the ergonomic `loop` surface (ADR-0052). The
+            // body closure is applied to the current state via this
+            // engine's `apply_app`; the shared `build_loop_step_args`/
+            // `loop_step_outcome` define the argument mapping and the
+            // `{ state: v }`/`{ out: v }`/bare-value outcome semantics.
             "loop_step" => {
                 let inc = incoming.unwrap_or(TaggedValue::Null);
                 let in_val = pair_fst(&inc).cloned().unwrap_or(TaggedValue::Null);
@@ -1808,129 +1505,24 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     LangError::engine_node("loop_step: missing body closure".to_string(), node)
                 })?;
                 let current = if state.is_null() { in_val } else { state };
-                let call_args: Vec<TaggedValue> = if let Some(obj_state) = current.as_object() {
-                    if let TaggedValue::Arrow {
-                        params,
-                        array_pattern,
-                        ..
-                    } = body_proc
-                    {
-                        if *array_pattern {
-                            if params.len() == 1 {
-                                vec![TaggedValue::Arr(Rc::from([current.clone()]))]
-                            } else {
-                                let arr: Vec<TaggedValue> = params
-                                    .iter()
-                                    .map(|p| {
-                                        obj_state
-                                            .get(p.as_str())
-                                            .cloned()
-                                            .unwrap_or(TaggedValue::Null)
-                                    })
-                                    .collect();
-                                vec![TaggedValue::Arr(arr.into())]
-                            }
-                        } else if params.len() > 1 {
-                            params
-                                .iter()
-                                .map(|p| {
-                                    obj_state
-                                        .get(p.as_str())
-                                        .cloned()
-                                        .unwrap_or(TaggedValue::Null)
-                                })
-                                .collect()
-                        } else {
-                            vec![current.clone()]
-                        }
-                    } else {
-                        vec![current.clone()]
-                    }
-                } else {
-                    vec![current.clone()]
-                };
+                let call_args = build_loop_step_args(body_proc, &current);
                 let result = self.apply_app(body_proc, &call_args)?;
-                // v0.1: `return v` produces a bare value (not wrapped in { out: v }).
-                // Recognize bare values as exit signals, and { state: v } as continue.
-                // { out: v } is accepted for backward compatibility.
-                if let Some(obj) = result.as_object() {
-                    if let Some(new_state) = obj.get("state") {
-                        // Continue with new state.
-                        Ok(either_right(new_state.clone()))
-                    } else if let Some(out) = obj.get("out") {
-                        // Exit with out value (backward compat with { out: v } protocol).
-                        Ok(either_left(out.clone()))
-                    } else {
-                        // Object without out/state keys — treat as exit value (return).
-                        Ok(either_left(result.clone()))
-                    }
-                } else {
-                    // Non-object (number, string, bool, null, array) — exit with the value.
-                    Ok(either_left(result.clone()))
-                }
+                Ok(loop_step_outcome(result))
             }
-            // `while_step` derived step op (ADR-0052 §"Derived forms").
-            // args = [cond_result, body_result] — re-evaluated per iteration
-            // by the `DerivedStepOp` handler with the current value as
-            // incoming. `incoming` is the loop pair (in, state).
-            // Current = in (first step) or state (later). If cond is truthy,
-            // run body and continue with its result; else terminate.
-            "while_step" => {
+            // Derived step ops (ADR-0052 §"Derived forms"). This engine's
+            // interpretation is eager: `Instr::DerivedStepOp` re-evaluates
+            // each arg sub-program per iteration and passes the results in
+            // `args`; the step *decision* is the shared [`step_decision`]
+            // semantics, with `eval_arg` reading the pre-evaluated args.
+            "while_step" | "for_step" | "fix_step" => {
                 let inc = incoming.unwrap_or(TaggedValue::Null);
-                let in_val = pair_fst(&inc).cloned().unwrap_or(TaggedValue::Null);
-                let state = pair_snd(&inc).cloned().unwrap_or(TaggedValue::Null);
-                let current = if state.is_null() { in_val } else { state };
-                let cond_val = args.first().cloned().unwrap_or(TaggedValue::Null);
-                if is_truthy(&cond_val) {
-                    let body_val = args.get(1).cloned().unwrap_or(TaggedValue::Null);
-                    Ok(either_right(body_val))
-                } else {
-                    Ok(either_left(current))
-                }
-            }
-            // `for_step` derived step op. args = [body_result]. State is
-            // pair(counter, acc). First step: initialize from in = pair(count,
-            // initial). While counter > 0, run body on acc and continue with
-            // pair(counter-1, new_acc); else terminate with acc.
-            "for_step" => {
-                let inc = incoming.unwrap_or(TaggedValue::Null);
-                let in_val = pair_fst(&inc).cloned().unwrap_or(TaggedValue::Null);
-                let state = pair_snd(&inc).cloned().unwrap_or(TaggedValue::Null);
-                let (counter, acc) = if state.is_null() {
-                    let count = pair_fst(&in_val).cloned().unwrap_or(TaggedValue::Null);
-                    let initial = pair_snd(&in_val).cloned().unwrap_or(TaggedValue::Null);
-                    (count, initial)
-                } else {
-                    let c = pair_fst(&state).cloned().unwrap_or(TaggedValue::Null);
-                    let a = pair_snd(&state).cloned().unwrap_or(TaggedValue::Null);
-                    (c, a)
-                };
-                let count_n = as_num(&counter)?;
-                if count_n.to_f64() > 0.0 {
-                    let body_val = args.first().cloned().unwrap_or(TaggedValue::Null);
-                    let new_counter = match count_n {
-                        Num::Int(i) => num_value(Num::Int(i - 1)),
-                        Num::Float(f) => num_value(Num::Float(f - 1.0)),
+                let mut eval_arg =
+                    |i: usize, _current: &TaggedValue| -> Result<TaggedValue, LangError> {
+                        args.get(i).cloned().ok_or_else(|| {
+                            LangError::engine_node(format!("{op}: missing arg {i}"), node)
+                        })
                     };
-                    Ok(either_right(pair(new_counter, body_val)))
-                } else {
-                    Ok(either_left(acc))
-                }
-            }
-            // `fix_step` derived step op. args = [body_result]. Current = in
-            // (first step) or state (later). If body result equals current,
-            // terminate (fixpoint); else continue with the result.
-            "fix_step" => {
-                let inc = incoming.unwrap_or(TaggedValue::Null);
-                let in_val = pair_fst(&inc).cloned().unwrap_or(TaggedValue::Null);
-                let state = pair_snd(&inc).cloned().unwrap_or(TaggedValue::Null);
-                let current = if state.is_null() { in_val } else { state };
-                let new_val = args.first().cloned().unwrap_or(TaggedValue::Null);
-                if handl_value::eq(&new_val, &current) {
-                    Ok(either_left(new_val))
-                } else {
-                    Ok(either_right(new_val))
-                }
+                step_decision(op, &inc, &mut eval_arg).map_err(|e| e.with_node(node))
             }
             // `bind` op: arrow-calculus env extension (ADR-0052). Mirrors the
             // v2 tree-walk's `prim_bind`. The `bind` node's payload has
@@ -1993,56 +1585,6 @@ impl<'a, 'h> VmFrame<'a, 'h> {
             "handle" => self.prim_v2_handle(node),
             // v0.1: `product` — categorical product `***` (ADR-0074).
             // Receives [f_result, g_result] and pairs them.
-            "product" => {
-                let left = args.first().cloned().unwrap_or(TaggedValue::Null);
-                let right = args.get(1).cloned().unwrap_or(TaggedValue::Null);
-                Ok(pair(left, right))
-            }
-            // v0.1: `nullish` — nullish coalescing `??` (ADR-0074 A.3).
-            // If left is some(v), return v; if none or null, return right.
-            "nullish" => {
-                let left = args.first().cloned().unwrap_or(TaggedValue::Null);
-                let right = args.get(1).cloned().unwrap_or(TaggedValue::Null);
-                if left.is_null() {
-                    Ok(right)
-                } else if left.get("_tag").and_then(|t| t.as_str()) == Some("Some") {
-                    Ok(left.get("value").cloned().unwrap_or(TaggedValue::Null))
-                } else if left.get("_tag").and_then(|t| t.as_str()) == Some("None") {
-                    Ok(right)
-                } else {
-                    Ok(right)
-                }
-            }
-            // v0.1: `opt_chain` — optional chaining `?.` (ADR-0074 A.4).
-            // args = [input, field_name]. If some(v) → some(v.field);
-            // if none or null → none.
-            "opt_chain" => {
-                let input = args.first().cloned().unwrap_or(TaggedValue::Null);
-                let field_name = args.get(1).and_then(|v| v.as_str()).ok_or_else(|| {
-                    LangError::engine_node(
-                        "opt_chain: field name must be a string".to_string(),
-                        node,
-                    )
-                })?;
-                if input.is_null() {
-                    Ok(handl_value::tval!({"_tag": "None"}))
-                } else if input.get("_tag").and_then(|t| t.as_str()) == Some("Some") {
-                    let inner = input.get("value").cloned().unwrap_or(TaggedValue::Null);
-                    let field_val = inner.get(field_name).cloned().unwrap_or(TaggedValue::Null);
-                    Ok(handl_value::tval!({"_tag": "Some", "value": field_val}))
-                } else if input.get("_tag").and_then(|t| t.as_str()) == Some("None") {
-                    Ok(handl_value::tval!({"_tag": "None"}))
-                } else {
-                    let field_val = input.get(field_name).cloned().unwrap_or(TaggedValue::Null);
-                    Ok(handl_value::tval!({"_tag": "Some", "value": field_val}))
-                }
-            }
-            // `field_access` — dynamic field access `target[field]`, native
-            // on `TaggedValue` (mirrors the tree-walk arm and
-            // `FieldAccessHostFn` in fp.rs): object+string → lookup,
-            // array+int → index, string+string → `a.b` concat for
-            // module-path construction. Keeping this in-engine avoids
-            // forcing closure-carrying records through `tagged_to_value`.
             "field_access" => {
                 let target = args.first().cloned().unwrap_or(TaggedValue::Null);
                 let field = args.get(1).cloned().unwrap_or(TaggedValue::Null);
@@ -2133,80 +1675,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     self.apply_app(callee, &actual_args)
                 }
             }
-            "export" => Ok(args.first().cloned().unwrap_or(TaggedValue::Null)),
-            "desugar_error" => {
-                let reason = node
-                    .payload
-                    .get("reason")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown desugar error");
-                let kind = node
-                    .payload
-                    .get("kind")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("desugar-error");
-                Err(LangError::engine_node(
-                    format!("{}: {}", kind, reason),
-                    node,
-                ))
-            }
-            "left" => {
-                let f = args.first().cloned().unwrap_or(TaggedValue::Null);
-                let input = incoming
-                    .or_else(|| args.get(1).cloned())
-                    .unwrap_or(TaggedValue::Null);
-                if is_either_left(&input) {
-                    let v = either_value(&input).cloned().unwrap_or(TaggedValue::Null);
-                    let fv = self.apply_app(&f, &[v])?;
-                    Ok(either_left(fv))
-                } else if is_either_right(&input) {
-                    Ok(input)
-                } else {
-                    Err(LangError::engine_node(
-                        "left: input is not an either".to_string(),
-                        node,
-                    ))
-                }
-            }
-            "right" => {
-                let f = args.first().cloned().unwrap_or(TaggedValue::Null);
-                let input = incoming
-                    .or_else(|| args.get(1).cloned())
-                    .unwrap_or(TaggedValue::Null);
-                if is_either_right(&input) {
-                    let v = either_value(&input).cloned().unwrap_or(TaggedValue::Null);
-                    let fv = self.apply_app(&f, &[v])?;
-                    Ok(either_right(fv))
-                } else if is_either_left(&input) {
-                    Ok(input)
-                } else {
-                    Err(LangError::engine_node(
-                        "right: input is not an either".to_string(),
-                        node,
-                    ))
-                }
-            }
-            "sum" => {
-                let f = args.first().cloned().unwrap_or(TaggedValue::Null);
-                let g = args.get(1).cloned().unwrap_or(TaggedValue::Null);
-                let input = incoming
-                    .or_else(|| args.get(2).cloned())
-                    .unwrap_or(TaggedValue::Null);
-                if is_either_left(&input) {
-                    let v = either_value(&input).cloned().unwrap_or(TaggedValue::Null);
-                    let fv = self.apply_app(&f, &[v])?;
-                    Ok(either_left(fv))
-                } else if is_either_right(&input) {
-                    let v = either_value(&input).cloned().unwrap_or(TaggedValue::Null);
-                    let gv = self.apply_app(&g, &[v])?;
-                    Ok(either_right(gv))
-                } else {
-                    Err(LangError::engine_node(
-                        "sum: input is not an either".to_string(),
-                        node,
-                    ))
-                }
-            }
+            // `export` and `record_proj` are owned by the shared table.
             "runtime_assert" => {
                 let children = node
                     .payload
@@ -2257,76 +1726,6 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                         node,
                     ))
                 }
-            }
-            // `paren` — parentheses/grouping: evaluate children from the
-            // current node, falling back to the supplied args/incoming.
-            "paren" => {
-                if let Some(children) = node.payload.get("children").and_then(|c| c.as_array()) {
-                    if children.is_empty() {
-                        Ok(incoming.unwrap_or(TaggedValue::Null))
-                    } else if children.len() == 1 {
-                        let idx = children[0].as_u64().ok_or_else(|| {
-                            LangError::engine_node(
-                                "paren: child index must be a number".to_string(),
-                                node,
-                            )
-                        })? as usize;
-                        self.exec_node_inner(AstRef::new(idx))
-                    } else {
-                        let mut vals = Vec::with_capacity(children.len());
-                        for c in children {
-                            let idx = c.as_u64().ok_or_else(|| {
-                                LangError::engine_node(
-                                    "paren: child index must be a number".to_string(),
-                                    node,
-                                )
-                            })? as usize;
-                            vals.push(self.exec_node_inner(AstRef::new(idx))?);
-                        }
-                        Ok(TaggedValue::Arr(Rc::from(vals)))
-                    }
-                } else if args.is_empty() {
-                    Ok(incoming.unwrap_or(TaggedValue::Null))
-                } else if args.len() == 1 {
-                    Ok(args[0].clone())
-                } else {
-                    Ok(TaggedValue::Arr(Rc::from(args.to_vec())))
-                }
-            }
-            // Frontier: transport a value along a path.
-            "transport" => Ok(args.get(1).cloned().unwrap_or(TaggedValue::Null)),
-            // ADR-0104b: 2-cell runtime value helpers.
-            "cell2_id" => {
-                let arrow = args.first().cloned().unwrap_or(TaggedValue::Null);
-                Ok(cell2_id(&arrow))
-            }
-            "cell2_comp_v" => {
-                let first = args.first().cloned().unwrap_or(TaggedValue::Null);
-                let second = args.get(1).cloned().unwrap_or(TaggedValue::Null);
-                Ok(cell2_comp_v(&first, &second))
-            }
-            "cell2_whisker_left" => {
-                let arrow = args.first().cloned().unwrap_or(TaggedValue::Null);
-                let cell = args.get(1).cloned().unwrap_or(TaggedValue::Null);
-                Ok(cell2_whisker("Left", &arrow, &cell))
-            }
-            "cell2_whisker_right" => {
-                let arrow = args.first().cloned().unwrap_or(TaggedValue::Null);
-                let cell = args.get(1).cloned().unwrap_or(TaggedValue::Null);
-                Ok(cell2_whisker("Right", &arrow, &cell))
-            }
-            "cell2_src" => {
-                let cell = args.first().cloned().unwrap_or(TaggedValue::Null);
-                Ok(cell2_src(&cell))
-            }
-            "cell2_tgt" => {
-                let cell = args.first().cloned().unwrap_or(TaggedValue::Null);
-                Ok(cell2_tgt(&cell))
-            }
-            "record_proj" => {
-                let record = args.first().cloned().unwrap_or(TaggedValue::Null);
-                let field = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
-                Ok(record_proj(&record, field))
             }
             _ => Err(LangError::engine_node(
                 format!("unknown v2 native op: {}", op),
@@ -3205,70 +2604,98 @@ fn op_is_derived_step(op: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Numeric op helpers (mirror the v2 tree-walk)
+// Shared op services (ADR-0044 §7)
 // ---------------------------------------------------------------------------
 
-/// Binary numeric op helper. Preserves int-int arithmetic.
-fn bin_num<F>(args: &[TaggedValue], f: F) -> Result<TaggedValue, LangError>
-where
-    F: FnOnce(f64, f64) -> f64,
-{
-    let a = as_num(&args[0])?;
-    let b = as_num(&args[1])?;
-    match (a, b) {
-        (Num::Int(a), Num::Int(b)) => Ok(TaggedValue::Int(f(a as f64, b as f64) as i64)),
-        (a, b) => Ok(TaggedValue::Float(f(a.to_f64(), b.to_f64()))),
+/// The bytecode VM's [`NativeOpCtx`] — the engine-local globals the shared
+/// op table needs: the scope stack, AST-node execution, and arrow
+/// application. The op *semantics* live in
+/// `plugin-engine-exec::native_ops`; this struct only forwards services.
+struct VmCtx<'f, 'a, 'h, 'n> {
+    frame: &'f mut VmFrame<'a, 'h>,
+    node: &'n AstNode,
+}
+
+impl NativeOpCtx for VmCtx<'_, '_, '_, '_> {
+    fn supports(&self, _service: OpService) -> bool {
+        // The VM can provide every declared service: AST children are
+        // compiled+executed on demand through `exec_node_inner`.
+        true
+    }
+
+    fn node_payload(&self) -> Option<&Value> {
+        Some(&self.node.payload)
+    }
+
+    fn eval_node(&mut self, r: AstRef) -> Result<TaggedValue, LangError> {
+        self.frame.exec_node_inner(r)
+    }
+
+    fn env_lookup(&mut self, name: &str) -> Option<TaggedValue> {
+        self.frame.scopes.lookup(name).cloned()
+    }
+
+    fn env_define(&mut self, name: &str, value: TaggedValue) {
+        self.frame.scopes.define(name, value);
+    }
+
+    fn env_push(&mut self) {
+        self.frame.scopes.push_scope();
+    }
+
+    fn env_pop(&mut self) {
+        self.frame.scopes.pop_scope();
+    }
+
+    fn env_capture(&mut self) -> Rc<FxHashMap<Rc<str>, TaggedValue>> {
+        Rc::new(self.frame.scopes.capture())
+    }
+
+    fn apply_arrow(
+        &mut self,
+        f: &TaggedValue,
+        args: &[TaggedValue],
+    ) -> Result<TaggedValue, LangError> {
+        self.frame.apply_app(f, args)
     }
 }
 
-/// Numeric comparison helper.
-fn cmp_num<F>(args: &[TaggedValue], f: F) -> Result<TaggedValue, LangError>
-where
-    F: FnOnce(f64, f64) -> bool,
-{
-    let a = as_num(&args[0])?;
-    let b = as_num(&args[1])?;
-    Ok(TaggedValue::Bool(f(a.to_f64(), b.to_f64())))
-}
+// ---------------------------------------------------------------------------
+// Typed instruction evaluation — semantics delegated to the shared op table
+// ---------------------------------------------------------------------------
 
 /// Evaluate a typed arithmetic bytecode (`Add`/`Sub`/`Mul`/`Div`/`Mod`).
 ///
 /// `a` is the first argument (popped second), `b` is the second argument
-/// (popped first/top). Mirrors the corresponding `apply_native_v2` arms
-/// exactly: int-int preserves integer arithmetic; if either is a float,
-/// both are promoted to `f64`. `Div`/`Mod` error on a zero divisor.
+/// (popped first/top). The instruction is this engine's interpretation of
+/// the op; the *semantics* delegate to the shared [`Num`] arithmetic (the
+/// same rules as `apply_native_op`'s `add`/`sub`/`mul`/`div`/`mod` arms —
+/// int-int preserves integer arithmetic, `Div`/`Mod` error on a zero
+/// divisor, `Add` concatenates strings).
 fn eval_bin_arith(instr: &Instr, a: TaggedValue, b: TaggedValue) -> Result<TaggedValue, LangError> {
-    let a = as_num(&a)?;
-    let b = as_num(&b)?;
     match instr {
-        Instr::Add => Ok(num_value(match (a, b) {
-            (Num::Int(a), Num::Int(b)) => Num::Int((a as f64 + b as f64) as i64),
-            (a, b) => Num::Float(a.to_f64() + b.to_f64()),
-        })),
-        Instr::Sub => Ok(num_value(match (a, b) {
-            (Num::Int(a), Num::Int(b)) => Num::Int((a as f64 - b as f64) as i64),
-            (a, b) => Num::Float(a.to_f64() - b.to_f64()),
-        })),
-        Instr::Mul => Ok(num_value(match (a, b) {
-            (Num::Int(a), Num::Int(b)) => Num::Int((a as f64 * b as f64) as i64),
-            (a, b) => Num::Float(a.to_f64() * b.to_f64()),
-        })),
-        Instr::Div => {
-            if b.to_f64() == 0.0 {
-                return Err(LangError::engine("division by zero".to_string()));
+        // `add` is the one arithmetic op that also concatenates strings —
+        // shared `bin_add` covers both branches.
+        Instr::Add => bin_add(&[a, b]),
+        Instr::Sub => Ok(num_value(as_num(&a)? - as_num(&b)?)),
+        Instr::Mul => Ok(num_value(as_num(&a)? * as_num(&b)?)),
+        Instr::Div | Instr::Mod => {
+            let a_n = as_num(&a)?;
+            let b_n = as_num(&b)?;
+            if b_n.to_f64() == 0.0 {
+                return Err(LangError::engine(format!(
+                    "{} by zero",
+                    if matches!(instr, Instr::Div) {
+                        "division"
+                    } else {
+                        "modulo"
+                    }
+                )));
             }
-            Ok(match (a, b) {
-                (Num::Int(a), Num::Int(b)) => TaggedValue::Int(a / b),
-                (a, b) => TaggedValue::Float(a.to_f64() / b.to_f64()),
-            })
-        }
-        Instr::Mod => {
-            if b.to_f64() == 0.0 {
-                return Err(LangError::engine("modulo by zero".to_string()));
-            }
-            Ok(num_value(match (a, b) {
-                (Num::Int(a), Num::Int(b)) => Num::Int(a % b),
-                (a, b) => Num::Float(a.to_f64() % b.to_f64()),
+            Ok(num_value(if matches!(instr, Instr::Div) {
+                a_n / b_n
+            } else {
+                a_n % b_n
             }))
         }
         _ => Err(LangError::engine(format!(
@@ -3281,33 +2708,20 @@ fn eval_bin_arith(instr: &Instr, a: TaggedValue, b: TaggedValue) -> Result<Tagge
 /// Evaluate a typed comparison bytecode (`Eq`/`Neq`/`Lt`/`Lte`/`Gt`/`Gte`).
 ///
 /// `a` is the first argument (popped second), `b` is the second argument
-/// (popped first/top). `Eq`/`Neq` use [`handl_value::eq`] (matching the
-/// `NativeOp` path exactly, including cross-type equality semantics); the
-/// ordered comparisons convert both operands to `f64` via [`as_num`].
+/// (popped first/top). `Eq`/`Neq` use [`handl_value::eq`]; the ordered
+/// comparisons use the shared [`Num`] ordering — identical to the
+/// `apply_native_op` comparison arms.
 fn eval_bin_cmp(instr: &Instr, a: TaggedValue, b: TaggedValue) -> Result<TaggedValue, LangError> {
+    let ord = |a: &TaggedValue, b: &TaggedValue, f: &dyn Fn(Num, Num) -> bool| {
+        Ok(TaggedValue::Bool(f(as_num(a)?, as_num(b)?)))
+    };
     match instr {
         Instr::Eq => Ok(TaggedValue::Bool(handl_value::eq(&a, &b))),
         Instr::Neq => Ok(TaggedValue::Bool(!handl_value::eq(&a, &b))),
-        Instr::Lt => {
-            let a = as_num(&a)?;
-            let b = as_num(&b)?;
-            Ok(TaggedValue::Bool(a.to_f64() < b.to_f64()))
-        }
-        Instr::Lte => {
-            let a = as_num(&a)?;
-            let b = as_num(&b)?;
-            Ok(TaggedValue::Bool(a.to_f64() <= b.to_f64()))
-        }
-        Instr::Gt => {
-            let a = as_num(&a)?;
-            let b = as_num(&b)?;
-            Ok(TaggedValue::Bool(a.to_f64() > b.to_f64()))
-        }
-        Instr::Gte => {
-            let a = as_num(&a)?;
-            let b = as_num(&b)?;
-            Ok(TaggedValue::Bool(a.to_f64() >= b.to_f64()))
-        }
+        Instr::Lt => ord(&a, &b, &|a, b| a < b),
+        Instr::Lte => ord(&a, &b, &|a, b| a <= b),
+        Instr::Gt => ord(&a, &b, &|a, b| a > b),
+        Instr::Gte => ord(&a, &b, &|a, b| a >= b),
         _ => Err(LangError::engine(format!(
             "eval_bin_cmp: not a comparison instruction: {:?}",
             instr
@@ -3318,79 +2732,39 @@ fn eval_bin_cmp(instr: &Instr, a: TaggedValue, b: TaggedValue) -> Result<TaggedV
 /// Evaluate a binary [`ArithOp`] (ADR-0103 `Arith` instruction).
 ///
 /// `a` is the first argument (popped second), `b` is the second argument
-/// (popped first/top). Mirrors the typed bytecodes (`Add`/`Sub`/`Mul`/`Div`/
-/// `Mod`) and the comparison bytecodes (`Eq`/`Neq`/`Lt`/`Le`/`Gt`/`Ge`) plus
-/// the `and`/`or` `NativeOp` arms exactly, so results are identical.
+/// (popped first/top). Semantics delegate to the shared [`Num`]/
+/// [`is_truthy`]/[`handl_value::eq`] vocabulary — identical to the typed
+/// bytecodes and the `apply_native_op` arms.
 fn eval_arith_bin(op: ArithOp, a: TaggedValue, b: TaggedValue) -> Result<TaggedValue, LangError> {
     match op {
-        ArithOp::Add => Ok(num_value({
-            let a = as_num(&a)?;
-            let b = as_num(&b)?;
-            match (a, b) {
-                (Num::Int(a), Num::Int(b)) => Num::Int((a as f64 + b as f64) as i64),
-                (a, b) => Num::Float(a.to_f64() + b.to_f64()),
+        ArithOp::Add => bin_add(&[a, b]),
+        ArithOp::Sub => Ok(num_value(as_num(&a)? - as_num(&b)?)),
+        ArithOp::Mul => Ok(num_value(as_num(&a)? * as_num(&b)?)),
+        ArithOp::Div | ArithOp::Mod => {
+            let a_n = as_num(&a)?;
+            let b_n = as_num(&b)?;
+            if b_n.to_f64() == 0.0 {
+                return Err(LangError::engine(format!(
+                    "{} by zero",
+                    if matches!(op, ArithOp::Div) {
+                        "division"
+                    } else {
+                        "modulo"
+                    }
+                )));
             }
-        })),
-        ArithOp::Sub => Ok(num_value({
-            let a = as_num(&a)?;
-            let b = as_num(&b)?;
-            match (a, b) {
-                (Num::Int(a), Num::Int(b)) => Num::Int((a as f64 - b as f64) as i64),
-                (a, b) => Num::Float(a.to_f64() - b.to_f64()),
-            }
-        })),
-        ArithOp::Mul => Ok(num_value({
-            let a = as_num(&a)?;
-            let b = as_num(&b)?;
-            match (a, b) {
-                (Num::Int(a), Num::Int(b)) => Num::Int((a as f64 * b as f64) as i64),
-                (a, b) => Num::Float(a.to_f64() * b.to_f64()),
-            }
-        })),
-        ArithOp::Div => {
-            let a = as_num(&a)?;
-            let b = as_num(&b)?;
-            if b.to_f64() == 0.0 {
-                return Err(LangError::engine("division by zero".to_string()));
-            }
-            Ok(match (a, b) {
-                (Num::Int(a), Num::Int(b)) => TaggedValue::Int(a / b),
-                (a, b) => TaggedValue::Float(a.to_f64() / b.to_f64()),
-            })
-        }
-        ArithOp::Mod => {
-            let a = as_num(&a)?;
-            let b = as_num(&b)?;
-            if b.to_f64() == 0.0 {
-                return Err(LangError::engine("modulo by zero".to_string()));
-            }
-            Ok(num_value(match (a, b) {
-                (Num::Int(a), Num::Int(b)) => Num::Int(a % b),
-                (a, b) => Num::Float(a.to_f64() % b.to_f64()),
+            Ok(num_value(if matches!(op, ArithOp::Div) {
+                a_n / b_n
+            } else {
+                a_n % b_n
             }))
         }
         ArithOp::Eq => Ok(TaggedValue::Bool(handl_value::eq(&a, &b))),
         ArithOp::Neq => Ok(TaggedValue::Bool(!handl_value::eq(&a, &b))),
-        ArithOp::Lt => {
-            let a = as_num(&a)?;
-            let b = as_num(&b)?;
-            Ok(TaggedValue::Bool(a.to_f64() < b.to_f64()))
-        }
-        ArithOp::Le => {
-            let a = as_num(&a)?;
-            let b = as_num(&b)?;
-            Ok(TaggedValue::Bool(a.to_f64() <= b.to_f64()))
-        }
-        ArithOp::Gt => {
-            let a = as_num(&a)?;
-            let b = as_num(&b)?;
-            Ok(TaggedValue::Bool(a.to_f64() > b.to_f64()))
-        }
-        ArithOp::Ge => {
-            let a = as_num(&a)?;
-            let b = as_num(&b)?;
-            Ok(TaggedValue::Bool(a.to_f64() >= b.to_f64()))
-        }
+        ArithOp::Lt => Ok(TaggedValue::Bool(as_num(&a)? < as_num(&b)?)),
+        ArithOp::Le => Ok(TaggedValue::Bool(as_num(&a)? <= as_num(&b)?)),
+        ArithOp::Gt => Ok(TaggedValue::Bool(as_num(&a)? > as_num(&b)?)),
+        ArithOp::Ge => Ok(TaggedValue::Bool(as_num(&a)? >= as_num(&b)?)),
         ArithOp::And => Ok(TaggedValue::Bool(is_truthy(&a) && is_truthy(&b))),
         ArithOp::Or => Ok(TaggedValue::Bool(is_truthy(&a) || is_truthy(&b))),
         // Unary ops are handled by `eval_arith_unary`.
@@ -3403,16 +2777,13 @@ fn eval_arith_bin(op: ArithOp, a: TaggedValue, b: TaggedValue) -> Result<TaggedV
 
 /// Evaluate a unary [`ArithOp`] (`Neg`/`Not`) for the `Arith` instruction.
 ///
-/// Mirrors the `neg` and `not` `NativeOp` arms exactly.
+/// Semantics delegate to the shared [`Num`]/[`is_truthy`] vocabulary.
 fn eval_arith_unary(op: ArithOp, a: TaggedValue) -> Result<TaggedValue, LangError> {
     match op {
-        ArithOp::Neg => {
-            let a = as_num(&a)?;
-            Ok(num_value(match a {
-                Num::Int(i) => Num::Int(-i),
-                Num::Float(f) => Num::Float(-f),
-            }))
-        }
+        ArithOp::Neg => Ok(num_value(match as_num(&a)? {
+            Num::Int(i) => Num::Int(-i),
+            Num::Float(f) => Num::Float(-f),
+        })),
         ArithOp::Not => Ok(TaggedValue::Bool(!is_truthy(&a))),
         // Binary ops are handled by `eval_arith_bin`.
         _ => Err(LangError::engine(format!(
