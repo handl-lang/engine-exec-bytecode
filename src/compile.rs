@@ -121,6 +121,28 @@ fn compile_into_td(
         "Seq" => {
             let fst = td.get_term("fst").expect("Seq term missing 'fst' field");
             let snd = td.get_term("snd").expect("Seq term missing 'snd' field");
+            // ADR-0120 Phase 2: `>>>` is `>>>[0]`. The bytecode backend only
+            // implements axis-0 composition; non-zero or non-literal axes are
+            // structurally valid but rejected here pending the multi-axis
+            // execution increment.
+            match td.axis().nat_literal() {
+                Some(0) => {}
+                Some(k) => {
+                    return Err(LangError::engine_node(
+                        format!(
+                            "Seq: axis-{k} composition is not yet implemented (ADR-0120 Phase 2)"
+                        ),
+                        node,
+                    ));
+                }
+                None => {
+                    return Err(LangError::engine_node(
+                        "Seq: non-literal composition axis is not yet supported (ADR-0120 Phase 2)"
+                            .to_string(),
+                        node,
+                    ));
+                }
+            }
             let fst_pushed = compile_into_td(&fst, lang, ast, node, out)?;
             let snd_pushed = compile_into_td(&snd, lang, ast, node, out)?;
             // Pop the scope `fst` reported (e.g. extend_env as fst), matching
