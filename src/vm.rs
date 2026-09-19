@@ -1981,8 +1981,10 @@ impl<'a, 'h> VmFrame<'a, 'h> {
     }
 
     /// Resolve a child arena index by role from a node's payload children.
+    /// Arity-aware (`child_role_index_for`): roles after an `optional` slot
+    /// shift when the slot is absent (ADR-0081 optional roles).
     fn role_child_arena(&self, node: &AstNode, role: &str) -> Result<Option<usize>, LangError> {
-        let Some(idx) = self.lang.child_role_index(&node.kind, role)? else {
+        let Some(idx) = self.lang.child_role_index_for(node, role)? else {
             return Ok(None);
         };
         let arena = node
@@ -2356,13 +2358,29 @@ impl<'a, 'h> VmFrame<'a, 'h> {
             .ok_or_else(|| {
                 LangError::engine_node("match: missing children in payload".to_string(), node)
             })?;
-        let scrut_idx = children.get(0).and_then(|v| v.as_u64()).ok_or_else(|| {
-            LangError::engine_node("match: missing scrutinee child".to_string(), node)
-        })? as usize;
-        let block_idx =
-            children.get(1).and_then(|v| v.as_u64()).ok_or_else(|| {
-                LangError::engine_node("match: missing block child".to_string(), node)
+        // `scrutinee`/`block` positions resolve by named role, arity-aware:
+        // the optional `motive` slot (ADR-0081 optional roles) shifts
+        // `block` to index 2 when present. Positional 0 / `len >= 3 ? 2 : 1`
+        // is the role-less fallback.
+        let scrut_idx = children
+            .get(
+                self.lang
+                    .child_role_index_for(node, "scrutinee")?
+                    .unwrap_or(0),
+            )
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                LangError::engine_node("match: missing scrutinee child".to_string(), node)
             })? as usize;
+        let block_idx = children
+            .get(
+                self.lang
+                    .child_role_index_for(node, "block")?
+                    .unwrap_or(if children.len() >= 3 { 2 } else { 1 }),
+            )
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| LangError::engine_node("match: missing block child".to_string(), node))?
+            as usize;
 
         // Evaluate the scrutinee.
         let scrut_val = self.exec_node_inner(AstRef::new(scrut_idx))?;

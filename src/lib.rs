@@ -1269,10 +1269,12 @@ mod tests {
                 ChildRoleSpec {
                     role: "key".into(),
                     variadic: false,
+                    optional: false,
                 },
                 ChildRoleSpec {
                     role: "value".into(),
                     variadic: false,
+                    optional: false,
                 },
             ]))
             .unwrap();
