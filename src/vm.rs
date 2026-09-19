@@ -1351,9 +1351,10 @@ impl<'a, 'h> VmFrame<'a, 'h> {
             // ADR-0053: the data-driven `if → match` desugar rewrites `if`
             // nodes into `match` nodes before eval; the shared
             // `match_shell` handles them here.
-            // Phase 9.5: `import "path"` loads a module via the configured
-            // resolver and binds its top-level exports into the current scope.
-            "import" => self.prim_v2_import(args, node),
+            // Phase 9.5: `import "path"` is owned by the shared op table
+            // (native_ops) — it resolves the module through
+            // `VmCtx::import_resolver` and binds the exports into the
+            // current scope via `env_define`.
             // ADR-0074 follow-up #3: `>>>` (`flow`) — function application
             // with a single input argument. Unlike `call` (which unpacks a
             // `proj_rest` array of call args), `flow` passes the left
@@ -1397,110 +1398,6 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 node,
             )),
         }
-    }
-
-    /// `import` native op (Phase 9.5): load a module via the configured
-    /// [`ImportResolver`] and bind its top-level exports into the current
-    /// scope. Mirrors the v2 tree-walk's `prim_import`.
-    fn prim_v2_import(
-        &mut self,
-        args: &[TaggedValue],
-        node: &AstNode,
-    ) -> Result<TaggedValue, LangError> {
-        // Resolve the module path: prefer the evaluated child (`args[0]`),
-        // fall back to the node's `path` payload field.
-        let path: String = args
-            .first()
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .or_else(|| {
-                node.payload
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-            })
-            .ok_or_else(|| {
-                LangError::engine_node(
-                    "import: missing module path (expected string argument or 'path' payload)"
-                        .to_string(),
-                    node,
-                )
-            })?;
-        let resolver = self.import_resolver.ok_or_else(|| {
-            LangError::engine_node("import: no import resolver configured".to_string(), node)
-        })?;
-        let bindings = resolver
-            .resolve_import(&path)
-            .map_err(|e| LangError::engine_node(format!("import \"{}\": {}", path, e), node))?;
-        // Binding semantics mirror the tree-walk `prim_import` (ADR-0096):
-        // `names` (non-"*") projects a single export, `alias` alone binds
-        // the whole module object, otherwise each export is spliced into
-        // the current scope. A `names` array supports braced import lists
-        // such as `from "p" import { a, b as x }`.
-        let names_val = node.payload.get("names");
-        let alias = node.payload.get("alias").and_then(|v| v.as_str());
-        if let Some(arr) = names_val.and_then(|v| v.as_array()) {
-            for item in arr {
-                let (imported, local) = match item {
-                    Value::String(s) => (s.as_str(), s.as_str()),
-                    Value::Object(obj) => {
-                        let n = obj.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
-                            LangError::engine_node(
-                                "import: missing 'name' in braced import entry".to_string(),
-                                node,
-                            )
-                        })?;
-                        let a = obj.get("as").and_then(|v| v.as_str()).unwrap_or(n);
-                        (n, a)
-                    }
-                    _ => {
-                        return Err(LangError::engine_node(
-                            "import: invalid braced import entry".to_string(),
-                            node,
-                        ));
-                    }
-                };
-                if imported == "*" {
-                    return Err(LangError::engine_node(
-                        "import: cannot use '*' inside a braced import list".to_string(),
-                        node,
-                    ));
-                }
-                let exported = match &bindings {
-                    Value::Object(map) => map.get(imported).cloned(),
-                    _ => None,
-                };
-                let value = exported.ok_or_else(|| {
-                    LangError::engine_node(
-                        format!("import \"{}\": module has no export `{}`", path, imported),
-                        node,
-                    )
-                })?;
-                self.scopes.define(local, TaggedValue::from(value));
-            }
-        } else if let Some(imported) = names_val.and_then(|v| v.as_str()).filter(|n| *n != "*") {
-            let exported = match &bindings {
-                Value::Object(map) => map.get(imported).cloned(),
-                _ => None,
-            };
-            let value = exported.ok_or_else(|| {
-                LangError::engine_node(
-                    format!("import \"{}\": module has no export `{}`", path, imported),
-                    node,
-                )
-            })?;
-            self.scopes
-                .define(alias.unwrap_or(imported), TaggedValue::from(value));
-        } else if let Some(alias) = alias {
-            self.scopes
-                .define(alias, TaggedValue::from(bindings.clone()));
-        } else if let Value::Object(map) = bindings {
-            for (name, val) in map {
-                self.scopes.define(&name, TaggedValue::from(val.clone()));
-            }
-        }
-        // `import` is a statement; it produces no value.
-        Ok(TaggedValue::Null)
     }
 
     /// Dispatch a payload-resolved `arr <op>` against a concrete operand.
@@ -1921,6 +1818,10 @@ impl NativeOpCtx for VmCtx<'_, '_, '_, '_> {
         args: &[TaggedValue],
     ) -> Result<TaggedValue, LangError> {
         self.frame.apply_app(f, args, self.node)
+    }
+
+    fn import_resolver(&self) -> Option<&dyn handl_plugin_engine_exec::ImportResolver> {
+        self.frame.import_resolver.map(|rc| &**rc)
     }
 }
 
