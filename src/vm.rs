@@ -59,7 +59,7 @@
 
 use std::rc::Rc;
 
-use handl_language::{Ast, AstNode, AstRef, LangError, Language, Value};
+use handl_language::{Ast, AstNode, AstRef, LangError, Language, Term, Value};
 use handl_plugin_engine_exec::native_ops::{
     self, NativeOpCtx, Num, OpService, as_num, bin_add, build_loop_step_args, is_truthy,
     loop_step_outcome, num_value, step_decision, type_tag,
@@ -112,6 +112,10 @@ impl FfiRegistry {
         self.fns.get(&(module.to_string(), name.to_string()))
     }
 }
+
+/// Tag for first-class `arr <op>` dispatch objects — mirrors the
+/// tree-walk's `ARR_DISPATCH_TAG` (ADR-0103 value shape).
+const ARR_DISPATCH_TAG: &str = "__arr__";
 
 // ---------------------------------------------------------------------------
 // Scope stack — identical semantics to the tree-walk interpreter
@@ -292,6 +296,21 @@ fn flatten_pair(v: &TaggedValue) -> Vec<TaggedValue> {
         }
         other => vec![other.clone()],
     }
+}
+
+/// Extract the implementation entry for `op` from a handler-like value
+/// (mirrors the tree-walk `handler_impl`).
+///
+/// A canonical `handler` value is a tagged object
+/// `{"__tag__": "handler", "impls": {"<op>": <arrow or Term>, ...}}`.
+/// Surface handler records are plain objects whose keys are the operation
+/// names: `{"<op>": <arrow or Term>, ...}`. Returns the value for `op`,
+/// or `None` when the value has no implementation for `op`.
+fn handler_impl(v: &TaggedValue, op: &str) -> Option<TaggedValue> {
+    v.get("impls")
+        .and_then(|impls| impls.get(op))
+        .or_else(|| v.get(op))
+        .cloned()
 }
 
 /// Construct a `left` Either value.
@@ -699,7 +718,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                         } else {
                             args
                         };
-                    let result = self.apply_app(&callee, &actual_args)?;
+                    let result = self.apply_app(&callee, &actual_args, node)?;
                     stack.push(result);
                 }
                 // Fixed-arity Call variants: avoid the per-call `Vec`
@@ -736,9 +755,9 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                             .iter()
                             .cloned()
                             .collect();
-                        self.apply_app(&callee, &actual)?
+                        self.apply_app(&callee, &actual, node)?
                     } else {
-                        self.apply_app(&callee, std::slice::from_ref(&arg0))?
+                        self.apply_app(&callee, std::slice::from_ref(&arg0), node)?
                     };
                     stack.push(result);
                 }
@@ -752,7 +771,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     let callee = stack.pop().ok_or_else(|| {
                         LangError::engine_node("stack underflow on Call2".to_string(), node)
                     })?;
-                    let result = self.apply_app(&callee, &[arg0, arg1])?;
+                    let result = self.apply_app(&callee, &[arg0, arg1], node)?;
                     stack.push(result);
                 }
                 Instr::Call3 => {
@@ -768,7 +787,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     let callee = stack.pop().ok_or_else(|| {
                         LangError::engine_node("stack underflow on Call3".to_string(), node)
                     })?;
-                    let result = self.apply_app(&callee, &[arg0, arg1, arg2])?;
+                    let result = self.apply_app(&callee, &[arg0, arg1, arg2], node)?;
                     stack.push(result);
                 }
                 Instr::ChoiceJump(left_target, right_target) => {
@@ -849,6 +868,75 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     };
                     let result = self.apply_native_v2(op, &args, node, inc)?;
                     stack.push(result);
+                }
+                Instr::ArrDispatch(n) => {
+                    // `arr <op>` (`Op { name: "$payload" }`): the op name
+                    // lives in the node's payload — a bare string, or the
+                    // `name`/`op` field of an object payload (mirrors the
+                    // tree-walk `eval_arr` resolution order).
+                    let op = node
+                        .payload
+                        .as_str()
+                        .map(str::to_string)
+                        .or_else(|| {
+                            node.payload
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                        })
+                        .or_else(|| {
+                            node.payload
+                                .get("op")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                        })
+                        .ok_or_else(|| {
+                            LangError::engine_node(
+                                "expected string payload for $payload op".to_string(),
+                                node,
+                            )
+                        })?;
+                    let mut args = Vec::with_capacity(*n);
+                    for _ in 0..*n {
+                        args.push(stack.pop().ok_or_else(|| {
+                            LangError::engine_node(
+                                "stack underflow on ArrDispatch".to_string(),
+                                node,
+                            )
+                        })?);
+                    }
+                    args.reverse();
+                    // The operand: the value the enclosing combinator left
+                    // on the stack (a `Seq` predecessor's result or the
+                    // program incoming, pushed at entry). Falls back to
+                    // `current_incoming` when a `Store` consumed the stack
+                    // copy — `extend_env`'s result IS its bound value, so
+                    // `Seq{extend_env, arr <op>}` still sees it.
+                    let inc = stack.pop().or_else(|| current_incoming.take());
+                    if args.is_empty() {
+                        match inc {
+                            Some(v) => {
+                                let result = self.arr_dispatch(&op, &v, node)?;
+                                stack.push(result);
+                            }
+                            None => {
+                                // First-class `arr <op>`: a dispatch object
+                                // `apply_app` recognizes (mirrors the
+                                // tree-walk `__arr__` value shape).
+                                let mut map = FxHashMap::<Rc<str>, TaggedValue>::default();
+                                map.insert(Rc::from("op"), TaggedValue::Str(Rc::from(op.as_str())));
+                                let mut obj = FxHashMap::<Rc<str>, TaggedValue>::default();
+                                obj.insert(
+                                    Rc::from(ARR_DISPATCH_TAG),
+                                    TaggedValue::Obj(Rc::new(map)),
+                                );
+                                stack.push(TaggedValue::Obj(Rc::new(obj)));
+                            }
+                        }
+                    } else {
+                        let result = self.apply_native_v2(&op, &args, node, inc)?;
+                        stack.push(result);
+                    }
                 }
                 Instr::ForeignOp(name, n) => {
                     let mut args = Vec::with_capacity(*n);
@@ -1489,28 +1577,70 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 }
             }
             "assign" => {
-                // ADR-0053: `assign { children: [target, value] }` —
-                // evaluate the `value` child (its position resolves by
-                // named role; index 1 is the role-less fallback,
-                // ADR-0081) and return it. Fall back to legacy
-                // `payload.value` for hand-built ASTs.
+                // ADR-0053: `assign { children: [target, value] }` or
+                // `assign { children: [target, value, body] }` —
+                // evaluate `value`, optionally bind `target` in a new
+                // scope and evaluate `body`, or just return the value.
+                // `target`/`value`/`body` positions resolve by named role
+                // (ADR-0081); `body` is an `optional` role so its presence
+                // resolves arity-aware (`child_role_index_for`), with the
+                // `children.len() == 3` check as the role-less fallback.
+                // Mirrors the v2 tree-walk's `assign` arm exactly. Falls
+                // back to legacy `payload.value` for hand-built ASTs.
                 if let Some(children) = node.payload.get("children").and_then(|c| c.as_array()) {
                     if children.len() >= 2 {
-                        let value_role = self
-                            .lang
-                            .child_role_index(&node.kind, "value")?
-                            .unwrap_or(1);
-                        let value_idx = children
-                            .get(value_role)
-                            .and_then(|v| v.as_u64())
+                        let value_idx = self
+                            .role_child_arena(node, "value")?
+                            .or_else(|| children[1].as_u64().map(|i| i as usize))
                             .ok_or_else(|| {
                                 LangError::engine_node(
                                     "assign: value index must be a number".to_string(),
                                     node,
                                 )
-                            })? as usize;
+                            })?;
+                        let body_idx = match self.lang.child_role_index_for(node, "body")? {
+                            Some(pos) => children.get(pos),
+                            // Role-less fallback: a third positional child
+                            // is the body.
+                            None if children.len() == 3 => children.get(2),
+                            None => None,
+                        }
+                        .map(|v| {
+                            v.as_u64().map(|i| i as usize).ok_or_else(|| {
+                                LangError::engine_node(
+                                    "assign: body index must be a number".to_string(),
+                                    node,
+                                )
+                            })
+                        })
+                        .transpose()?;
+                        if let Some(body_idx) = body_idx {
+                            // `x = y in body` — bind `target` in a fresh
+                            // scope and evaluate `body` under it.
+                            let var_idx = self
+                                .role_child_arena(node, "target")?
+                                .or_else(|| children[0].as_u64().map(|i| i as usize))
+                                .ok_or_else(|| {
+                                    LangError::engine_node(
+                                        "assign: var index must be a number".to_string(),
+                                        node,
+                                    )
+                                })?;
+                            let var_name = self.binding_target_name(var_idx, "assign", node)?;
+                            let value = self.exec_node_inner(AstRef::new(value_idx))?;
+                            self.scopes.push_scope();
+                            self.scopes.define(&var_name, value);
+                            let result = self.exec_node_inner(AstRef::new(body_idx));
+                            self.scopes.pop_scope();
+                            return result;
+                        }
+                        // `x = y` — just evaluate and return the value.
                         return self.exec_node_inner(AstRef::new(value_idx));
                     }
+                    return Err(LangError::engine_node(
+                        "assign: expected at least 2 children".to_string(),
+                        node,
+                    ));
                 }
                 let value = node.payload.get("value").ok_or_else(|| {
                     LangError::engine_node("assign: missing value in payload".to_string(), node)
@@ -1596,7 +1726,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 })?;
                 let current = if state.is_null() { in_val } else { state };
                 let call_args = build_loop_step_args(body_proc, &current);
-                let result = self.apply_app(body_proc, &call_args)?;
+                let result = self.apply_app(body_proc, &call_args, node)?;
                 Ok(loop_step_outcome(result))
             }
             // `fold_step` — the ArrowLoop protocol used by the `loop` fold
@@ -1613,7 +1743,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     pair_fst(&inc).cloned().unwrap_or(TaggedValue::Null),
                     pair_snd(&inc).cloned().unwrap_or(TaggedValue::Null),
                 ];
-                self.apply_app(step_proc, &call_args)
+                self.apply_app(step_proc, &call_args, node)
             }
             // Derived step ops (ADR-0052 §"Derived forms"). This engine's
             // interpretation is eager: `Instr::DerivedStepOp` re-evaluates
@@ -1778,7 +1908,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                         .map_err(|e| LangError::engine_node(e.to_string(), node))?;
                     Ok(TaggedValue::from(val))
                 } else {
-                    self.apply_app(callee, &actual_args)
+                    self.apply_app(callee, &actual_args, node)
                 }
             }
             // `export` and `record_proj` are owned by the shared table.
@@ -1823,7 +1953,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 if !matches!(pred_val, TaggedValue::Arrow { .. }) {
                     return Ok(expr_val);
                 }
-                let check_result = self.apply_app(&pred_val, &[expr_val.clone()])?;
+                let check_result = self.apply_app(&pred_val, &[expr_val.clone()], node)?;
                 if is_truthy(&check_result) {
                     Ok(expr_val)
                 } else {
@@ -2026,7 +2156,20 @@ impl<'a, 'h> VmFrame<'a, 'h> {
 
             let target_arena = self.role_child_arena(&child_node, "target")?;
             let value_arena = self.role_child_arena(&child_node, "value")?;
-            if let (Some(target_idx), Some(value_idx)) = (target_arena, value_arena) {
+            // The binding fast path covers only the two-child `x = v`
+            // form: an `assign` carrying the optional trailing `body`
+            // role (`x = v in body`) evaluates under its own pushed scope
+            // via the `assign` op — it must NOT be bound into the block
+            // scope here. Mirrors the tree-walk `ac.len() == 2` guard.
+            let two_child = child_node
+                .payload
+                .get("children")
+                .and_then(|c| c.as_array())
+                .map(|ac| ac.len() == 2)
+                .unwrap_or(false);
+            if let (true, Some(target_idx), Some(value_idx)) =
+                (two_child, target_arena, value_arena)
+            {
                 // Binding child: evaluate the value and bind the target
                 // name. A `target` child whose shape declares a `subject`
                 // role (e.g. a type annotation — the `subject`/`annot` role
@@ -2555,17 +2698,64 @@ impl<'a, 'h> VmFrame<'a, 'h> {
         Ok(body_val)
     }
 
+    /// Dispatch a payload-resolved `arr <op>` against a concrete operand.
+    /// Mirrors the tree-walk `arr_dispatch`: a handler implementation
+    /// carried by the operand's `impls` (or a same-named field) wins;
+    /// otherwise the operand's `Pair` spine is flattened into positional
+    /// args for the native op.
+    ///
+    /// The runtime handler stack the tree-walk also consults does not
+    /// exist in this engine — `Handle` terms are eliminated at compile
+    /// time by `Term::eliminate_handlers`.
+    fn arr_dispatch(
+        &mut self,
+        op: &str,
+        incoming: &TaggedValue,
+        node: &AstNode,
+    ) -> Result<TaggedValue, LangError> {
+        if let Some(impl_val) = handler_impl(incoming, op) {
+            if matches!(impl_val, TaggedValue::Arrow { .. }) {
+                return self.apply_app(&impl_val, std::slice::from_ref(incoming), node);
+            }
+            // Serialized `Term` impl: compile it against this node and run
+            // it with the operand as incoming — mirrors the tree-walk's
+            // `eval_inner(&impl_term, ..., incoming)` fallback.
+            let impl_term: Term =
+                serde_json::from_value(tagged_to_value(&impl_val)).map_err(|e| {
+                    LangError::engine_node(
+                        format!("handler impl for op '{op}' is not a Term or arrow: {e}"),
+                        node,
+                    )
+                })?;
+            let instrs = compile(&impl_term, self.lang, self.ast, node)?;
+            return self.exec_instrs_inner(&instrs, node, Some(incoming.clone()));
+        }
+        let op_args = flatten_pair(incoming);
+        self.apply_native_v2(op, &op_args, node, Some(incoming.clone()))
+    }
+
     /// Apply an `App` callee: closure application only (ADR-0060).
     ///
     /// Host-function dispatch (string callee) has been moved to the
-    /// `call_host` native op. This helper only handles arrow-value
-    /// (closure) application: extract params/body/env, build a fresh
-    /// scope from the captured env, bind params, evaluate the body.
+    /// `call_host` native op. This helper handles first-class `arr <op>`
+    /// dispatch objects (`{__arr__: {op}}`) and arrow-value (closure)
+    /// application: extract params/body/env, build a fresh scope from the
+    /// captured env, bind params, evaluate the body.
     fn apply_app(
         &mut self,
         callee: &TaggedValue,
         args: &[TaggedValue],
+        node: &AstNode,
     ) -> Result<TaggedValue, LangError> {
+        // First-class `arr <op>` dispatch object: apply the op to the
+        // args (the tree-walk `apply_app` `__arr__` arm).
+        if let Some(inner) = callee.get(ARR_DISPATCH_TAG) {
+            let op = inner.get("op").and_then(|v| v.as_str()).ok_or_else(|| {
+                LangError::engine_node("arr: missing op in dispatch object".to_string(), node)
+            })?;
+            let incoming = args.first().cloned().unwrap_or(TaggedValue::Null);
+            return self.arr_dispatch(op, &incoming, node);
+        }
         // Bound-arrow record `{__term__, __bound__}` (ADR-0120 Phase 1 —
         // generated by `desugar.data` for `Type.rec`): applying it runs
         // `__term__` on `__bound__ ++ args`, delivered as ONE array
@@ -2585,7 +2775,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 elems.extend(args.iter().cloned());
                 let term_val = term_val.clone();
                 let tuple = TaggedValue::Arr(Rc::from(elems));
-                return self.apply_app(&term_val, &[tuple]);
+                return self.apply_app(&term_val, &[tuple], node);
             }
         }
         // Closure application — match on TaggedValue::Arrow directly.
@@ -2637,7 +2827,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 // ADR-0106 item 2 step 1: re-wrap of an existing body.
                 body_def: None,
             };
-            return home_vm.apply_app(&local_callee, args);
+            return home_vm.apply_app(&local_callee, args, node);
         }
         // Array-pattern arrows (`[x, y] ~> body`) consume a single array
         // argument and destructure it by position.
@@ -2834,7 +3024,7 @@ impl NativeOpCtx for VmCtx<'_, '_, '_, '_> {
         f: &TaggedValue,
         args: &[TaggedValue],
     ) -> Result<TaggedValue, LangError> {
-        self.frame.apply_app(f, args)
+        self.frame.apply_app(f, args, self.node)
     }
 }
 

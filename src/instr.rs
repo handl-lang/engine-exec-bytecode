@@ -23,6 +23,7 @@
 //! | [`ChoiceJump`]       | `either -> val`                       | Pop Either; push its value; jump to left or right target (`Choice`). |
 //! | [`Jump`]             | `->`                                  | Unconditional jump. |
 //! | [`NativeOp`]         | `arg... -> result`                    | Apply native op `op` to `n` args (`Arr Native`). |
+//! | [`ArrDispatch`]      | `operand arg... -> result`            | Resolve `node.payload` as the op name and dispatch (`arr <op>`, `Arr` op `"$payload"`). |
 //! | [`ForeignOp`]        | `arg... -> result`                    | Call host function `name` with `n` args (`Arr Foreign`). |
 //! | [`FirstOp`]          | `pair -> {__pair__:[result, snd]}`    | Run inner sub-program on pair's first component; re-pair with second (`First`). |
 //! | [`LoopCheck`]        | `result -> ...`                       | Inspect loop body result; route single-step vs multi-step (`Loop`). |
@@ -241,6 +242,22 @@ pub enum Instr {
     /// utility ops (`is_pos`/`dec`/`inc`/`half_floor`/`inc_fst`/
     /// `countdown_step`/`infinite_step`).
     NativeOp(String, usize),
+
+    /// Pop `n` argument values, resolve the op name from the current node's
+    /// payload (`$payload` resolution — a bare string payload, or the `name`/
+    /// `op` field of an object payload), and dispatch it against the operand.
+    ///
+    /// Emitted by `Arr { op: "$payload", args, source: Native, .. }` — the
+    /// `arr <op>` surface form (`eval.arr`). With no args, the operand is the
+    /// value the enclosing combinator left on the operand stack (the `Seq`
+    /// predecessor's result, or the program's incoming value): it is popped
+    /// and dispatched through handler-impl lookup then the native op table —
+    /// the tree-walk `arr_dispatch` path. With no operand, the result is a
+    /// first-class `{__arr__: {op}}` dispatch object that
+    /// [`VmFrame::apply_app`] applies later. With args, falls through to
+    /// [`VmFrame::apply_native_v2`] under the resolved name (mirroring the
+    /// tree-walk's `eval_arr` argument case).
+    ArrDispatch(usize),
 
     /// Pop `n` argument values, call the host function `name`, and push the
     /// result.

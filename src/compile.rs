@@ -637,12 +637,19 @@ fn compile_arr(
     }
     match source {
         ArrSource::Native => {
+            // `$payload` ops (`arr <op>` surface form): the op name lives
+            // in the node's payload at runtime, so it cannot be baked into
+            // a `NativeOp`. Emit `ArrDispatch`, which resolves the name and
+            // dispatches through the handler-impl → native path (mirrors
+            // the tree-walk `eval_arr`/`arr_dispatch`).
+            if op == "$payload" {
+                out.push(Instr::ArrDispatch(args.len()));
             // Hot-path: emit a typed arithmetic/comparison instruction
             // instead of `NativeOp(op, 2)` for the common binary numeric
             // ops. This avoids the per-op `Vec` allocation and string
             // dispatch in the VM. Results are identical to the `NativeOp`
             // path.
-            if let Some(typed) = typed_binary_instr(op) {
+            } else if let Some(typed) = typed_binary_instr(op) {
                 out.push(typed);
             } else if let Some(arith) = arith_instr(op) {
                 // ADR-0103: migrate the remaining arithmetic/logic ops
