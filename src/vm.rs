@@ -1341,6 +1341,39 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                         .lang
                         .child_role_index(&node.kind, "entries")?
                         .unwrap_or(0);
+                    // ADR-0074 v0.1: `{ expr }` (bare-expression block) vs
+                    // `{ key: val }` (object). When ALL children from the
+                    // `entries` role are non-`entry` nodes (bare
+                    // expressions), treat as a block: evaluate each and
+                    // return the last value. When any child is an `entry`
+                    // node, treat as an object. `kind == "entry"` is the
+                    // role-less fallback (ADR-0081). Mirrors the v2
+                    // tree-walk's object prim.
+                    let all_bare = children.iter().skip(start).all(|c| {
+                        c.as_u64()
+                            .and_then(|idx| self.ast.at(AstRef::new(idx as usize)).ok())
+                            .map(|n| {
+                                !self
+                                    .lang
+                                    .pattern_role_is(&n.kind, "entry")
+                                    .unwrap_or_else(|| n.kind == "entry")
+                            })
+                            .unwrap_or(true)
+                    });
+                    if all_bare && !children.is_empty() {
+                        // Block semantics: evaluate all, return last.
+                        let mut last = TaggedValue::Null;
+                        for entry in children.iter().skip(start) {
+                            let idx = entry.as_u64().ok_or_else(|| {
+                                LangError::engine_node(
+                                    "object: entry index must be a number".to_string(),
+                                    node,
+                                )
+                            })? as usize;
+                            last = self.exec_node_inner(AstRef::new(idx))?;
+                        }
+                        return Ok(last);
+                    }
                     let mut obj = FxHashMap::default();
                     for entry in children.iter().skip(start) {
                         let entry_idx = entry.as_u64().ok_or_else(|| {
@@ -1350,6 +1383,25 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                             )
                         })? as usize;
                         let entry_node = self.ast.at(AstRef::new(entry_idx))?;
+                        // Spread entry: if the child is not an `entry`-roled
+                        // node, evaluate it and merge its fields into the
+                        // object. This implements `{ ...s, field: val }`
+                        // syntax. `kind == "entry"` is the role-less
+                        // fallback (ADR-0081). Mirrors the v2 tree-walk's
+                        // object prim.
+                        let is_entry = self
+                            .lang
+                            .pattern_role_is(&entry_node.kind, "entry")
+                            .unwrap_or_else(|| entry_node.kind == "entry");
+                        if !is_entry {
+                            let spread_val = self.exec_node_inner(AstRef::new(entry_idx))?;
+                            if let Some(spread_obj) = spread_val.as_object() {
+                                for (k, v) in spread_obj {
+                                    obj.insert(Rc::clone(k), v.clone());
+                                }
+                            }
+                            continue;
+                        }
                         let entry_children = entry_node
                             .payload
                             .get("children")
