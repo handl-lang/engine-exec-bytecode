@@ -126,7 +126,7 @@ fn compile_into_td(
             // ordinary sequential composition; `k < dim` pastes n-cells at
             // the value level — both operands see the same incoming, which
             // is exactly op-argument evaluation, so the paste lowers to the
-            // shared `cell2_comp_axis` op with `[axis, fst, snd]` as args.
+            // shared `cell_comp_axis` op with `[axis, fst, snd]` as args.
             let fst_dim = fst.globular_dim();
             match td.axis().nat_literal() {
                 // `∘₀` on 1-cells — sequential composition (`>>>`).
@@ -143,26 +143,30 @@ fn compile_into_td(
                     // Seq.
                     return Ok(snd_pushed);
                 }
-                // `k ≥ dim(fst)` violates the globular dimension law
-                // statically — the same error the shared executor reports
-                // at runtime.
-                Some(k) if k >= fst_dim => {
+                // A dynamic axis on 1-cell operands could resolve to 0 —
+                // sequential composition — which is not expressible as
+                // value-level composition.
+                None if fst_dim <= 1 => {
                     return Err(LangError::engine_node(
-                        format!(
-                            "Seq: axis-{k} composition requires cells of dimension > {k} (fst has dim {fst_dim})"
-                        ),
+                        "Seq: non-literal composition axis on 1-cell operands (dim ≤ 1) is not supported"
+                            .to_string(),
                         node,
                     ));
                 }
-                // Pasting regime: a literal `k < dim(fst)`, or a dynamic
-                // axis on declared n-cell operands — the op resolves `k`
-                // and the dimension law at runtime. The declared dimension
-                // is baked into the op name because `NativeOp` cannot
-                // carry `lit` (the `route_on_type` convention).
-                _ if fst_dim > 1 => {
+                // Pasting regime: every other case lowers to the shared
+                // `cell_comp_axis` op — including `k >= dim(fst)` and
+                // literal `k > 0` on declared 1-cells. The op resolves the
+                // *effective* dimension at runtime (`max(declared,
+                // cell_dim(fst), cell_dim(snd))`): a `Cell`/`__dim__`
+                // record pastes at its own height, and `k >= n` on plain
+                // values is the shared executor's dimension error. The
+                // declared dimension is baked into the op name because
+                // `NativeOp` cannot carry `lit` (the `route_on_type`
+                // convention).
+                _ => {
                     return compile_into_td(
                         &TermData::op(
-                            format!("cell2_comp_axis:{fst_dim}"),
+                            format!("cell_comp_axis:{fst_dim}"),
                             vec![td.axis(), fst, snd],
                             &ArrSource::Native,
                             None,
@@ -172,18 +176,6 @@ fn compile_into_td(
                         node,
                         out,
                     );
-                }
-                // A dynamic axis on 1-cell operands could resolve to 0 —
-                // sequential composition — which is not expressible as
-                // value-level composition. (`Some(k)` cannot reach here:
-                // it would need `k < fst_dim` with `fst_dim ≤ 1`, and
-                // `globular_dim ≥ 1` forces `k < 1`.)
-                None | Some(_) => {
-                    return Err(LangError::engine_node(
-                        "Seq: non-literal composition axis on 1-cell operands (dim ≤ 1) is not supported"
-                            .to_string(),
-                        node,
-                    ));
                 }
             }
         }
