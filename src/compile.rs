@@ -121,38 +121,71 @@ fn compile_into_td(
         "Seq" => {
             let fst = td.get_term("fst").expect("Seq term missing 'fst' field");
             let snd = td.get_term("snd").expect("Seq term missing 'snd' field");
-            // ADR-0120 Phase 2: `>>>` is `>>>[0]`. The bytecode backend only
-            // implements axis-0 composition; non-zero or non-literal axes are
-            // structurally valid but rejected here pending the multi-axis
-            // execution increment.
+            // ADR-0120 Phase 5: `Seq{axis: k}` is `∘ₖ` — composition along
+            // the k-th globular axis. Axis 0 on 1-cells (`dim ≤ 1`) is
+            // ordinary sequential composition; `k < dim` pastes n-cells at
+            // the value level — both operands see the same incoming, which
+            // is exactly op-argument evaluation, so the paste lowers to the
+            // shared `cell2_comp_axis` op with `[axis, fst, snd]` as args.
+            let fst_dim = fst.globular_dim();
             match td.axis().nat_literal() {
-                Some(0) => {}
-                Some(k) => {
+                // `∘₀` on 1-cells — sequential composition (`>>>`).
+                Some(0) if fst_dim <= 1 => {
+                    let fst_pushed = compile_into_td(&fst, lang, ast, node, out)?;
+                    let snd_pushed = compile_into_td(&snd, lang, ast, node, out)?;
+                    // Pop the scope `fst` reported (e.g. extend_env as fst),
+                    // matching the tree-walk's Seq scope discipline.
+                    if fst_pushed {
+                        out.push(Instr::PopScope);
+                    }
+                    // Propagate snd_pushed: an extend_env in snd position
+                    // (the Bind lowering shape) is popped by the *enclosing*
+                    // Seq.
+                    return Ok(snd_pushed);
+                }
+                // `k ≥ dim(fst)` violates the globular dimension law
+                // statically — the same error the shared executor reports
+                // at runtime.
+                Some(k) if k >= fst_dim => {
                     return Err(LangError::engine_node(
                         format!(
-                            "Seq: axis-{k} composition is not yet implemented (ADR-0120 Phase 2)"
+                            "Seq: axis-{k} composition requires cells of dimension > {k} (fst has dim {fst_dim})"
                         ),
                         node,
                     ));
                 }
-                None => {
+                // Pasting regime: a literal `k < dim(fst)`, or a dynamic
+                // axis on declared n-cell operands — the op resolves `k`
+                // and the dimension law at runtime. The declared dimension
+                // is baked into the op name because `NativeOp` cannot
+                // carry `lit` (the `route_on_type` convention).
+                _ if fst_dim > 1 => {
+                    return compile_into_td(
+                        &TermData::op(
+                            format!("cell2_comp_axis:{fst_dim}"),
+                            vec![td.axis(), fst, snd],
+                            &ArrSource::Native,
+                            None,
+                        ),
+                        lang,
+                        ast,
+                        node,
+                        out,
+                    );
+                }
+                // A dynamic axis on 1-cell operands could resolve to 0 —
+                // sequential composition — which is not expressible as
+                // value-level composition. (`Some(k)` cannot reach here:
+                // it would need `k < fst_dim` with `fst_dim ≤ 1`, and
+                // `globular_dim ≥ 1` forces `k < 1`.)
+                None | Some(_) => {
                     return Err(LangError::engine_node(
-                        "Seq: non-literal composition axis is not yet supported (ADR-0120 Phase 2)"
+                        "Seq: non-literal composition axis on 1-cell operands (dim ≤ 1) is not supported"
                             .to_string(),
                         node,
                     ));
                 }
             }
-            let fst_pushed = compile_into_td(&fst, lang, ast, node, out)?;
-            let snd_pushed = compile_into_td(&snd, lang, ast, node, out)?;
-            // Pop the scope `fst` reported (e.g. extend_env as fst), matching
-            // the tree-walk's Seq scope discipline.
-            if fst_pushed {
-                out.push(Instr::PopScope);
-            }
-            // Propagate snd_pushed: an extend_env in snd position (the Bind
-            // lowering shape) is popped by the *enclosing* Seq.
-            Ok(snd_pushed)
         }
 
         "First" => {
