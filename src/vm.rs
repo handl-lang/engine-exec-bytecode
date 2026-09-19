@@ -1345,13 +1345,12 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     };
                 step_decision(op, &inc, &mut eval_arg).map_err(|e| e.with_node(node))
             }
-            // `bind`, `eval_block`, and `eval_rec` are owned by the shared
-            // op table (native_ops) — EvalNode + Env gated.
+            // `bind`, `eval_block`, `eval_rec`, `match`, and `handle`
+            // are owned by the shared op table (native_ops) — EvalNode +
+            // Env gated (+ `Pattern` for the two orchestration shells).
             // ADR-0053: the data-driven `if → match` desugar rewrites `if`
-            // nodes into `match` nodes before eval, so the v2 bytecode path
-            // must handle `match`/`handle` directly.
-            "match" => self.prim_v2_match(node),
-            "handle" => self.prim_v2_handle(node),
+            // nodes into `match` nodes before eval; the shared
+            // `match_shell` handles them here.
             // Phase 9.5: `import "path"` loads a module via the configured
             // resolver and binds its top-level exports into the current scope.
             "import" => self.prim_v2_import(args, node),
@@ -1502,223 +1501,6 @@ impl<'a, 'h> VmFrame<'a, 'h> {
         }
         // `import` is a statement; it produces no value.
         Ok(TaggedValue::Null)
-    }
-
-    /// `match` native op: pattern-match a scrutinee against a list of arms.
-    ///
-    /// Mirrors the v2 tree-walk's `prim_match` and cranelift's `prim_match`.
-    /// The `match` node's payload has `children: [scrut_idx, block_idx]`.
-    /// The block node (kind `block`) has `children: [arm_idx, ...]`. Each
-    /// arm node (kind `arm`) has `children: [pattern_idx, body_idx]`. The
-    /// first matching arm's body is evaluated in a scope holding the pattern
-    /// bindings; if no arm matches, an error is returned.
-    ///
-    /// ADR-0053: the data-driven `if → match` desugar rewrites `if` nodes
-    /// into `match` nodes before eval, so the v2 bytecode path must handle
-    /// the `match` op directly.
-    fn prim_v2_match(&mut self, node: &AstNode) -> Result<TaggedValue, LangError> {
-        let children = node
-            .payload
-            .get("children")
-            .and_then(|c| c.as_array())
-            .ok_or_else(|| {
-                LangError::engine_node("match: missing children in payload".to_string(), node)
-            })?;
-        // `scrutinee`/`block` positions resolve by named role, arity-aware:
-        // the optional `motive` slot (ADR-0081 optional roles) shifts
-        // `block` to index 2 when present. Positional 0 / `len >= 3 ? 2 : 1`
-        // is the role-less fallback.
-        let scrut_idx = children
-            .get(
-                self.lang
-                    .child_role_index_for(node, "scrutinee")?
-                    .unwrap_or(0),
-            )
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| {
-                LangError::engine_node("match: missing scrutinee child".to_string(), node)
-            })? as usize;
-        let block_idx = children
-            .get(
-                self.lang
-                    .child_role_index_for(node, "block")?
-                    .unwrap_or(if children.len() >= 3 { 2 } else { 1 }),
-            )
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| LangError::engine_node("match: missing block child".to_string(), node))?
-            as usize;
-
-        // Evaluate the scrutinee.
-        let scrut_val = self.exec_node_inner(AstRef::new(scrut_idx))?;
-        // Convert to Value for pattern matching (which works on serde_json::Value).
-        let scrut_value = tagged_to_value(&scrut_val);
-
-        // Get the block node's children (the arm indices).
-        let block_node = self.ast.at(AstRef::new(block_idx))?;
-        let arm_indices = block_node
-            .payload
-            .get("children")
-            .and_then(|c| c.as_array())
-            .ok_or_else(|| {
-                LangError::engine_node("match: block node missing children".to_string(), node)
-            })?;
-
-        // Try each arm.
-        for arm_entry in arm_indices {
-            let arm_idx = arm_entry.as_u64().ok_or_else(|| {
-                LangError::engine_node("match: arm index must be a number".to_string(), node)
-            })? as usize;
-            let arm_node = self.ast.at(AstRef::new(arm_idx))?;
-            let arm_children = arm_node
-                .payload
-                .get("children")
-                .and_then(|c| c.as_array())
-                .ok_or_else(|| {
-                    LangError::engine_node("match: arm node missing children".to_string(), node)
-                })?;
-            // `pattern`/`body` positions resolve by named role
-            // (ADR-0081); positional 0/1 is the role-less fallback.
-            let pattern_role = self
-                .lang
-                .child_role_index(&arm_node.kind, "pattern")?
-                .unwrap_or(0);
-            let body_role = self
-                .lang
-                .child_role_index(&arm_node.kind, "body")?
-                .unwrap_or(1);
-            let pattern_idx = arm_children
-                .get(pattern_role)
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| {
-                    LangError::engine_node("match: arm missing pattern child".to_string(), node)
-                })? as usize;
-            let body_idx = arm_children
-                .get(body_role)
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| {
-                    LangError::engine_node("match: arm missing body child".to_string(), node)
-                })? as usize;
-
-            // Interpret the pattern node structurally (ADR-0061: shared
-            // pattern matching logic).
-            self.scopes.push_scope();
-            let matched =
-                pattern_match::try_pattern(self.ast, AstRef::new(pattern_idx), &scrut_value, self);
-            if let Ok(true) = matched {
-                let result = self.exec_node_inner(AstRef::new(body_idx));
-                self.scopes.pop_scope();
-                return result;
-            }
-            self.scopes.pop_scope();
-            matched?;
-        }
-        Err(LangError::engine_node(
-            "match: no arm matched".to_string(),
-            node,
-        ))
-    }
-
-    /// `handle` native op: evaluate a body, then dispatch the result to the
-    /// first matching handler clause.
-    ///
-    /// Mirrors the v2 tree-walk's `prim_handle` and cranelift's
-    /// `prim_handle`. Structurally identical to `match` (children =
-    /// [body_idx, block_idx], block contains `arm` nodes with
-    /// [pattern_idx, handler_idx]). The body is evaluated first; its result
-    /// is matched against clause patterns. If no clause matches, the body
-    /// value is returned as-is (not an error).
-    fn prim_v2_handle(&mut self, node: &AstNode) -> Result<TaggedValue, LangError> {
-        let children = node
-            .payload
-            .get("children")
-            .and_then(|c| c.as_array())
-            .ok_or_else(|| {
-                LangError::engine_node("handle: missing children in payload".to_string(), node)
-            })?;
-        // `target`/`impl` positions resolve by named role (ADR-0081);
-        // positional 0/1 is the role-less fallback.
-        let body_role = self
-            .lang
-            .child_role_index(&node.kind, "target")?
-            .unwrap_or(0);
-        let impl_role = self.lang.child_role_index(&node.kind, "impl")?.unwrap_or(1);
-        let body_idx = children
-            .get(body_role)
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| LangError::engine_node("handle: missing body child".to_string(), node))?
-            as usize;
-        let block_idx = children
-            .get(impl_role)
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| {
-                LangError::engine_node("handle: missing block child".to_string(), node)
-            })? as usize;
-
-        // Evaluate the body first.
-        let body_val = self.exec_node_inner(AstRef::new(body_idx))?;
-        // Convert to Value for pattern matching.
-        let body_value = tagged_to_value(&body_val);
-
-        // Get the block node's children (the clause indices).
-        let block_node = self.ast.at(AstRef::new(block_idx))?;
-        let clause_indices = block_node
-            .payload
-            .get("children")
-            .and_then(|c| c.as_array())
-            .ok_or_else(|| {
-                LangError::engine_node("handle: block node missing children".to_string(), node)
-            })?;
-
-        // Try each clause.
-        for clause_entry in clause_indices {
-            let clause_idx = clause_entry.as_u64().ok_or_else(|| {
-                LangError::engine_node("handle: clause index must be a number".to_string(), node)
-            })? as usize;
-            let clause_node = self.ast.at(AstRef::new(clause_idx))?;
-            let clause_children = clause_node
-                .payload
-                .get("children")
-                .and_then(|c| c.as_array())
-                .ok_or_else(|| {
-                    LangError::engine_node("handle: clause node missing children".to_string(), node)
-                })?;
-            // `pattern`/`body` (the handler position) resolve by named
-            // role (ADR-0081); positional 0/1 is the role-less fallback.
-            let pattern_role = self
-                .lang
-                .child_role_index(&clause_node.kind, "pattern")?
-                .unwrap_or(0);
-            let body_role = self
-                .lang
-                .child_role_index(&clause_node.kind, "body")?
-                .unwrap_or(1);
-            let pattern_idx = clause_children
-                .get(pattern_role)
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| {
-                    LangError::engine_node("handle: clause missing pattern child".to_string(), node)
-                })? as usize;
-            let handler_idx = clause_children
-                .get(body_role)
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| {
-                    LangError::engine_node("handle: clause missing handler child".to_string(), node)
-                })? as usize;
-
-            self.scopes.push_scope();
-            let matched =
-                pattern_match::try_pattern(self.ast, AstRef::new(pattern_idx), &body_value, self);
-            if let Ok(true) = matched {
-                let result = self.exec_node_inner(AstRef::new(handler_idx));
-                self.scopes.pop_scope();
-                return result;
-            }
-            self.scopes.pop_scope();
-            matched?;
-        }
-
-        // No clause matched — return the body value as-is.
-        Ok(body_val)
     }
 
     /// Dispatch a payload-resolved `arr <op>` against a concrete operand.
@@ -2091,6 +1873,18 @@ impl NativeOpCtx for VmCtx<'_, '_, '_, '_> {
 
     fn env_capture(&mut self) -> Rc<FxHashMap<Rc<str>, TaggedValue>> {
         Rc::new(self.frame.scopes.capture())
+    }
+
+    fn try_pattern(&mut self, pattern: AstRef, scrutinee: &TaggedValue) -> Result<bool, LangError> {
+        // `VmFrame` itself is the `PatternMatchCtx` (ADR-0061);
+        // `try_pattern` works on `serde_json::Value` and binds into
+        // `self.frame.scopes` via `define_binding`.
+        pattern_match::try_pattern(
+            self.frame.ast,
+            pattern,
+            &tagged_to_value(scrutinee),
+            self.frame,
+        )
     }
 
     fn node_kind_at(&mut self, r: AstRef) -> Option<String> {
