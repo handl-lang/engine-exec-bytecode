@@ -403,7 +403,21 @@ pub(crate) fn lower_natives() -> NativeRewriteRegistry {
     reg.register(
         "lower.object_key",
         Box::new(|ctx: &mut RewriteCtx<'_>| {
-            let key_idx = ctx.child_ref(0).ok_or_else(|| {
+            // `key`/`value` child positions resolve by named role
+            // (ADR-0081); positional 0/1 is the role-less fallback.
+            let key_role = ctx
+                .lang()
+                .child_role_index(&ctx.node().kind, "key")
+                .ok()
+                .flatten()
+                .unwrap_or(0);
+            let val_role = ctx
+                .lang()
+                .child_role_index(&ctx.node().kind, "value")
+                .ok()
+                .flatten()
+                .unwrap_or(1);
+            let key_idx = ctx.child_ref(key_role).ok_or_else(|| {
                 LangError::engine("lower.object_key: entry missing key child".to_string())
             })?;
             let key_node = ctx.ast().get(AstRef::new(key_idx)).ok_or_else(|| {
@@ -412,7 +426,7 @@ pub(crate) fn lower_natives() -> NativeRewriteRegistry {
             if key_node.kind != "string" {
                 return Ok(ctx.pass_through());
             }
-            let val_idx = ctx.remap_child(1).ok_or_else(|| {
+            let val_idx = ctx.remap_child(val_role).ok_or_else(|| {
                 LangError::engine("lower.object_key: entry missing value child".to_string())
             })?;
             let new_key = ctx.push_leaf("var", key_node.payload.clone());

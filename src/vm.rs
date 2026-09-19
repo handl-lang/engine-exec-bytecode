@@ -449,6 +449,10 @@ impl<'a, 'h> PatternMatchCtx for VmFrame<'a, 'h> {
     fn global_value(&self, name: &str) -> Option<Value> {
         self.scopes.globals.get(name).map(tagged_to_value)
     }
+
+    fn lang(&self) -> Option<&Language> {
+        Some(self.lang)
+    }
 }
 
 impl<'a, 'h> VmFrame<'a, 'h> {
@@ -1209,12 +1213,26 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                         .map(String::from);
                     (param_names, rest_name, b as usize, false)
                 } else if let Some(children) = payload.get("children").and_then(|c| c.as_array()) {
-                    let param_idx = children.first().and_then(|v| v.as_u64()).ok_or_else(|| {
-                        LangError::engine_node("closure: missing param child".to_string(), node)
-                    })? as usize;
-                    let body_idx = children.get(1).and_then(|v| v.as_u64()).ok_or_else(|| {
-                        LangError::engine_node("closure: missing body child".to_string(), node)
-                    })? as usize;
+                    // `params`/`body` child positions resolve by named
+                    // role (ADR-0081); positional 0/1 is the role-less
+                    // fallback.
+                    let params_role = self
+                        .lang
+                        .child_role_index(&node.kind, "params")?
+                        .unwrap_or(0);
+                    let body_role = self.lang.child_role_index(&node.kind, "body")?.unwrap_or(1);
+                    let param_idx = children
+                        .get(params_role)
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| {
+                            LangError::engine_node("closure: missing param child".to_string(), node)
+                        })? as usize;
+                    let body_idx = children
+                        .get(body_role)
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| {
+                            LangError::engine_node("closure: missing body child".to_string(), node)
+                        })? as usize;
                     let param_node = self.ast.at(AstRef::new(param_idx))?;
                     // `param_names` resolves fixed params plus an optional
                     // rest param (`...name`) data-driven via
@@ -1260,11 +1278,22 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                                 node,
                             )
                         })? as usize;
-                        // Spread: if the child is a `rest` node (from
-                        // `...expr` syntax), flatten its value into the
-                        // array if it's an array. Mirrors the tree-walk
+                        // Spread: if the child is a `rest`-roled node
+                        // (`pattern_role: rest`; from `...expr` syntax),
+                        // flatten its value into the array if it's an
+                        // array. `kind == "rest"` is the role-less
+                        // fallback (ADR-0081). Mirrors the tree-walk
                         // implementation.
-                        if self.ast.get(AstRef::new(idx)).map(|n| n.kind.as_str()) == Some("rest") {
+                        let is_rest = self
+                            .ast
+                            .get(AstRef::new(idx))
+                            .map(|n| {
+                                self.lang
+                                    .pattern_role_is(&n.kind, "rest")
+                                    .unwrap_or_else(|| n.kind == "rest")
+                            })
+                            .unwrap_or(false);
+                        if is_rest {
                             let val = self.exec_node_inner(AstRef::new(idx))?;
                             if let TaggedValue::Arr(arr) = val {
                                 result.extend(arr.iter().cloned());
@@ -1408,17 +1437,26 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 }
             }
             "assign" => {
-                // ADR-0053: `assign { children: [var, value] }` — evaluate
-                // child 1 (value) and return it. Fall back to legacy
+                // ADR-0053: `assign { children: [target, value] }` —
+                // evaluate the `value` child (its position resolves by
+                // named role; index 1 is the role-less fallback,
+                // ADR-0081) and return it. Fall back to legacy
                 // `payload.value` for hand-built ASTs.
                 if let Some(children) = node.payload.get("children").and_then(|c| c.as_array()) {
                     if children.len() >= 2 {
-                        let value_idx = children[1].as_u64().ok_or_else(|| {
-                            LangError::engine_node(
-                                "assign: value index must be a number".to_string(),
-                                node,
-                            )
-                        })? as usize;
+                        let value_role = self
+                            .lang
+                            .child_role_index(&node.kind, "value")?
+                            .unwrap_or(1);
+                        let value_idx = children
+                            .get(value_role)
+                            .and_then(|v| v.as_u64())
+                            .ok_or_else(|| {
+                                LangError::engine_node(
+                                    "assign: value index must be a number".to_string(),
+                                    node,
+                                )
+                            })? as usize;
                         return self.exec_node_inner(AstRef::new(value_idx));
                     }
                 }
@@ -2302,14 +2340,24 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 .ok_or_else(|| {
                     LangError::engine_node("match: arm node missing children".to_string(), node)
                 })?;
+            // `pattern`/`body` positions resolve by named role
+            // (ADR-0081); positional 0/1 is the role-less fallback.
+            let pattern_role = self
+                .lang
+                .child_role_index(&arm_node.kind, "pattern")?
+                .unwrap_or(0);
+            let body_role = self
+                .lang
+                .child_role_index(&arm_node.kind, "body")?
+                .unwrap_or(1);
             let pattern_idx = arm_children
-                .get(0)
+                .get(pattern_role)
                 .and_then(|v| v.as_u64())
                 .ok_or_else(|| {
                     LangError::engine_node("match: arm missing pattern child".to_string(), node)
                 })? as usize;
             let body_idx = arm_children
-                .get(1)
+                .get(body_role)
                 .and_then(|v| v.as_u64())
                 .ok_or_else(|| {
                     LangError::engine_node("match: arm missing body child".to_string(), node)
@@ -2351,13 +2399,24 @@ impl<'a, 'h> VmFrame<'a, 'h> {
             .ok_or_else(|| {
                 LangError::engine_node("handle: missing children in payload".to_string(), node)
             })?;
-        let body_idx =
-            children.get(0).and_then(|v| v.as_u64()).ok_or_else(|| {
-                LangError::engine_node("handle: missing body child".to_string(), node)
+        // `target`/`impl` positions resolve by named role (ADR-0081);
+        // positional 0/1 is the role-less fallback.
+        let body_role = self
+            .lang
+            .child_role_index(&node.kind, "target")?
+            .unwrap_or(0);
+        let impl_role = self.lang.child_role_index(&node.kind, "impl")?.unwrap_or(1);
+        let body_idx = children
+            .get(body_role)
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| LangError::engine_node("handle: missing body child".to_string(), node))?
+            as usize;
+        let block_idx = children
+            .get(impl_role)
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                LangError::engine_node("handle: missing block child".to_string(), node)
             })? as usize;
-        let block_idx = children.get(1).and_then(|v| v.as_u64()).ok_or_else(|| {
-            LangError::engine_node("handle: missing block child".to_string(), node)
-        })? as usize;
 
         // Evaluate the body first.
         let body_val = self.exec_node_inner(AstRef::new(body_idx))?;
@@ -2387,14 +2446,24 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 .ok_or_else(|| {
                     LangError::engine_node("handle: clause node missing children".to_string(), node)
                 })?;
+            // `pattern`/`body` (the handler position) resolve by named
+            // role (ADR-0081); positional 0/1 is the role-less fallback.
+            let pattern_role = self
+                .lang
+                .child_role_index(&clause_node.kind, "pattern")?
+                .unwrap_or(0);
+            let body_role = self
+                .lang
+                .child_role_index(&clause_node.kind, "body")?
+                .unwrap_or(1);
             let pattern_idx = clause_children
-                .get(0)
+                .get(pattern_role)
                 .and_then(|v| v.as_u64())
                 .ok_or_else(|| {
                     LangError::engine_node("handle: clause missing pattern child".to_string(), node)
                 })? as usize;
             let handler_idx = clause_children
-                .get(1)
+                .get(body_role)
                 .and_then(|v| v.as_u64())
                 .ok_or_else(|| {
                     LangError::engine_node("handle: clause missing handler child".to_string(), node)

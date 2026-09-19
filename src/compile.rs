@@ -910,12 +910,24 @@ fn try_extract_closure_params_body(
     }
 
     // Pratt-parsed payload shape: `{"children": [param_idx, body_idx]}`.
+    // `params`/`body` child positions resolve by named role (ADR-0081);
+    // positional 0/1 is the role-less fallback.
     if let Some(children) = payload.get("children").and_then(|c| c.as_array()) {
-        let param_idx = match children.first().and_then(|v| v.as_u64()) {
+        let params_role = lang
+            .child_role_index(&node.kind, "params")
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        let body_role = lang
+            .child_role_index(&node.kind, "body")
+            .ok()
+            .flatten()
+            .unwrap_or(1);
+        let param_idx = match children.get(params_role).and_then(|v| v.as_u64()) {
             Some(idx) => idx as usize,
             None => return Ok(None),
         };
-        let body_idx = match children.get(1).and_then(|v| v.as_u64()) {
+        let body_idx = match children.get(body_role).and_then(|v| v.as_u64()) {
             Some(idx) => idx as usize,
             None => return Ok(None),
         };
