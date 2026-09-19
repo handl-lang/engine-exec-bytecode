@@ -1688,30 +1688,6 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     .map_err(|e| LangError::engine_node(e.to_string(), node))?;
                 Ok(TaggedValue::from(val))
             }
-            // ADR-0060: proj_rest — evaluate all children after index 0 and
-            // return them as a JSON array.
-            "proj_rest" => {
-                let children = node
-                    .payload
-                    .get("children")
-                    .and_then(|c| c.as_array())
-                    .ok_or_else(|| {
-                        LangError::engine(
-                            "proj_rest: expected children array in payload".to_string(),
-                        )
-                    })?;
-                let mut vals = Vec::new();
-                for entry in children.iter().skip(1) {
-                    let idx = entry.as_u64().ok_or_else(|| {
-                        LangError::engine_node(
-                            "proj_rest: child index must be a number".to_string(),
-                            node,
-                        )
-                    })? as usize;
-                    vals.push(self.exec_node_inner(AstRef::new(idx))?);
-                }
-                Ok(TaggedValue::Arr(Rc::from(vals)))
-            }
             // `loop_step` — the ergonomic `loop` surface (ADR-0052). The
             // body closure is applied to the current state via this
             // engine's `apply_app`; the shared `build_loop_step_args`/
@@ -1765,105 +1741,11 @@ impl<'a, 'h> VmFrame<'a, 'h> {
             // `name` and `children: [value_idx, body_idx]`; evaluate value,
             // extend env with name=value, evaluate body, pop scope.
             "bind" => self.prim_v2_bind(node),
-            // ADR-0060: json node payload is the JSON template string. When
-            // the json node has children (desugared from json{...}(args)),
-            // child 0 is the template node and children 1..N are args.
-            // Evaluate args and substitute $0, $1, … into the template.
-            "json" => {
-                if let Some(children) = node.payload.get("children").and_then(|c| c.as_array()) {
-                    if children.len() >= 2 {
-                        let template_idx = children[0].as_u64().ok_or_else(|| {
-                            LangError::engine_node(
-                                "json: child index must be a number".to_string(),
-                                node,
-                            )
-                        })? as usize;
-                        let template_node = self.ast.at(AstRef::new(template_idx))?;
-                        let template = template_node.payload.as_str().ok_or_else(|| {
-                            LangError::engine_node(
-                                "json: template payload must be a string".to_string(),
-                                node,
-                            )
-                        })?;
-                        let mut s = template.to_string();
-                        for (i, entry) in children[1..].iter().enumerate() {
-                            let idx = entry.as_u64().ok_or_else(|| {
-                                LangError::engine_node(
-                                    "json: child index must be a number".to_string(),
-                                    node,
-                                )
-                            })? as usize;
-                            let val = self.exec_node_inner(AstRef::new(idx))?;
-                            let replacement = serde_json::to_string(&tagged_to_value(&val))
-                                .map_err(|e| {
-                                    LangError::engine_node(format!("json: {}", e), node)
-                                })?;
-                            s = s.replace(&format!("${}", i), &replacement);
-                        }
-                        return serde_json::from_str::<Value>(&s)
-                            .map_err(|e| {
-                                LangError::engine_node(format!("json: parse error: {}", e), node)
-                            })
-                            .map(TaggedValue::from);
-                    }
-                }
-                let expr = node.payload.as_str().ok_or_else(|| {
-                    LangError::engine_node("json: payload must be a string".to_string(), node)
-                })?;
-                serde_json::from_str::<Value>(expr)
-                    .map_err(|e| LangError::engine_node(format!("json: parse error: {}", e), node))
-                    .map(TaggedValue::from)
-            }
             // ADR-0053: the data-driven `if → match` desugar rewrites `if`
             // nodes into `match` nodes before eval, so the v2 bytecode path
             // must handle `match`/`handle` directly.
             "match" => self.prim_v2_match(node),
             "handle" => self.prim_v2_handle(node),
-            // v0.1: `product` — categorical product `***` (ADR-0074).
-            // Receives [f_result, g_result] and pairs them.
-            "field_access" => {
-                let target = args.first().cloned().unwrap_or(TaggedValue::Null);
-                let field = args.get(1).cloned().unwrap_or(TaggedValue::Null);
-                match (target, field) {
-                    (TaggedValue::Obj(map), TaggedValue::Str(key)) => {
-                        Ok(map.get(key.as_ref()).cloned().unwrap_or(TaggedValue::Null))
-                    }
-                    (TaggedValue::Arr(arr), field) => {
-                        let i = field
-                            .as_f64()
-                            .filter(|n| *n >= 0.0 && n.fract() == 0.0)
-                            .map(|n| n as usize)
-                            .ok_or_else(|| {
-                                LangError::engine_node(
-                                    "field_access: array index must be a non-negative integer"
-                                        .to_string(),
-                                    node,
-                                )
-                            })?;
-                        arr.get(i).cloned().ok_or_else(|| {
-                            LangError::engine_node(
-                                format!(
-                                    "field_access: index {i} out of bounds (len {})",
-                                    arr.len()
-                                ),
-                                node,
-                            )
-                        })
-                    }
-                    (TaggedValue::Str(s), TaggedValue::Str(key)) => {
-                        let joined: Rc<str> = Rc::from(format!("{}.{}", s.as_ref(), key.as_ref()));
-                        Ok(TaggedValue::Str(joined))
-                    }
-                    (target, field) => Err(LangError::engine_node(
-                        format!(
-                            "field_access: target must be object/array, field must be string/number; got {} and {}",
-                            type_tag(&target),
-                            type_tag(&field),
-                        ),
-                        node,
-                    )),
-                }
-            }
             // Phase 9.5: `import "path"` loads a module via the configured
             // resolver and binds its top-level exports into the current scope.
             "import" => self.prim_v2_import(args, node),
@@ -1912,57 +1794,6 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 }
             }
             // `export` and `record_proj` are owned by the shared table.
-            "runtime_assert" => {
-                let children = node
-                    .payload
-                    .get("children")
-                    .and_then(|c| c.as_array())
-                    .ok_or_else(|| {
-                        LangError::engine_node(
-                            "runtime_assert: expected children array in payload".to_string(),
-                            node,
-                        )
-                    })?;
-                let pred_idx = self
-                    .lang
-                    .child_role_index(&node.kind, "predicate")?
-                    .unwrap_or(0);
-                let expr_idx = self.lang.child_role_index(&node.kind, "expr")?.unwrap_or(1);
-                let pred_arena =
-                    children
-                        .get(pred_idx)
-                        .and_then(|v| v.as_u64())
-                        .ok_or_else(|| {
-                            LangError::engine_node(
-                                format!("runtime_assert: predicate child {} not found", pred_idx),
-                                node,
-                            )
-                        })? as usize;
-                let expr_arena =
-                    children
-                        .get(expr_idx)
-                        .and_then(|v| v.as_u64())
-                        .ok_or_else(|| {
-                            LangError::engine_node(
-                                format!("runtime_assert: expr child {} not found", expr_idx),
-                                node,
-                            )
-                        })? as usize;
-                let pred_val = self.exec_node_inner(AstRef::new(pred_arena))?;
-                let expr_val = self.exec_node_inner(AstRef::new(expr_arena))?;
-                if !matches!(pred_val, TaggedValue::Arrow { .. }) {
-                    return Ok(expr_val);
-                }
-                let check_result = self.apply_app(&pred_val, &[expr_val.clone()], node)?;
-                if is_truthy(&check_result) {
-                    Ok(expr_val)
-                } else {
-                    Err(LangError::engine_node(
-                        "runtime_assert: assertion failed — predicate returned false".to_string(),
-                        node,
-                    ))
-                }
-            }
             _ => Err(LangError::engine_node(
                 format!("unknown v2 native op: {}", op),
                 node,
@@ -2993,6 +2824,18 @@ impl NativeOpCtx for VmCtx<'_, '_, '_, '_> {
 
     fn node_payload(&self) -> Option<&Value> {
         Some(&self.node.payload)
+    }
+
+    fn node_payload_at(&mut self, r: AstRef) -> Option<Value> {
+        self.frame.ast.at(r).ok().map(|n| n.payload.clone())
+    }
+
+    fn child_role_index(&mut self, role: &str) -> Option<usize> {
+        self.frame
+            .lang
+            .child_role_index(&self.node.kind, role)
+            .ok()
+            .flatten()
     }
 
     fn eval_node(&mut self, r: AstRef) -> Result<TaggedValue, LangError> {
