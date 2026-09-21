@@ -136,6 +136,13 @@ pub(crate) struct ScopeStack {
     /// Stack of mark positions — each `push_scope` records the current
     /// length, each `pop_scope` truncates back to that length.
     pub(crate) marks: Vec<usize>,
+    /// Lexical floor: bindings below this index belong to a *caller* frame
+    /// (`apply_app` sets it to the pre-call bindings length and restores it
+    /// after). `lookup`/`assign`/`capture` only see bindings at or above
+    /// the floor, so a callee can neither read nor mutate its caller's
+    /// live locals — matching the tree-walk, where a closure's visible
+    /// env is its captured env plus its own scopes only.
+    pub(crate) floor: usize,
     /// The captured environment root for the current closure invocation.
     /// Searched after `bindings` so user-defined scopes shadow captured
     /// variables. Stored as `Rc` so closure calls avoid deep-cloning the
@@ -162,6 +169,7 @@ impl ScopeStack {
         Self {
             bindings: Vec::new(),
             marks: vec![0],
+            floor: 0,
             captured_root: None,
             globals: Rc::new(FxHashMap::default()),
             enclosing_updated: false,
@@ -178,8 +186,9 @@ impl ScopeStack {
     /// from the end), then the captured root (if any), then host-provided
     /// globals. Mirrors the tree-walk `ScopeStack::lookup` ordering.
     pub(crate) fn lookup(&self, name: &str) -> Option<&TaggedValue> {
-        // Search innermost bindings first (reverse linear scan).
-        for (n, v) in self.bindings.iter().rev() {
+        // Search innermost bindings first (reverse linear scan), down to
+        // the lexical floor — a caller frame's bindings are not visible.
+        for (n, v) in self.bindings[self.floor..].iter().rev() {
             if n.as_ref() == name {
                 return Some(v);
             }
@@ -211,6 +220,9 @@ impl ScopeStack {
     pub(crate) fn assign(&mut self, name: &str, value: TaggedValue) {
         let inner_start = self.marks.last().copied().unwrap_or(0);
         for (pos, (n, v)) in self.bindings.iter_mut().enumerate().rev() {
+            if pos < self.floor {
+                break;
+            }
             if n.as_ref() == name {
                 if !handl_value::eq(v, &value) {
                     *v = value;
@@ -259,7 +271,7 @@ impl ScopeStack {
             }
         }
         // Then include current scopes (higher priority, overwrites parent).
-        for (n, v) in &self.bindings {
+        for (n, v) in &self.bindings[self.floor..] {
             captured.insert(Rc::clone(n), v.clone());
         }
         captured
@@ -1073,6 +1085,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     rest,
                     body,
                     array_pattern,
+                    capture,
                 } => {
                     // Capture the current environment and construct a
                     // `TaggedValue::Arrow`. Identical to the `closure`
@@ -1080,7 +1093,15 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     // for args, the string `match op` dispatch, and the
                     // node payload extraction — `params` and `body` are
                     // pre-computed at compile time.
-                    let captured = self.scopes.capture();
+                    //
+                    // `capture` is the compile-time free-name superset of
+                    // the body: the env is filtered to names the body can
+                    // reference, so sequential sibling closures cannot
+                    // nest exponentially at `tagged_to_value` boundaries.
+                    let mut captured = self.scopes.capture();
+                    if let Some(names) = capture {
+                        captured.retain(|k, _| names.contains(k));
+                    }
                     stack.push(TaggedValue::Arrow {
                         params: Rc::clone(params),
                         rest: rest.clone(),
@@ -1562,6 +1583,8 @@ impl<'a, 'h> VmFrame<'a, 'h> {
             let saved_captured = self.scopes.captured_root.take();
             let saved_marks_len = self.scopes.marks.len();
             let saved_bindings_len = self.scopes.bindings.len();
+            let saved_floor = self.scopes.floor;
+            self.scopes.floor = saved_bindings_len;
             self.scopes.captured_root = Some(captured_env);
             self.scopes.push_scope();
             for (param, arg) in params.iter().zip(head.iter()) {
@@ -1577,6 +1600,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
             self.scopes.bindings.truncate(saved_bindings_len);
             self.scopes.marks.truncate(saved_marks_len);
             self.scopes.captured_root = saved_captured;
+            self.scopes.floor = saved_floor;
             return result;
         }
         // Positional arrows: ADR-0074 multi-param arrows may receive a
@@ -1614,6 +1638,8 @@ impl<'a, 'h> VmFrame<'a, 'h> {
         let saved_captured = self.scopes.captured_root.take();
         let saved_marks_len = self.scopes.marks.len();
         let saved_bindings_len = self.scopes.bindings.len();
+        let saved_floor = self.scopes.floor;
+        self.scopes.floor = saved_bindings_len;
         self.scopes.captured_root = Some(captured_env);
         self.scopes.push_scope();
         for (param, arg) in params.iter().zip(actual_args.iter()) {
@@ -1628,10 +1654,12 @@ impl<'a, 'h> VmFrame<'a, 'h> {
         }
         let result = self.exec_node_inner(body_ref);
         // Restore: truncate bindings and marks to pre-call state, discarding
-        // any scopes the body may have pushed, and restore the captured root.
+        // any scopes the body may have pushed, and restore the captured root
+        // and lexical floor.
         self.scopes.bindings.truncate(saved_bindings_len);
         self.scopes.marks.truncate(saved_marks_len);
         self.scopes.captured_root = saved_captured;
+        self.scopes.floor = saved_floor;
         result
     }
 }
@@ -1645,6 +1673,7 @@ fn op_uses_incoming(op: &str) -> bool {
     matches!(
         op,
         "id" | "tag"
+            | "truthy"
             | "is_pos"
             | "dec"
             | "inc"

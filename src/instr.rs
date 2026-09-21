@@ -421,6 +421,12 @@ pub enum Instr {
         body: usize,
         /// Whether the params node is an array-destructuring pattern.
         array_pattern: bool,
+        /// Compile-time free-name superset of `body` (see
+        /// `handl_language::subtree_name_candidates`): the captured env is
+        /// filtered to these names so sequential sibling closures cannot
+        /// nest exponentially at `tagged_to_value` boundaries. `None`
+        /// keeps the full env (conservative fallback).
+        capture: Option<Rc<std::collections::HashSet<Rc<str>>>>,
     },
 
     // --- ADR-0103 hardware-boundary instructions ---

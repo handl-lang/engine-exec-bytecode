@@ -619,11 +619,21 @@ fn compile_arr(
     // when the params/body cannot be statically resolved.
     if source == &ArrSource::Native && op == "closure" {
         if let Some(closure) = try_extract_closure_params_body(lang, ast, node)? {
+            // Free-variable capture set: the body subtree's name
+            // candidates, computed once here so the VM can filter
+            // `scopes.capture()` to the bindings the body can actually
+            // reference. `None` (unresolvable subtree) keeps the full env.
+            let capture = handl_language::subtree_name_candidates(
+                |r| ast.get(r).map(|n| n.payload.clone()),
+                AstRef::new(closure.body),
+            )
+            .map(Rc::new);
             out.push(Instr::Closure {
                 params: closure.params,
                 rest: closure.rest,
                 body: closure.body,
                 array_pattern: closure.array_pattern,
+                capture,
             });
             return Ok(false);
         }
