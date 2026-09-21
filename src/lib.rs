@@ -42,14 +42,16 @@
 //! - No-scheme fallback: if a node kind has no eval scheme, returns
 //!   `node.payload` directly.
 //! - Closure representation: `Value::Object` with
-//!   `{"__arrow__": true, "params": [...], "body": <arena_idx>, "env": {...}}`,
-//!   created by the `"closure"` native op.
+//!   `{"__arrow__": true, "params": [...], "body_def": {"__ast__": <arena>},
+//!   "binds": {...}, "handlers": [...]}` — self-contained serializable data
+//!   (ADR-0106), created by `Instr::Closure`.
 //! - Native ops: `add, sub, mul, div, mod, neg, eq, neq, lt, gt, lte, gte,
 //!   and, or, not, tag, id, closure, bind` — identical semantics to the
 //!   tree-walk.
 //! - Scope: `Vec<HashMap<String, Value>>` scope stack; `extend_env` pushes a
-//!   child scope; lookup searches innermost-first. Closure calls swap in the
-//!   captured env, bind params, eval body, restore.
+//!   child scope; lookup searches innermost-first. Arrow applications
+//!   install the arrow's `binds` as the captured root, bind params, eval
+//!   the `body_def` arena, restore.
 
 #![warn(missing_docs)]
 
@@ -62,7 +64,7 @@ pub use instr::{ArithOp, Instr};
 
 use handl_language::{Ast, AstRef, LangError, Language, SchemeVersion, Value};
 use handl_plugin_engine_exec::{EvalEngine, EvalRequest};
-use handl_plugin_engine_exec_tree_walk::{EvalFrame as TreeWalkEvalFrame, register_home_frame};
+use handl_plugin_engine_exec_tree_walk::EvalFrame as TreeWalkEvalFrame;
 use handl_plugin_engine_transform::native::{NativeRewrite, NativeRewriteRegistry, RewriteCtx};
 use handl_plugin_engine_transform_rewrite::RewriteEngine;
 use handl_value::TaggedValue;
@@ -141,8 +143,9 @@ impl Default for BytecodeEngine {
 
 impl BytecodeEngine {
     /// Shared core of [`EvalEngine::eval`] and [`EvalEngine::eval_shared`]:
-    /// install the `ast`/`lang`/`modules` in the home-frame thread-locals,
-    /// compile/execute the arena root, and return a `Value`.
+    /// install the `ast`/`lang`/`modules` in the ambient-frame thread-locals
+    /// (`TreeWalkEvalFrame` — services only, not lexical state), then
+    /// compile/execute the arena root and return a `Value`.
     fn eval_ast_rc(&self, lang: Rc<Language>, ast: Rc<Ast>) -> Result<Value, LangError> {
         self.eval_ast_rc_with_args(lang, ast, &[])
     }
@@ -205,8 +208,12 @@ impl BytecodeEngine {
             globals
         });
 
+        // Install the ambient eval services so host callbacks applying
+        // arrow values (`ctx.try_call_value`, `TreeWalkCallable`) resolve
+        // this eval's language/module context. Arrows themselves are
+        // self-contained (`body_def` + `binds`, ADR-0106) — the frame is
+        // ambient services only, not lexical state.
         let eval_frame = TreeWalkEvalFrame {
-            ast: Rc::clone(&ast),
             lang: Rc::clone(&lang),
             modules: self.modules.clone(),
             globals: Some(Rc::clone(&globals_rc)),
@@ -281,31 +288,15 @@ impl EvalEngine for BytecodeEngine {
     /// Seal a module's exported bindings before they cross into the
     /// importer's scope (Phase 9.5 `import "path"`).
     ///
-    /// Registers the module's AST as a home frame and stamps any unhomed
-    /// arrow values so a later engine can route application back here.
+    /// ADR-0106: arrows are self-contained (`body_def` + `binds` +
+    /// `handlers`), so nothing needs stamping — the value is already
+    /// complete.
     fn seal_module_value(
         &self,
-        ast: &Ast,
-        lang: &Language,
+        _ast: &Ast,
+        _lang: &Language,
         value: Value,
     ) -> Result<Value, LangError> {
-        if !contains_unhomed_arrow(&value) {
-            return Ok(value);
-        }
-        let globals: Option<HashMap<String, Value>> = if self.globals.is_empty() {
-            None
-        } else {
-            Some(self.globals.clone())
-        };
-        let frame_id = register_home_frame(
-            Rc::new(ast.clone()),
-            Rc::new(lang.clone()),
-            self.modules.clone(),
-            globals,
-            self.import_resolver.clone(),
-        );
-        let mut value = value;
-        stamp_home(&mut value, frame_id);
         Ok(value)
     }
 }
@@ -434,53 +425,6 @@ pub(crate) fn lower_natives() -> NativeRewriteRegistry {
         }),
     );
     reg
-}
-
-/// Whether `value` contains an arrow value (`{"__arrow__": true, ...}`)
-/// that carries no `__home__` frame id — i.e. an arrow whose `body` index
-/// refers to the ambient eval's AST and must be stamped before it crosses
-/// a runtime boundary.
-fn contains_unhomed_arrow(value: &Value) -> bool {
-    match value {
-        Value::Array(a) => a.iter().any(contains_unhomed_arrow),
-        Value::Object(o) => {
-            if o.get("__arrow__").and_then(|v| v.as_bool()) == Some(true) {
-                return o.get("__home__").and_then(|v| v.as_u64()).is_none()
-                    || o.values().any(contains_unhomed_arrow);
-            }
-            o.values().any(contains_unhomed_arrow)
-        }
-        _ => false,
-    }
-}
-
-/// Stamp every arrow value inside `value` that lacks a `__home__` frame id
-/// with `frame_id` — recursively, including arrows nested inside a
-/// closure's captured `env`. Arrows that already carry a `__home__` keep it.
-fn stamp_home(value: &mut Value, frame_id: u64) {
-    match value {
-        Value::Array(a) => {
-            for v in a.iter_mut() {
-                stamp_home(v, frame_id);
-            }
-        }
-        Value::Object(o) => {
-            if o.get("__arrow__").and_then(|v| v.as_bool()) == Some(true)
-                && o.get("__home__").and_then(|v| v.as_u64()).is_none()
-            {
-                o.insert("__home__".to_string(), Value::from(frame_id));
-            }
-            // Arrow envs serialize by reference (`{"__envref__": id}`) —
-            // stamp env-resident arrows in `TaggedValue` space.
-            if let Some(id) = o.get("__envref__").and_then(|v| v.as_u64()) {
-                handl_value::stamp_env_home(id, frame_id);
-            }
-            for v in o.values_mut() {
-                stamp_home(v, frame_id);
-            }
-        }
-        _ => {}
-    }
 }
 
 #[cfg(test)]

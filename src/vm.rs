@@ -13,7 +13,9 @@
 //!
 //! - **Pair** (`first`): `{"__pair__": [a, b]}`.
 //! - **Either** (`Choice` / `tag`): `{"__either__": "left"|"right", "value": v}`.
-//! - **Arrow-value** (`App`): `{"__arrow__": true, "params": [...], "body": <idx>, "env": {...}}`.
+//! - **Arrow-value** (`App`): `{"__arrow__": true, "params": [...],
+//!   "body_def": {"__ast__": <arena>}, "binds": {...}, "handlers": [...]}`
+//!   — self-contained serializable data (ADR-0106).
 //!
 //! ## Loop execution model
 //!
@@ -65,7 +67,6 @@ use handl_plugin_engine_exec::native_ops::{
     loop_step_outcome, num_value, step_decision, type_tag,
 };
 use handl_plugin_engine_exec::pattern_match::{self, PatternMatchCtx};
-use handl_plugin_engine_exec_tree_walk::home_frame;
 use handl_value::{TaggedValue, tagged_to_value};
 use rustc_hash::FxHashMap;
 
@@ -126,10 +127,11 @@ const ARR_DISPATCH_TAG: &str = "__arr__";
 ///
 /// Mirrors the tree-walk's `ScopeStack` exactly: `push_scope` records a
 /// mark; lookup searches innermost-first (linear scan from the end);
-/// closure calls swap in the captured environment, bind params, evaluate
-/// the body, then restore the original scope stack. For the small scopes
-/// typical in handler programs (3-10 variables), a linear scan is faster
-/// than `HashMap` because there is no hashing overhead.
+/// arrow applications install the arrow's residual `binds` as
+/// `captured_root`, bind params, evaluate the `body_def` arena, then
+/// restore. For the small scopes typical in handler programs (3-10
+/// variables), a linear scan is faster than `HashMap` because there is no
+/// hashing overhead.
 pub(crate) struct ScopeStack {
     /// Flat list of (name, value) bindings, innermost last.
     pub(crate) bindings: Vec<(Rc<str>, TaggedValue)>,
@@ -140,13 +142,13 @@ pub(crate) struct ScopeStack {
     /// (`apply_app` sets it to the pre-call bindings length and restores it
     /// after). `lookup`/`assign`/`capture` only see bindings at or above
     /// the floor, so a callee can neither read nor mutate its caller's
-    /// live locals — matching the tree-walk, where a closure's visible
-    /// env is its captured env plus its own scopes only.
+    /// live locals — matching the tree-walk, where an arrow's visible
+    /// bindings are its `binds` plus its own scopes only.
     pub(crate) floor: usize,
-    /// The captured environment root for the current closure invocation.
-    /// Searched after `bindings` so user-defined scopes shadow captured
-    /// variables. Stored as `Rc` so closure calls avoid deep-cloning the
-    /// entire captured `HashMap`.
+    /// The applied arrow's residual `binds` for the current invocation.
+    /// Searched after `bindings` so user-defined scopes shadow residual
+    /// bindings. Stored as `Rc` so arrow calls avoid deep-cloning the
+    /// `binds` map.
     pub(crate) captured_root: Option<Rc<FxHashMap<Rc<str>, TaggedValue>>>,
     /// Host-provided globals (e.g. `self` and `__arg_N`), searched after
     /// local/captured bindings so user-defined scopes shadow them. Held in
@@ -162,6 +164,14 @@ pub(crate) struct ScopeStack {
     /// any such write must not count as converged. Mirrors the tree-walk
     /// `ScopeStack::enclosing_updated`.
     pub(crate) enclosing_updated: bool,
+    /// Names bound by enclosing `eval_rec` regions (flat stack, segmented
+    /// by `rec_marks`). The `closure` mint keeps these as residual `binds`
+    /// on minted arrows rather than substituting them into `body_def`
+    /// (ADR-0106): substituting a rec name would embed a stale
+    /// current-pass value and break fixpoint convergence.
+    pub(crate) rec_names: Vec<Rc<str>>,
+    /// Segment marks for `rec_names` — one per active `eval_rec` region.
+    pub(crate) rec_marks: Vec<usize>,
 }
 
 impl ScopeStack {
@@ -173,6 +183,8 @@ impl ScopeStack {
             captured_root: None,
             globals: Rc::new(FxHashMap::default()),
             enclosing_updated: false,
+            rec_names: Vec::new(),
+            rec_marks: Vec::new(),
         }
     }
 
@@ -256,15 +268,16 @@ impl ScopeStack {
         }
     }
 
-    /// Capture all visible variables into a single flat map.
+    /// Collect all visible bindings into a single flat map.
     ///
-    /// Used by the `closure` primitive to snapshot the current environment.
+    /// Used by the `closure` mint to gather the definition-site bindings
+    /// split into `body_def` substitution + residual `binds` (ADR-0106).
     /// Inner scopes shadow outer ones (later entries overwrite earlier).
-    /// Includes the parent closure's captured env (if any) so that nested
-    /// closures retain access to bindings from all enclosing closure scopes.
+    /// Includes the enclosing arrow's `binds` (if any) so that nested
+    /// arrows retain access to bindings from all enclosing arrow scopes.
     pub(crate) fn capture(&self) -> FxHashMap<Rc<str>, TaggedValue> {
         let mut captured = FxHashMap::default();
-        // Include parent closure's captured env first (lower priority).
+        // Include the enclosing arrow's `binds` first (lower priority).
         if let Some(parent_captured) = &self.captured_root {
             for (k, v) in parent_captured.iter() {
                 captured.insert(Rc::clone(k), v.clone());
@@ -369,8 +382,25 @@ pub(crate) struct VmFrame<'a, 'h> {
     modules: Option<&'h Rc<dyn handl_platform::ModuleLookup>>,
     /// The import resolver for `import "path"` statements (Phase 9.5).
     import_resolver: Option<&'h Rc<dyn handl_plugin_engine_exec::ImportResolver>>,
-    /// Per-node v2 compilation cache: `AstRef index -> compiled instructions`.
-    cache: FxHashMap<usize, Rc<[Instr]>>,
+    /// Deserialized `body_def` arenas carried by applied arrows
+    /// (ADR-0106). Applying an arrow pushes its arena here and executes
+    /// under `active_def`; the entries keep the arenas alive for the
+    /// frame's lifetime so `def_cache` keys stay valid.
+    def_arenas: Vec<Rc<Ast>>,
+    /// Memo of `body_def` `Rc` pointer -> `def_arenas` slot, so applying
+    /// the same arrow repeatedly does not re-deserialize its arena. The
+    /// value stores an `Rc::clone` of the definition, so the keyed
+    /// address cannot be recycled while the entry lives — a stale hit is
+    /// impossible.
+    def_arena_keys: FxHashMap<usize, (usize, Rc<TaggedValue>)>,
+    /// Per-node v2 compilation cache, keyed by `(arena_slot, node_index)`:
+    /// slot `0` is `self.ast`, slots `1..` index into `def_arenas`, so
+    /// def-arena node indices never collide with `self.ast` indices.
+    def_cache: FxHashMap<(usize, usize), Rc<[Instr]>>,
+    /// The `def_arenas` slot whose arena is currently executing, or `None`
+    /// while running `self.ast`. `apply_arrow_body` sets/restores it
+    /// around the arrow body's execution.
+    active_def: Option<usize>,
     /// The scope stack.
     scopes: ScopeStack,
     /// Reusable operand stack for `exec_instrs_inner`. Taken via
@@ -401,7 +431,10 @@ impl<'a, 'h> VmFrame<'a, 'h> {
             lang,
             modules,
             import_resolver,
-            cache: FxHashMap::default(),
+            def_arenas: Vec::new(),
+            def_arena_keys: FxHashMap::default(),
+            def_cache: FxHashMap::default(),
+            active_def: None,
             scopes: ScopeStack::new(),
             scratch_stack: Vec::new(),
             ffi_registry: FfiRegistry::new(),
@@ -429,6 +462,36 @@ impl<'a, 'h> VmFrame<'a, 'h> {
     /// Set the host-provided globals map (e.g. `self`, `__arg_N`).
     pub(crate) fn set_globals(&mut self, globals: Rc<FxHashMap<Rc<str>, TaggedValue>>) {
         self.scopes.set_globals(globals);
+    }
+
+    /// The arena currently executing: the applied arrow's `body_def`
+    /// arena while `active_def` is set, else the frame's own `ast`.
+    pub(crate) fn cur_ast(&self) -> &Ast {
+        match self.active_def {
+            Some(slot) => &self.def_arenas[slot],
+            None => self.ast,
+        }
+    }
+
+    /// Deserialize `def` (a `{"__ast__": <Ast>}` `body_def` value) into a
+    /// `def_arenas` slot, memoized by the definition's `Rc` pointer.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the definition is not a well-formed `__ast__`
+    /// value or deserializes to an empty arena — the arrow is malformed.
+    fn def_arena_slot(&mut self, def: &Rc<TaggedValue>) -> Result<usize, LangError> {
+        let key = Rc::as_ptr(def) as usize;
+        if let Some(&(slot, _)) = self.def_arena_keys.get(&key) {
+            return Ok(slot);
+        }
+        let ast = handl_language::as_ast(&tagged_to_value(def))
+            .filter(|a| !a.is_empty())
+            .ok_or_else(|| LangError::engine("arrow: malformed body_def".to_string()))?;
+        let slot = self.def_arenas.len();
+        self.def_arenas.push(Rc::new(ast));
+        self.def_arena_keys.insert(key, (slot, Rc::clone(def)));
+        Ok(slot)
     }
 }
 
@@ -477,24 +540,39 @@ impl<'a, 'h> VmFrame<'a, 'h> {
     /// Internal node evaluator — the [`TaggedValue`] counterpart of
     /// [`exec_node`](Self::exec_node). Returns a [`TaggedValue`].
     pub(crate) fn exec_node_inner(&mut self, node_ref: AstRef) -> Result<TaggedValue, LangError> {
-        let node = self.ast.at(node_ref)?;
+        // Resolve the node in the active arena. For a `body_def` arena we
+        // clone the `Rc` into a local handle so `node` borrows the handle
+        // rather than `self` — no per-node clone on either path.
+        let arena_handle;
+        let (node, arena): (&AstNode, &Ast) = match self.active_def {
+            Some(slot) => {
+                arena_handle = Rc::clone(&self.def_arenas[slot]);
+                (arena_handle.at(node_ref)?, &arena_handle)
+            }
+            None => (self.ast.at(node_ref)?, self.ast),
+        };
 
-        // Compile-on-demand with cache.
-        if !self.cache.contains_key(&node_ref.index()) {
+        // Compile-on-demand with cache. `def_arena` programs are keyed by
+        // `(slot + 1, index)`; slot 0 is `self.ast`.
+        let key = match self.active_def {
+            Some(slot) => (slot + 1, node_ref.index()),
+            None => (0, node_ref.index()),
+        };
+        if !self.def_cache.contains_key(&key) {
             let scheme_def = self.lang.eval.get_by_identity(&node.kind);
             let instrs = match scheme_def {
-                Some(def) => compile(&def.scheme, self.lang, self.ast, node)?,
+                Some(def) => compile(&def.scheme, self.lang, arena, node)?,
                 None => vec![Instr::LoadPayload, Instr::Return],
             };
-            self.cache.insert(node_ref.index(), Rc::from(instrs));
+            self.def_cache.insert(key, Rc::from(instrs));
         }
 
         // Rc-clone the instruction slice (cheap refcount bump) to avoid
         // borrow conflict with recursive exec_node calls that may insert
         // into the cache.
         let instrs = self
-            .cache
-            .get(&node_ref.index())
+            .def_cache
+            .get(&key)
             // INFALLIBLE: we just inserted this key (or it was cached from a
             // prior call) on the line above, so the lookup cannot miss.
             .expect("just inserted or cached")
@@ -1087,32 +1165,56 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     array_pattern,
                     capture,
                 } => {
-                    // Capture the current environment and construct a
-                    // `TaggedValue::Arrow`. Identical to the `closure`
-                    // native op, but avoids the per-call `Vec` allocation
-                    // for args, the string `match op` dispatch, and the
-                    // node payload extraction — `params` and `body` are
-                    // pre-computed at compile time.
+                    // Mint a self-contained arrow (ADR-0106): `body_def`
+                    // is the body subtree extracted into a standalone
+                    // arena with every free variable substituted by a
+                    // `lit` node holding its definition-site value;
+                    // `binds` keeps the residual names that substitution
+                    // must not close over (active `eval_rec` binders,
+                    // non-serializable resources).
                     //
                     // `capture` is the compile-time free-name superset of
-                    // the body: the env is filtered to names the body can
-                    // reference, so sequential sibling closures cannot
-                    // nest exponentially at `tagged_to_value` boundaries.
+                    // the body: the substitution map is filtered to names
+                    // the body can actually reference, so sequential
+                    // sibling closures cannot nest exponentially.
                     let mut captured = self.scopes.capture();
                     if let Some(names) = capture {
                         captured.retain(|k, _| names.contains(k));
                     }
+                    // The arrow's own parameters are bound at apply time —
+                    // they are binders, not free variables. If a param name
+                    // collides with an in-scope binding, substituting it
+                    // would bake the *enclosing* value into `body_def` and
+                    // shadow the argument (shared `closure` op parity).
+                    for p in params.iter() {
+                        captured.remove(p.as_str());
+                    }
+                    if let Some(r) = rest {
+                        captured.remove(r.as_ref());
+                    }
+                    let mut subst: std::collections::HashMap<Rc<str>, Value> =
+                        std::collections::HashMap::with_capacity(captured.len());
+                    let mut binds: FxHashMap<Rc<str>, TaggedValue> = FxHashMap::default();
+                    for (name, value) in captured.iter() {
+                        if self.scopes.rec_names.contains(name)
+                            || !native_ops::arrow_free(value)
+                        {
+                            binds.insert(Rc::clone(name), value.clone());
+                        } else {
+                            subst.insert(Rc::clone(name), tagged_to_value(value));
+                        }
+                    }
+                    let sub = self
+                        .cur_ast()
+                        .instantiate(AstRef::new(*body), self.lang, &subst)
+                        .map_err(|e| e.with_node(node))?;
                     stack.push(TaggedValue::Arrow {
                         params: Rc::clone(params),
                         rest: rest.clone(),
-                        body: *body,
-                        env: Rc::new(captured),
-                        home: None,
                         array_pattern: *array_pattern,
-                        // ADR-0106 item 2 step 1: the bytecode engine's body is
-                        // an instruction index, not an AST node, so no
-                        // self-describing definition is minted yet (step 3).
-                        body_def: None,
+                        body_def: Rc::new(TaggedValue::from(handl_language::ast_value(&sub))),
+                        binds: Rc::new(binds),
+                        handlers: Rc::from(Vec::new()),
                     });
                 }
                 // --- ADR-0103 hardware-boundary instructions ---
@@ -1450,7 +1552,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                         node,
                     )
                 })?;
-            let instrs = compile(&impl_term, self.lang, self.ast, node)?;
+            let instrs = compile(&impl_term, self.lang, self.cur_ast(), node)?;
             return self.exec_instrs_inner(&instrs, node, Some(incoming.clone()));
         }
         let op_args = flatten_pair(incoming);
@@ -1461,9 +1563,9 @@ impl<'a, 'h> VmFrame<'a, 'h> {
     ///
     /// Host-function dispatch (string callee) has been moved to the
     /// `call_host` native op. This helper handles first-class `arr <op>`
-    /// dispatch objects (`{__arr__: {op}}`) and arrow-value (closure)
-    /// application: extract params/body/env, build a fresh scope from the
-    /// captured env, bind params, evaluate the body.
+    /// dispatch objects (`{__arr__: {op}}`) and arrow-value application:
+    /// install the arrow's `binds` as `captured_root`, bind params,
+    /// evaluate the `body_def` arena.
     fn apply_app(
         &mut self,
         callee: &TaggedValue,
@@ -1501,23 +1603,24 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 return self.apply_app(&term_val, &[tuple], node);
             }
         }
-        // Closure application — match on TaggedValue::Arrow directly.
-        let (params, rest_param, body_idx, captured_env, home, array_pattern) = match callee {
+        // Closure application — match on TaggedValue::Arrow directly. The
+        // arrow is self-contained data (ADR-0106): `body_def` is the
+        // substituted standalone arena, `binds` the explicit residual
+        // bindings, `handlers` the carried deep handlers.
+        let (params, rest_param, array_pattern, body_def, binds) = match callee {
             TaggedValue::Arrow {
                 params,
                 rest,
-                body,
-                env,
-                home,
                 array_pattern,
+                body_def,
+                binds,
                 ..
             } => (
                 params.clone(),
                 rest.clone(),
-                *body,
-                Rc::clone(env),
-                *home,
                 *array_pattern,
+                Rc::clone(body_def),
+                Rc::clone(binds),
             ),
             _ => {
                 return Err(LangError::engine(
@@ -1525,33 +1628,6 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 ));
             }
         };
-        let body_ref = AstRef::new(body_idx);
-
-        // Boundary-crossed arrow: its `body` index refers to a different
-        // AST (the one that minted it). Run the body in that home frame,
-        // with the home frame's modules, globals, and the arrow's captured
-        // env.
-        if let Some(frame_id) = home {
-            let frame = home_frame(frame_id).ok_or_else(|| {
-                LangError::engine(format!("arrow: unknown home frame {}", frame_id))
-            })?;
-            let home_modules_ref = frame.modules.as_ref();
-            let mut home_vm = VmFrame::new(&*frame.ast, &*frame.lang, home_modules_ref, None);
-            if let Some(g) = &frame.globals {
-                home_vm.scopes.set_globals(Rc::clone(g));
-            }
-            let local_callee = TaggedValue::Arrow {
-                params: params.clone(),
-                rest: rest_param.clone(),
-                body: body_idx,
-                env: captured_env.clone(),
-                home: None,
-                array_pattern,
-                // ADR-0106 item 2 step 1: re-wrap of an existing body.
-                body_def: None,
-            };
-            return home_vm.apply_app(&local_callee, args, node);
-        }
         // Array-pattern arrows (`[x, y] ~> body`) consume a single array
         // argument and destructure it by position.
         if array_pattern {
@@ -1580,28 +1656,15 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 )));
             }
             let (head, tail) = arr.split_at(fixed);
-            let saved_captured = self.scopes.captured_root.take();
-            let saved_marks_len = self.scopes.marks.len();
-            let saved_bindings_len = self.scopes.bindings.len();
-            let saved_floor = self.scopes.floor;
-            self.scopes.floor = saved_bindings_len;
-            self.scopes.captured_root = Some(captured_env);
-            self.scopes.push_scope();
-            for (param, arg) in params.iter().zip(head.iter()) {
-                self.scopes.define(param, arg.clone());
-            }
-            if let Some(rest_name) = &rest_param {
-                self.scopes.define(
-                    rest_name.as_ref(),
-                    TaggedValue::Arr(Rc::from(tail.to_vec())),
-                );
-            }
-            let result = self.exec_node_inner(body_ref);
-            self.scopes.bindings.truncate(saved_bindings_len);
-            self.scopes.marks.truncate(saved_marks_len);
-            self.scopes.captured_root = saved_captured;
-            self.scopes.floor = saved_floor;
-            return result;
+            return self.apply_arrow_body(
+                &params,
+                rest_param.as_ref(),
+                &body_def,
+                &binds,
+                head,
+                tail,
+                node,
+            );
         }
         // Positional arrows: ADR-0074 multi-param arrows may receive a
         // single `Pair` (product `***`) and destructure it into individual
@@ -1612,54 +1675,103 @@ impl<'a, 'h> VmFrame<'a, 'h> {
             } else {
                 args.to_vec()
             };
-        // Rest param (`[a, ...rest] ~> body`): surplus args bind to the rest
-        // name as an array, so `args.len() >= params.len()` is required.
-        let arity_ok = if rest_param.is_some() {
-            actual_args.len() >= params.len()
-        } else {
-            params.len() == actual_args.len()
-        };
-        if !arity_ok {
+        if actual_args.len() < params.len() {
             return Err(LangError::engine(format!(
                 "arrow-value expects {} args, got {}",
                 params.len(),
                 actual_args.len()
             )));
         }
-        // Arrow-value invocation (ADR-0052): the arrow carries its
-        // definition-time env as data. We install the captured env as the
-        // `captured_root` (a cheap `Rc` clone — no deep HashMap clone),
-        // push a fresh scope for params, and evaluate the body. The
-        // caller's env is never mutated — we save the pre-call binding/marks
-        // lengths and `captured_root`, then truncate back after the body
-        // returns. This avoids allocating a fresh `ScopeStack` (two `Vec`
-        // allocations) on every closure call — critical for `loop_step`
-        // where `apply_app` runs once per iteration.
+        // Rest params (`[a, ...rest] ~> body`): surplus args bind to the
+        // rest name as an array and the call consumes all args at once.
+        if let Some(rest_name) = &rest_param {
+            let (head, tail) = actual_args.split_at(params.len());
+            return self.apply_arrow_body(
+                &params,
+                Some(rest_name),
+                &body_def,
+                &binds,
+                head,
+                tail,
+                node,
+            );
+        }
+        // Curried application (ADR-0074): apply the first `params.len()`
+        // args, evaluate the body, then apply the result to the surplus —
+        // `f(1, 5)` on a curried arrow is `(f 1) 5`.
+        let (head, mut rest) = actual_args.split_at(params.len());
+        let mut val =
+            self.apply_arrow_body(&params, None, &body_def, &binds, head, &[], node)?;
+        while !rest.is_empty() {
+            val = self.apply_app(&val, rest, node)?;
+            rest = &[];
+        }
+        Ok(val)
+    }
+
+    /// Apply an arrow body (ADR-0106): execute the arrow's `body_def`
+    /// arena under a scope whose `captured_root` is the arrow's residual
+    /// `binds` map, with params (and the rest binding) bound in a fresh
+    /// scope on top. The caller's bindings are never visible — the lexical
+    /// `floor` is set to the pre-call bindings length.
+    ///
+    /// The `body_def` arena is deserialized once per arrow and memoized in
+    /// `def_arenas`; its node indices are compiled into `def_cache` keyed
+    /// by `(arena_slot, index)` so they never collide with `self.ast`.
+    /// `active_def` selects the arena for the duration of the body —
+    /// `cur_ast()` resolves every child/payload read through it.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_arrow_body(
+        &mut self,
+        params: &[String],
+        rest_param: Option<&Rc<str>>,
+        body_def: &Rc<TaggedValue>,
+        binds: &Rc<FxHashMap<Rc<str>, TaggedValue>>,
+        head: &[TaggedValue],
+        tail: &[TaggedValue],
+        node: &AstNode,
+    ) -> Result<TaggedValue, LangError> {
+        let slot = self
+            .def_arena_slot(body_def)
+            .map_err(|e| e.with_node(node))?;
+        let body_ref = AstRef::new(self.def_arenas[slot].len() - 1);
+
+        // Arrow-value invocation (ADR-0052): install the residual `binds`
+        // as the `captured_root` (a cheap `Rc` clone — no deep HashMap
+        // clone), push a fresh scope for params, and evaluate the body.
+        // The caller's env is never mutated — we save the pre-call
+        // binding/marks lengths, `captured_root`, `active_def`, and the
+        // lexical floor, then restore after the body returns. This avoids
+        // allocating a fresh `ScopeStack` (two `Vec` allocations) on every
+        // closure call — critical for `loop_step` where `apply_app` runs
+        // once per iteration.
         let saved_captured = self.scopes.captured_root.take();
         let saved_marks_len = self.scopes.marks.len();
         let saved_bindings_len = self.scopes.bindings.len();
         let saved_floor = self.scopes.floor;
+        let saved_def = self.active_def.replace(slot);
         self.scopes.floor = saved_bindings_len;
-        self.scopes.captured_root = Some(captured_env);
+        self.scopes.captured_root = Some(Rc::clone(binds));
         self.scopes.push_scope();
-        for (param, arg) in params.iter().zip(actual_args.iter()) {
+        for (param, arg) in params.iter().zip(head.iter()) {
             self.scopes.define(param, arg.clone());
         }
         // Bind the rest param to the surplus args as an array.
-        if let Some(rest_name) = &rest_param {
+        if let Some(rest_name) = rest_param {
             self.scopes.define(
                 rest_name.as_ref(),
-                TaggedValue::Arr(Rc::from(actual_args[params.len()..].to_vec())),
+                TaggedValue::Arr(Rc::from(tail.to_vec())),
             );
         }
         let result = self.exec_node_inner(body_ref);
         // Restore: truncate bindings and marks to pre-call state, discarding
-        // any scopes the body may have pushed, and restore the captured root
-        // and lexical floor.
+        // any scopes the body may have pushed, and restore the captured
+        // root, lexical floor, and active arena.
         self.scopes.bindings.truncate(saved_bindings_len);
         self.scopes.marks.truncate(saved_marks_len);
         self.scopes.captured_root = saved_captured;
         self.scopes.floor = saved_floor;
+        self.active_def = saved_def;
         result
     }
 }
@@ -1727,7 +1839,7 @@ impl NativeOpCtx for VmCtx<'_, '_, '_, '_> {
     }
 
     fn node_payload_at(&mut self, r: AstRef) -> Option<Value> {
-        self.frame.ast.at(r).ok().map(|n| n.payload.clone())
+        self.frame.cur_ast().at(r).ok().map(|n| n.payload.clone())
     }
 
     fn child_role_index(&mut self, role: &str) -> Option<usize> {
@@ -1748,7 +1860,7 @@ impl NativeOpCtx for VmCtx<'_, '_, '_, '_> {
 
     fn role_declared_at(&mut self, r: AstRef, role: &str) -> bool {
         self.frame
-            .ast
+            .cur_ast()
             .at(r)
             .ok()
             .and_then(|n| {
@@ -1763,7 +1875,7 @@ impl NativeOpCtx for VmCtx<'_, '_, '_, '_> {
 
     fn child_role_index_at(&mut self, r: AstRef, role: &str) -> Option<usize> {
         self.frame
-            .ast
+            .cur_ast()
             .at(r)
             .ok()
             .and_then(|n| self.frame.lang.child_role_index_for(n, role).ok().flatten())
@@ -1804,29 +1916,34 @@ impl NativeOpCtx for VmCtx<'_, '_, '_, '_> {
     fn try_pattern(&mut self, pattern: AstRef, scrutinee: &TaggedValue) -> Result<bool, LangError> {
         // `VmFrame` itself is the `PatternMatchCtx` (ADR-0061);
         // `try_pattern` works on `serde_json::Value` and binds into
-        // `self.frame.scopes` via `define_binding`.
-        pattern_match::try_pattern(
-            self.frame.ast,
-            pattern,
-            &tagged_to_value(scrutinee),
-            self.frame,
-        )
+        // `self.frame.scopes` via `define_binding`. The arena handle is
+        // copied/cloned out first so the `&mut self.frame` argument does
+        // not conflict with the arena borrow.
+        let arena_handle;
+        let ast: &Ast = match self.frame.active_def {
+            Some(slot) => {
+                arena_handle = Rc::clone(&self.frame.def_arenas[slot]);
+                &arena_handle
+            }
+            None => self.frame.ast,
+        };
+        pattern_match::try_pattern(ast, pattern, &tagged_to_value(scrutinee), self.frame)
     }
 
     fn node_kind_at(&mut self, r: AstRef) -> Option<String> {
-        self.frame.ast.get(r).map(|n| n.kind.clone())
+        self.frame.cur_ast().get(r).map(|n| n.kind.clone())
     }
 
     fn pattern_role_at(&mut self, r: AstRef, role: &str) -> Option<bool> {
         self.frame
-            .ast
+            .cur_ast()
             .get(r)
             .and_then(|n| self.frame.lang.pattern_role_is(&n.kind, role))
     }
 
     fn literal_child_at(&mut self, parent: AstRef, role: &str, child: AstRef) -> Option<bool> {
-        let parent_kind = self.frame.ast.get(parent)?.kind.clone();
-        let child_kind = self.frame.ast.get(child)?.kind.clone();
+        let parent_kind = self.frame.cur_ast().get(parent)?.kind.clone();
+        let child_kind = self.frame.cur_ast().get(child)?.kind.clone();
         self.frame
             .lang
             .literal_child(&parent_kind, role, &child_kind)
@@ -1836,9 +1953,43 @@ impl NativeOpCtx for VmCtx<'_, '_, '_, '_> {
         &mut self,
         r: AstRef,
     ) -> Result<(Vec<String>, Option<String>, bool), LangError> {
-        let node = self.frame.ast.at(r)?;
-        let (names, rest) = self.frame.lang.param_names(self.frame.ast, node)?;
+        let node = self.frame.cur_ast().at(r)?;
+        let (names, rest) = self
+            .frame
+            .lang
+            .param_names(self.frame.cur_ast(), node)?;
         Ok((names, rest, self.frame.lang.is_array_pattern(node)))
+    }
+
+    fn closure_body_def(
+        &mut self,
+        body: AstRef,
+        env: &std::collections::HashMap<Rc<str>, Value>,
+    ) -> Result<TaggedValue, LangError> {
+        // ADR-0106: extract the body into a standalone arena with `env`'s
+        // free variables substituted as `lit` nodes, then wrap as
+        // `{"__ast__": <Ast>}` — the arrow's self-describing definition.
+        let sub = self
+            .frame
+            .cur_ast()
+            .instantiate(body, self.frame.lang, env)?;
+        Ok(TaggedValue::from(handl_language::ast_value(&sub)))
+    }
+
+    fn rec_bound_names(&self) -> std::collections::HashSet<Rc<str>> {
+        self.frame.scopes.rec_names.iter().cloned().collect()
+    }
+
+    fn rec_region_enter(&mut self, names: &[Rc<str>]) {
+        let mark = self.frame.scopes.rec_names.len();
+        self.frame.scopes.rec_marks.push(mark);
+        self.frame.scopes.rec_names.extend(names.iter().cloned());
+    }
+
+    fn rec_region_exit(&mut self) {
+        if let Some(mark) = self.frame.scopes.rec_marks.pop() {
+            self.frame.scopes.rec_names.truncate(mark);
+        }
     }
 
     fn apply_arrow(
@@ -2782,11 +2933,18 @@ mod tests {
             AstNode::new("var").with_payload(json!("x")),
             AstNode::new("test").with_payload(json!({})),
         ]);
+        // ADR-0106: the arrow carries its body as a serialized standalone
+        // arena (`body_def`); the root is the arena's last node.
         let closure = json!({
             "__arrow__": true,
             "params": ["x"],
-            "body": 0,
-            "env": {},
+            "body_def": {
+                "__ast__": {
+                    "nodes": [
+                        { "kind": "var", "span": null, "payload": "x" }
+                    ]
+                }
+            },
         });
         let s = TermData::app(
             TermData::op("const", vec![], &ArrSource::Native, Some(closure.into())),
