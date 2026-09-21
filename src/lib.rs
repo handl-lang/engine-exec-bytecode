@@ -470,6 +470,11 @@ fn stamp_home(value: &mut Value, frame_id: u64) {
             {
                 o.insert("__home__".to_string(), Value::from(frame_id));
             }
+            // Arrow envs serialize by reference (`{"__envref__": id}`) —
+            // stamp env-resident arrows in `TaggedValue` space.
+            if let Some(id) = o.get("__envref__").and_then(|v| v.as_u64()) {
+                handl_value::stamp_env_home(id, frame_id);
+            }
             for v in o.values_mut() {
                 stamp_home(v, frame_id);
             }
