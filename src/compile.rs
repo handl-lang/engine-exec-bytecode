@@ -543,7 +543,7 @@ fn compile_arr(
         // (the type tag string). Compile the arg, then emit RouteOnType.
         "route_on_type" => {
             for arg in args {
-                let arg_pushed = compile_into_td(arg, lang, ast, node, out)?;
+                let arg_pushed = compile_op_arg(arg, lang, ast, node, out)?;
                 if arg_pushed {
                     out.push(Instr::PopScope);
                 }
@@ -640,7 +640,7 @@ fn compile_arr(
     }
 
     for arg in args {
-        let arg_pushed = compile_into_td(arg, lang, ast, node, out)?;
+        let arg_pushed = compile_op_arg(arg, lang, ast, node, out)?;
         if arg_pushed {
             out.push(Instr::PopScope);
         }
@@ -698,6 +698,31 @@ fn compile_arr(
         }
     }
     Ok(false)
+}
+
+/// Compile a single `Arr`/`Op` argument. A bare 0-arg native op that uses
+/// `incoming` (`id`, `truthy`, ...) in arg position sees the enclosing
+/// op's incoming — the frame incoming — per the tree-walk's arg evaluation
+/// (`eval_arr` evaluates each arg with the `Arr`'s incoming). Emitting
+/// `NativeOp(op, 0)` there would instead pop the previous arg's pushed
+/// result and underflow the enclosing op, so emit [`Instr::PushIncoming`].
+fn compile_op_arg(
+    arg: &TermData,
+    lang: &Language,
+    ast: &Ast,
+    node: &AstNode,
+    out: &mut Vec<Instr>,
+) -> Result<bool, LangError> {
+    if arg.tag() == "Op"
+        && arg.get_term_list("args").is_empty()
+        && arg.get("lit").filter(|v| !v.is_null()).is_none()
+        && matches!(arg.arr_source(), Some(ArrSource::Native))
+        && crate::vm::op_uses_incoming(arg.get_str("name").unwrap_or(""))
+    {
+        out.push(Instr::PushIncoming);
+        return Ok(false);
+    }
+    compile_into_td(arg, lang, ast, node, out)
 }
 
 /// `while_step`/`for_step`/`fix_step` — derived step ops that carry

@@ -622,7 +622,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
         if let Some(v) = &incoming {
             stack.push(v.clone());
         }
-        let mut current_incoming = incoming;
+        let mut current_incoming = incoming.clone();
         let mut loop_counter: usize = 0;
         const MAX_ITERS: usize = 100_000;
         let mut loop_input: Option<TaggedValue> = None;
@@ -875,6 +875,9 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 Instr::Jump(target) => {
                     ip = *target;
                     continue;
+                }
+                Instr::PushIncoming => {
+                    stack.push(incoming.clone().unwrap_or(TaggedValue::Null));
                 }
                 Instr::RouteOnType(tag) => {
                     let val = stack.pop().ok_or_else(|| {
@@ -1781,10 +1784,11 @@ impl<'a, 'h> VmFrame<'a, 'h> {
 /// Ops that use `incoming` with 0 args pop the incoming value from the stack
 /// (it's the value flowing through the arrow). Ops that don't use `incoming`
 /// (like `closure`) don't pop anything for a 0-arg call.
-fn op_uses_incoming(op: &str) -> bool {
+pub(crate) fn op_uses_incoming(op: &str) -> bool {
     matches!(
         op,
         "id" | "tag"
+            | "pair_tag"
             | "truthy"
             | "is_pos"
             | "dec"

@@ -229,6 +229,17 @@ pub enum Instr {
     /// executes.
     Jump(usize),
 
+    /// Push the frame's incoming value (the value 0-arg incoming-ops pop
+    /// from the stack when they sit in pipe position).
+    ///
+    /// Emitted for a bare 0-arg incoming-op (`id`, `truthy`, ...) used as
+    /// an `Arr`/`Op` **arg**: there the op must see the enclosing op's
+    /// incoming — the frame incoming — not the operand-stack top, which
+    /// holds earlier args' pushed results. Compiling it as
+    /// `NativeOp(op, 0)` would pop a sibling arg and underflow the
+    /// enclosing op.
+    PushIncoming,
+
     /// Pop `n` argument values, apply the native op `op`, and push the
     /// result.
     ///
