@@ -132,12 +132,18 @@ fn compile_into_td(
                 // `∘₀` on 1-cells — sequential composition (`>>>`).
                 Some(0) if fst_dim <= 1 => {
                     let fst_pushed = compile_into_td(&fst, lang, ast, node, out)?;
+                    // fst's result is now the current incoming — snd's
+                    // arg-position incoming-ops (`PushIncoming`) read it
+                    // from the `current_incoming` register, which the
+                    // frame `incoming` param doesn't track.
+                    out.push(Instr::SetIncoming);
                     let snd_pushed = compile_into_td(&snd, lang, ast, node, out)?;
                     // Pop the scope `fst` reported (e.g. extend_env as fst),
                     // matching the tree-walk's Seq scope discipline.
                     if fst_pushed {
                         out.push(Instr::PopScope);
                     }
+                    out.push(Instr::RestoreIncoming);
                     // Propagate snd_pushed: an extend_env in snd position
                     // (the Bind lowering shape) is popped by the *enclosing*
                     // Seq.
@@ -207,20 +213,27 @@ fn compile_into_td(
             // ChoiceJump(left_target, right_target) -- placeholder.
             let cj_pos = out.len();
             out.push(Instr::ChoiceJump(0, 0));
-            // Left branch.
+            // Left branch. `SetIncoming` makes the routed value the arm's
+            // incoming (arg-position ops read the `current_incoming`
+            // register, not the stack top); `RestoreIncoming` before the
+            // merge so later sibling args see the enclosing incoming.
             let left_target = out.len();
+            out.push(Instr::SetIncoming);
             let l_pushed = compile_into_td(&l, lang, ast, node, out)?;
             if l_pushed {
                 out.push(Instr::PopScope);
             }
+            out.push(Instr::RestoreIncoming);
             let left_jump_pos = out.len();
             out.push(Instr::Jump(0)); // placeholder -- skip right branch
             // Right branch.
             let right_target = out.len();
+            out.push(Instr::SetIncoming);
             let r_pushed = compile_into_td(&r, lang, ast, node, out)?;
             if r_pushed {
                 out.push(Instr::PopScope);
             }
+            out.push(Instr::RestoreIncoming);
             let end = out.len();
             // Patch ChoiceJump and the left-branch Jump.
             out[cj_pos] = Instr::ChoiceJump(left_target, right_target);
@@ -658,15 +671,18 @@ fn compile_arr(
             // instead of `NativeOp(op, 2)` for the common binary numeric
             // ops. This avoids the per-op `Vec` allocation and string
             // dispatch in the VM. Results are identical to the `NativeOp`
-            // path.
-            } else if let Some(typed) = typed_binary_instr(op) {
-                out.push(typed);
-            } else if let Some(arith) = arith_instr(op) {
+            // path. Gated on exact arity: the typed instrs pop a fixed
+            // operand count, so n-ary applications (`sub(10,3,2)`) must
+            // fall through to `NativeOp`, which left-folds via
+            // `native_ops` — the shared n-ary convention.
+            } else if args.len() == 2 && typed_binary_instr(op).is_some() {
+                out.push(typed_binary_instr(op).expect("checked"));
+            } else if arith_arity(op) == Some(args.len()) {
                 // ADR-0103: migrate the remaining arithmetic/logic ops
                 // (`neg`/`and`/`or`/`not`) that currently go through
                 // `NativeOp` to the consolidated `Arith` hardware-boundary
                 // instruction. Results are identical to the `NativeOp` path.
-                out.push(Instr::Arith(arith));
+                out.push(Instr::Arith(arith_instr(op).expect("checked")));
             } else {
                 out.push(Instr::NativeOp(op.to_string(), args.len()));
             }
@@ -701,11 +717,13 @@ fn compile_arr(
 }
 
 /// Compile a single `Arr`/`Op` argument. A bare 0-arg native op that uses
-/// `incoming` (`id`, `truthy`, ...) in arg position sees the enclosing
-/// op's incoming — the frame incoming — per the tree-walk's arg evaluation
-/// (`eval_arr` evaluates each arg with the `Arr`'s incoming). Emitting
-/// `NativeOp(op, 0)` there would instead pop the previous arg's pushed
-/// result and underflow the enclosing op, so emit [`Instr::PushIncoming`].
+/// `incoming` (`id`, `inc`, `truthy`, ...) in arg position sees the
+/// enclosing op's incoming — the region's current incoming — per the
+/// tree-walk's arg evaluation (`eval_arr` evaluates each arg with the
+/// `Arr`'s incoming). Emitting a bare `NativeOp(op, 0)` there would
+/// instead pop the previous arg's pushed result and underflow the
+/// enclosing op, so emit [`Instr::PushIncoming`] first — the `NativeOp`
+/// then pops that copy and applies the op.
 fn compile_op_arg(
     arg: &TermData,
     lang: &Language,
@@ -720,6 +738,10 @@ fn compile_op_arg(
         && crate::vm::op_uses_incoming(arg.get_str("name").unwrap_or(""))
     {
         out.push(Instr::PushIncoming);
+        out.push(Instr::NativeOp(
+            arg.get_str("name").unwrap_or("").to_string(),
+            0,
+        ));
         return Ok(false);
     }
     compile_into_td(arg, lang, ast, node, out)
@@ -773,6 +795,18 @@ fn arith_instr(op: &str) -> Option<ArithOp> {
         "and" => ArithOp::And,
         "or" => ArithOp::Or,
         "not" => ArithOp::Not,
+        _ => return None,
+    })
+}
+
+/// The exact operand count an [`ArithOp`] instruction pops — `neg`/`not`
+/// are unary, `and`/`or` binary. `None` for ops without an `Arith` form.
+/// N-ary applications (`and(t,t,f)`) fall through to `NativeOp`, which
+/// folds via `native_ops`.
+fn arith_arity(op: &str) -> Option<usize> {
+    Some(match op {
+        "neg" | "not" => 1,
+        "and" | "or" => 2,
         _ => return None,
     })
 }
@@ -1180,7 +1214,9 @@ mod tests {
             instrs,
             vec![
                 Instr::Push(json!(5)),
+                Instr::SetIncoming, // snd's incoming = fst's result
                 Instr::NativeOp("id".into(), 0),
+                Instr::RestoreIncoming,
                 Instr::Return,
             ]
         );
@@ -1206,10 +1242,14 @@ mod tests {
             instrs,
             vec![
                 Instr::Push(json!(5)),    // 0: const 5
-                Instr::Store("x".into()), // 1: extend_env "x"
-                Instr::Load("x".into()),  // 2: proj_env "x"
-                Instr::PopScope,          // 3: pop scope (outer Seq)
-                Instr::Return,            // 4
+                Instr::SetIncoming,       // 1: inner Seq snd incoming = 5
+                Instr::Store("x".into()), // 2: extend_env "x"
+                Instr::RestoreIncoming,   // 3: inner Seq done
+                Instr::SetIncoming,       // 4: outer Seq snd incoming
+                Instr::Load("x".into()),  // 5: proj_env "x"
+                Instr::PopScope,          // 6: pop scope (outer Seq)
+                Instr::RestoreIncoming,   // 7: outer Seq done
+                Instr::Return,            // 8
             ]
         );
     }
@@ -1247,11 +1287,15 @@ mod tests {
         assert_eq!(
             instrs,
             vec![
-                Instr::ChoiceJump(1, 3), // 0: route left/right
-                Instr::Push(json!(1)),   // 1: left branch
-                Instr::Jump(4),          // 2: skip right
-                Instr::Push(json!(2)),   // 3: right branch
-                Instr::Return,           // 4: end
+                Instr::ChoiceJump(1, 5),  // 0: route left/right
+                Instr::SetIncoming,       // 1: left arm incoming = routed val
+                Instr::Push(json!(1)),    // 2: left branch
+                Instr::RestoreIncoming,   // 3
+                Instr::Jump(8),           // 4: skip right
+                Instr::SetIncoming,       // 5: right arm incoming = routed val
+                Instr::Push(json!(2)),    // 6: right branch
+                Instr::RestoreIncoming,   // 7
+                Instr::Return,            // 8: end
             ]
         );
     }
@@ -1345,12 +1389,20 @@ mod tests {
             instrs,
             vec![
                 Instr::Push(json!(true)),         // 0: const true
-                Instr::NativeOp("tag".into(), 0), // 1: tag
-                Instr::ChoiceJump(3, 5),          // 2: route left/right
-                Instr::Push(json!("yes")),        // 3: left (then)
-                Instr::Jump(6),                   // 4: skip right
-                Instr::Push(json!("no")),         // 5: right (else)
-                Instr::Return,                    // 6: end
+                Instr::SetIncoming,               // 1: inner Seq snd incoming
+                Instr::NativeOp("tag".into(), 0), // 2: tag
+                Instr::RestoreIncoming,           // 3: inner Seq done
+                Instr::SetIncoming,               // 4: outer Seq snd incoming = Either
+                Instr::ChoiceJump(6, 10),         // 5: route left/right
+                Instr::SetIncoming,               // 6: left arm incoming = routed val
+                Instr::Push(json!("yes")),        // 7: left (then)
+                Instr::RestoreIncoming,           // 8
+                Instr::Jump(13),                  // 9: skip right
+                Instr::SetIncoming,               // 10: right arm incoming
+                Instr::Push(json!("no")),         // 11: right (else)
+                Instr::RestoreIncoming,           // 12
+                Instr::RestoreIncoming,           // 13: outer Seq done
+                Instr::Return,                    // 14: end
             ]
         );
     }

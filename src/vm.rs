@@ -626,6 +626,10 @@ impl<'a, 'h> VmFrame<'a, 'h> {
             stack.push(v.clone());
         }
         let mut current_incoming = incoming.clone();
+        // Save-stack for `SetIncoming`/`RestoreIncoming` pairs so a
+        // `Seq`/`Choice` nested inside an `Arr` arg region restores the
+        // enclosing region's incoming for later sibling args.
+        let mut incoming_save: Vec<Option<TaggedValue>> = Vec::new();
         let mut loop_counter: usize = 0;
         const MAX_ITERS: usize = 100_000;
         let mut loop_input: Option<TaggedValue> = None;
@@ -880,7 +884,14 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     continue;
                 }
                 Instr::PushIncoming => {
-                    stack.push(incoming.clone().unwrap_or(TaggedValue::Null));
+                    stack.push(current_incoming.clone().unwrap_or(TaggedValue::Null));
+                }
+                Instr::SetIncoming => {
+                    incoming_save.push(current_incoming.take());
+                    current_incoming = stack.last().cloned();
+                }
+                Instr::RestoreIncoming => {
+                    current_incoming = incoming_save.pop().flatten();
                 }
                 Instr::RouteOnType(tag) => {
                     let val = stack.pop().ok_or_else(|| {
@@ -915,7 +926,12 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     } else if *n == 0 && op_uses_incoming(op) {
                         stack.pop()
                     } else {
-                        current_incoming.take()
+                        // Clone, not take: arg-position incoming-ops and
+                        // the enclosing op share the region's incoming
+                        // (tree-walk passes the same `incoming` to every
+                        // subterm) — consuming it here would starve a
+                        // later sibling op in the same region.
+                        current_incoming.clone()
                     };
                     let mut args = Vec::with_capacity(*n);
                     for _ in 0..*n {

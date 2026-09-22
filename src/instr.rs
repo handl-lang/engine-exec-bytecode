@@ -229,16 +229,36 @@ pub enum Instr {
     /// executes.
     Jump(usize),
 
-    /// Push the frame's incoming value (the value 0-arg incoming-ops pop
+    /// Push the current incoming value (the value 0-arg incoming-ops pop
     /// from the stack when they sit in pipe position).
     ///
     /// Emitted for a bare 0-arg incoming-op (`id`, `truthy`, ...) used as
     /// an `Arr`/`Op` **arg**: there the op must see the enclosing op's
-    /// incoming — the frame incoming — not the operand-stack top, which
-    /// holds earlier args' pushed results. Compiling it as
+    /// incoming — the region's current incoming — not the operand-stack
+    /// top, which holds earlier args' pushed results. Compiling it as
     /// `NativeOp(op, 0)` would pop a sibling arg and underflow the
     /// enclosing op.
+    ///
+    /// Reads the frame's `current_incoming` register, which `SetIncoming`
+    /// updates at `Seq{0}`/`Choice` incoming-boundaries (the register
+    /// holds the frame's `incoming` at entry). A bare `PushIncoming`
+    /// reading `incoming` directly would see `None` under `Seq` — the
+    /// pipeline value flows through the operand stack there.
     PushIncoming,
+
+    /// Save `current_incoming` and set it to the operand-stack top.
+    ///
+    /// Emitted at incoming-boundaries: after `Seq{0}`'s `fst` compiles
+    /// (so `snd` sees the predecessor's result) and at the head of each
+    /// `Choice` arm (so the arm sees the routed value). Paired with
+    /// [`RestoreIncoming`] when the region ends, so a `Seq`/`Choice`
+    /// nested inside an `Arr` arg doesn't leak its incoming to sibling
+    /// args.
+    SetIncoming,
+
+    /// Restore `current_incoming` to the value saved by the matching
+    /// [`SetIncoming`].
+    RestoreIncoming,
 
     /// Pop `n` argument values, apply the native op `op`, and push the
     /// result.
