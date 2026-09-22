@@ -502,17 +502,20 @@ impl<'a, 'h> VmFrame<'a, 'h> {
 /// (which uses `self.ast` internally; the `ast` parameter from the trait
 /// is the same AST).
 impl<'a, 'h> PatternMatchCtx for VmFrame<'a, 'h> {
-    fn define_binding(&mut self, name: &str, value: Value) {
-        self.scopes.define(name, TaggedValue::from(value));
+    fn define_binding(&mut self, name: &str, value: TaggedValue) {
+        self.scopes.define(name, value);
     }
 
-    fn eval_pattern_node(&mut self, _ast: &Ast, node_ref: AstRef) -> Result<Value, LangError> {
-        let val = self.exec_node_inner(node_ref)?;
-        Ok(tagged_to_value(&val))
+    fn eval_pattern_node(
+        &mut self,
+        _ast: &Ast,
+        node_ref: AstRef,
+    ) -> Result<TaggedValue, LangError> {
+        self.exec_node_inner(node_ref)
     }
 
-    fn global_value(&self, name: &str) -> Option<Value> {
-        self.scopes.globals.get(name).map(tagged_to_value)
+    fn global_value(&self, name: &str) -> Option<TaggedValue> {
+        self.scopes.globals.get(name).cloned()
     }
 
     fn lang(&self) -> Option<&Language> {
@@ -1919,7 +1922,7 @@ impl NativeOpCtx for VmCtx<'_, '_, '_, '_> {
 
     fn try_pattern(&mut self, pattern: AstRef, scrutinee: &TaggedValue) -> Result<bool, LangError> {
         // `VmFrame` itself is the `PatternMatchCtx` (ADR-0061);
-        // `try_pattern` works on `serde_json::Value` and binds into
+        // `try_pattern` works on `TaggedValue` directly and binds into
         // `self.frame.scopes` via `define_binding`. The arena handle is
         // copied/cloned out first so the `&mut self.frame` argument does
         // not conflict with the arena borrow.
@@ -1931,7 +1934,7 @@ impl NativeOpCtx for VmCtx<'_, '_, '_, '_> {
             }
             None => self.frame.ast,
         };
-        pattern_match::try_pattern(ast, pattern, &tagged_to_value(scrutinee), self.frame)
+        pattern_match::try_pattern(ast, pattern, scrutinee, self.frame)
     }
 
     fn node_kind_at(&mut self, r: AstRef) -> Option<String> {
