@@ -104,6 +104,7 @@ impl FfiRegistry {
     }
 
     /// Register a host function under `(module, name)`.
+    #[cfg(test)]
     pub(crate) fn register(&mut self, module: &str, name: &str, f: FfiFn) {
         self.fns.insert((module.to_string(), name.to_string()), f);
     }
@@ -442,6 +443,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
     }
 
     /// Define a global variable in the root scope (for unit tests).
+    #[cfg(test)]
     pub(crate) fn define_global(&mut self, name: &str, value: TaggedValue) {
         self.scopes.define(name, value);
     }
@@ -450,6 +452,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
     ///
     /// The function receives the popped argument values (as `serde_json::
     /// Value`) and returns a result value or an error message.
+    #[cfg(test)]
     pub(crate) fn register_ffi(
         &mut self,
         module: &str,
@@ -592,6 +595,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
     /// This is the public(crate) boundary: accepts and returns
     /// [`serde_json::Value`], converting to/from the internal
     /// [`TaggedValue`] representation.
+    #[cfg(test)]
     pub(crate) fn exec_instrs(
         &mut self,
         instrs: &[Instr],
