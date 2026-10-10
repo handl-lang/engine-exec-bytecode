@@ -1222,9 +1222,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                         std::collections::HashMap::with_capacity(captured.len());
                     let mut binds: FxHashMap<Rc<str>, TaggedValue> = FxHashMap::default();
                     for (name, value) in captured.iter() {
-                        if self.scopes.rec_names.contains(name)
-                            || !native_ops::arrow_free(value)
-                        {
+                        if self.scopes.rec_names.contains(name) || !native_ops::arrow_free(value) {
                             binds.insert(Rc::clone(name), value.clone());
                         } else {
                             subst.insert(Rc::clone(name), tagged_to_value(value));
@@ -1726,8 +1724,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
         // args, evaluate the body, then apply the result to the surplus —
         // `f(1, 5)` on a curried arrow is `(f 1) 5`.
         let (head, mut rest) = actual_args.split_at(params.len());
-        let mut val =
-            self.apply_arrow_body(&params, None, &body_def, &binds, head, &[], node)?;
+        let mut val = self.apply_arrow_body(&params, None, &body_def, &binds, head, &[], node)?;
         while !rest.is_empty() {
             val = self.apply_app(&val, rest, node)?;
             rest = &[];
@@ -1981,10 +1978,7 @@ impl NativeOpCtx for VmCtx<'_, '_, '_, '_> {
         r: AstRef,
     ) -> Result<(Vec<String>, Option<String>, bool), LangError> {
         let node = self.frame.cur_ast().at(r)?;
-        let (names, rest) = self
-            .frame
-            .lang
-            .param_names(self.frame.cur_ast(), node)?;
+        let (names, rest) = self.frame.lang.param_names(self.frame.cur_ast(), node)?;
         Ok((names, rest, self.frame.lang.is_array_pattern(node)))
     }
 

@@ -1287,15 +1287,15 @@ mod tests {
         assert_eq!(
             instrs,
             vec![
-                Instr::ChoiceJump(1, 5),  // 0: route left/right
-                Instr::SetIncoming,       // 1: left arm incoming = routed val
-                Instr::Push(json!(1)),    // 2: left branch
-                Instr::RestoreIncoming,   // 3
-                Instr::Jump(8),           // 4: skip right
-                Instr::SetIncoming,       // 5: right arm incoming = routed val
-                Instr::Push(json!(2)),    // 6: right branch
-                Instr::RestoreIncoming,   // 7
-                Instr::Return,            // 8: end
+                Instr::ChoiceJump(1, 5), // 0: route left/right
+                Instr::SetIncoming,      // 1: left arm incoming = routed val
+                Instr::Push(json!(1)),   // 2: left branch
+                Instr::RestoreIncoming,  // 3
+                Instr::Jump(8),          // 4: skip right
+                Instr::SetIncoming,      // 5: right arm incoming = routed val
+                Instr::Push(json!(2)),   // 6: right branch
+                Instr::RestoreIncoming,  // 7
+                Instr::Return,           // 8: end
             ]
         );
     }
