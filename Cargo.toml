@@ -2,6 +2,9 @@
 name = "handl-plugin-engine-exec-bytecode"
 version.workspace = true
 edition.workspace = true
+description = "The **bytecode eval engine** for the eval operation (ADR-0044 §4, §7)."
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 handl-language = { path = "../handl-language" }
