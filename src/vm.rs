@@ -1688,6 +1688,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 head,
                 tail,
                 node,
+                callee,
             );
         }
         // Positional arrows: ADR-0074 multi-param arrows may receive a
@@ -1718,13 +1719,14 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 head,
                 tail,
                 node,
+                callee,
             );
         }
         // Curried application (ADR-0074): apply the first `params.len()`
         // args, evaluate the body, then apply the result to the surplus —
         // `f(1, 5)` on a curried arrow is `(f 1) 5`.
         let (head, mut rest) = actual_args.split_at(params.len());
-        let mut val = self.apply_arrow_body(&params, None, &body_def, &binds, head, &[], node)?;
+        let mut val = self.apply_arrow_body(&params, None, &body_def, &binds, head, &[], node, callee)?;
         while !rest.is_empty() {
             val = self.apply_app(&val, rest, node)?;
             rest = &[];
@@ -1753,6 +1755,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
         head: &[TaggedValue],
         tail: &[TaggedValue],
         node: &AstNode,
+        self_val: &TaggedValue,
     ) -> Result<TaggedValue, LangError> {
         let slot = self
             .def_arena_slot(body_def)
@@ -1776,6 +1779,15 @@ impl<'a, 'h> VmFrame<'a, 'h> {
         self.scopes.floor = saved_bindings_len;
         self.scopes.captured_root = Some(Rc::clone(binds));
         self.scopes.push_scope();
+        // Self-reference markers (mirrors the tree-walk apply): a `binds`
+        // entry holding `self_ref_marker()` is rebound to the arrow under
+        // application so a self-recursive name resolves to the arrow
+        // itself — the marker is serializable data, no cyclic env.
+        for (name, v) in binds.iter() {
+            if handl_value::is_self_ref_marker(v) {
+                self.scopes.define(name, self_val.clone());
+            }
+        }
         for (param, arg) in params.iter().zip(head.iter()) {
             self.scopes.define(param, arg.clone());
         }
