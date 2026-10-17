@@ -7,15 +7,15 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-handl-language = { path = "../handl-language" }
+handl-language = { workspace = true }
 handl-platform = { path = "../platform" }
-plugin-engine = { path = "../plugin-engine" }
+plugin-engine = { workspace = true }
 handl-plugin-engine-exec = { path = "../plugin-engine-exec" }
 handl-plugin-engine-exec-tree-walk = { path = "../plugin-engine-exec-tree-walk" }
 handl-plugin-engine-transform = { path = "../plugin-engine-transform" }
 handl-plugin-engine-transform-rewrite = { path = "../plugin-engine-transform-rewrite" }
 handl-runtime = { path = "../handl-runtime" }
-handl-value = { path = "../handl-value" }
+handl-value = { workspace = true }
 serde_json = { workspace = true }
 rustc-hash = "2"
 
