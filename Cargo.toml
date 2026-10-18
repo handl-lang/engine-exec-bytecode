@@ -168,7 +168,7 @@ handl-lib-mood = { path = "../lib-mood" }
 handl-lib-obj = { path = "../lib-obj" }
 
 [patch."https://github.com/handl-lang/lib-ops"]
-handl-lib-ops = { path = "../lib-ops" }
+handl-lib-ops = { path = "../kernel/crates/ops" }
 
 [patch."https://github.com/handl-lang/lib-option"]
 handl-lib-option = { path = "../lib-option" }
@@ -183,10 +183,10 @@ handl-plugin-lib-otlp-std = { path = "../lib-otlp-std" }
 handl-lib-parse = { path = "../lib-parse" }
 
 [patch."https://github.com/handl-lang/lib-prim"]
-handl-lib-prim = { path = "../lib-prim" }
+handl-lib-prim = { path = "../kernel/crates/prim" }
 
 [patch."https://github.com/handl-lang/lib-prim-handl"]
-handl-lib-prim-handl = { path = "../lib-prim-handl" }
+handl-lib-prim-handl = { path = "../kernel/crates/prim-handl" }
 
 [patch."https://github.com/handl-lang/lib-rand-c"]
 handl-lib-rand-c = { path = "../lib-rand-c" }
