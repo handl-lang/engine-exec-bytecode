@@ -194,7 +194,6 @@ handl-lib-url-whatwg = { path = "../lib-url-whatwg" }
 handl-lib-utils = { path = "../lib-utils" }
 
 [patch."https://github.com/handl-lang/native"]
-hnl-engine-exec-cranelift = { path = "../native/modules/exec-cranelift" }
 
 [patch."https://github.com/handl-lang/otlp"]
 handl-plugin-lib-otlp = { path = "../otlp/modules/lib-otlp" }
@@ -223,3 +222,6 @@ handl-plugin-lib-lang-parse = { path = "../stdlib/modules/lib-lang-parse" }
 handl-plugin-lib-lang-run-compiled = { path = "../stdlib/modules/lib-lang-run-compiled" }
 handl-plugin-lib-lang-typecheck = { path = "../stdlib/modules/lib-lang-typecheck" }
 handl-plugin-lib-stdlib = { path = "../stdlib/crates/plugin-lib-stdlib" }
+
+[patch."https://github.com/handl-lang/engine-exec-cranelift"]
+hnl-engine-exec-cranelift = { path = "../engine-exec-cranelift" }
