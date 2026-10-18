@@ -970,6 +970,14 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     let result = self.apply_native_v2(op, &args, node, inc)?;
                     stack.push(result);
                 }
+                Instr::SubProgram(prog) => {
+                    // Detached `Seq`/`Choice` arg — run on a fresh stack
+                    // with the region's incoming; only the sub-program's
+                    // top result returns (see `Instr::SubProgram`).
+                    let result =
+                        self.exec_instrs_inner(prog, node, current_incoming.clone())?;
+                    stack.push(result);
+                }
                 Instr::ArrDispatch(n) => {
                     // `arr <op>` (`Op { name: "$payload" }`): the op name
                     // lives in the node's payload — a bare string, or the

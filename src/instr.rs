@@ -313,6 +313,21 @@ pub enum Instr {
     /// leftovers are discarded and only the top (the result) is returned.
     FirstOp(usize, usize),
 
+    /// Run a detached arg sub-program on a fresh operand stack with
+    /// `current_incoming` as its incoming, pushing the sub-program's
+    /// top result.
+    ///
+    /// Compiled op args are emitted inline by default; a `Seq`/`Choice`
+    /// arg is compiled into a detached program and wrapped in
+    /// `SubProgram` instead. An inline `Seq` leaves its `fst` result on
+    /// the stack beneath `snd`'s (the `SetIncoming` discipline — a
+    /// later op either pops the fst residue as its incoming or reads it
+    /// via the `current_incoming` register), so an enclosing
+    /// `NativeOp(op, n)` would pop residue from earlier args instead of
+    /// their results. A detached program discards the residue: it runs
+    /// on its own stack and only the top — the arg's value — returns.
+    SubProgram(Rc<Vec<Instr>>),
+
     /// Pop two values `a` (top) and `b` (below), push the pair
     /// `{"__pair__": [b, a]}`.
     ///

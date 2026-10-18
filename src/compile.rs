@@ -26,6 +26,7 @@ use std::rc::Rc;
 
 use handl_language::{ArrSource, Language, Term};
 use handl_language::{Ast, AstNode, AstRef, LangError, Value};
+use handl_plugin_engine_exec::native_ops;
 use plugin_engine::TermData;
 
 use crate::instr::{ArithOp, Instr};
@@ -684,7 +685,15 @@ fn compile_arr(
                 // instruction. Results are identical to the `NativeOp` path.
                 out.push(Instr::Arith(arith_instr(op).expect("checked")));
             } else {
-                out.push(Instr::NativeOp(op.to_string(), args.len()));
+                // `NativeOp` cannot carry `lit`, so term-level lit ops
+                // (`elem`, `field_access`, `has_field`, `obj_except`,
+                // `arr_drop`, `json`) bake the literal into the op name
+                // as `<op>:<json-lit>` — the `route_on_type:` convention;
+                // `native_ops::apply_native_op` decodes it.
+                let name = lit
+                    .and_then(|l| native_ops::bake_lit_name(op, l))
+                    .unwrap_or_else(|| op.to_string());
+                out.push(Instr::NativeOp(name, args.len()));
             }
         }
         ArrSource::Foreign(name) => {
@@ -731,6 +740,20 @@ fn compile_op_arg(
     node: &AstNode,
     out: &mut Vec<Instr>,
 ) -> Result<bool, LangError> {
+    // `Seq`/`Choice` args run as detached sub-programs: an inline `Seq`
+    // leaves its `fst` result on the stack beneath `snd`'s (the
+    // `SetIncoming` discipline — a later op pops the residue as its
+    // incoming or copies it via `PushIncoming`), so an enclosing
+    // `NativeOp(op, n)` would pop residue from earlier args instead of
+    // their results. The sub-program runs on a fresh stack with the
+    // region's incoming; only its top — the arg's value — returns to
+    // the operand stack.
+    if matches!(arg.tag(), "Seq" | "Choice") {
+        let mut sub = Vec::new();
+        compile_into_td(arg, lang, ast, node, &mut sub)?;
+        out.push(Instr::SubProgram(Rc::new(sub)));
+        return Ok(false);
+    }
     if arg.tag() == "Op"
         && arg.get_term_list("args").is_empty()
         && arg.get("lit").filter(|v| !v.is_null()).is_none()
