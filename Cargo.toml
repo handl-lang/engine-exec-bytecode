@@ -1,25 +1,225 @@
 [package]
-name = "handl-plugin-engine-exec-bytecode"
-version.workspace = true
-edition.workspace = true
+name = "hnl-engine-exec-bytecode"
+version = "0.1.0"
+edition = "2024"
 description = "The **bytecode eval engine** for the eval operation (ADR-0044 §4, §7)."
-license.workspace = true
-repository.workspace = true
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/handl-lang/engine-exec-bytecode"
 
 [dependencies]
-handl-language = { workspace = true }
-handl-platform = { path = "../platform" }
-plugin-engine = { workspace = true }
-handl-plugin-engine-exec = { path = "../plugin-engine-exec" }
-handl-plugin-engine-exec-tree-walk = { path = "../plugin-engine-exec-tree-walk" }
-handl-plugin-engine-transform = { path = "../plugin-engine-transform" }
-handl-plugin-engine-transform-rewrite = { path = "../plugin-engine-transform-rewrite" }
-handl-runtime = { path = "../handl-runtime" }
-handl-value = { workspace = true }
-serde_json = { workspace = true }
+handl-language = { git = "https://github.com/handl-lang/kernel", branch = "main" }
+handl-platform = { git = "https://github.com/handl-lang/platform", branch = "main" }
+hnl-engine = { git = "https://github.com/handl-lang/engine", branch = "main" }
+hnl-engine-exec = { git = "https://github.com/handl-lang/engine-exec", branch = "main" }
+hnl-engine-exec-tree-walk = { git = "https://github.com/handl-lang/engine-exec-tree-walk", branch = "main" }
+hnl-engine-transform = { git = "https://github.com/handl-lang/engine-transform", branch = "main" }
+hnl-engine-transform-rewrite = { git = "https://github.com/handl-lang/engine-transform-rewrite", branch = "main" }
+handl-runtime = { git = "https://github.com/handl-lang/platform", branch = "main" }
+handl-value = { git = "https://github.com/handl-lang/kernel", branch = "main" }
+serde_json = "1"
 rustc-hash = "2"
 
 [dev-dependencies]
-handl-test-utils = { path = "../handl-test-utils" }
-handl-plugin-module = { path = "../plugin-module" }
-serde_json = { workspace = true }
+handl-test-utils = { git = "https://github.com/handl-lang/platform", branch = "main" }
+handl-plugin-module = { git = "https://github.com/handl-lang/platform", branch = "main" }
+serde_json = "1"
+
+[patch."https://github.com/handl-lang/engine"]
+hnl-engine = { path = "../engine" }
+
+[patch."https://github.com/handl-lang/engine-exec"]
+hnl-engine-exec = { path = "../engine-exec" }
+
+[patch."https://github.com/handl-lang/engine-exec-bytecode"]
+hnl-engine-exec-bytecode = { path = "../engine-exec-bytecode" }
+
+[patch."https://github.com/handl-lang/engine-exec-tree-walk"]
+hnl-engine-exec-tree-walk = { path = "../engine-exec-tree-walk" }
+
+[patch."https://github.com/handl-lang/engine-lex"]
+hnl-engine-lex = { path = "../engine-lex" }
+
+[patch."https://github.com/handl-lang/engine-lex-pattern"]
+hnl-engine-lex-pattern = { path = "../engine-lex-pattern" }
+
+[patch."https://github.com/handl-lang/engine-lint"]
+hnl-engine-lint = { path = "../engine-lint" }
+
+[patch."https://github.com/handl-lang/engine-parse"]
+hnl-engine-parse = { path = "../engine-parse" }
+
+[patch."https://github.com/handl-lang/engine-parse-pratt"]
+hnl-engine-parse-pratt = { path = "../engine-parse-pratt" }
+
+[patch."https://github.com/handl-lang/engine-transform"]
+hnl-engine-transform = { path = "../engine-transform" }
+
+[patch."https://github.com/handl-lang/engine-transform-rewrite"]
+hnl-engine-transform-rewrite = { path = "../engine-transform-rewrite" }
+
+[patch."https://github.com/handl-lang/engine-typecheck"]
+hnl-engine-typecheck = { path = "../engine-typecheck" }
+
+[patch."https://github.com/handl-lang/engine-typecheck-handl"]
+hnl-engine-typecheck-handl = { path = "../engine-typecheck-handl" }
+
+[patch."https://github.com/handl-lang/ffi"]
+handl-plugin-ffi = { path = "../ffi/modules/ffi" }
+
+[patch."https://github.com/handl-lang/kernel"]
+handl-language = { path = "../kernel/crates/handl-language" }
+handl-value = { path = "../kernel/crates/handl-value" }
+
+[patch."https://github.com/handl-lang/kit-canonical"]
+handl-kit-canonical = { path = "../kit-canonical/crates/kit-canonical" }
+
+[patch."https://github.com/handl-lang/lang"]
+handl-kit-data-canonical = { path = "../lang/crates/handl-kit-data-canonical" }
+
+[patch."https://github.com/handl-lang/lib-archive"]
+handl-lib-archive = { path = "../lib-archive" }
+
+[patch."https://github.com/handl-lang/lib-arrow-iter"]
+handl-lib-arrow-iter = { path = "../lib-arrow-iter" }
+
+[patch."https://github.com/handl-lang/lib-base64"]
+handl-lib-base64 = { path = "../lib-base64" }
+
+[patch."https://github.com/handl-lang/lib-bytes"]
+handl-lib-bytes = { path = "../lib-bytes" }
+
+[patch."https://github.com/handl-lang/lib-char"]
+handl-lib-char = { path = "../lib-char" }
+
+[patch."https://github.com/handl-lang/lib-cmp"]
+handl-lib-cmp = { path = "../lib-cmp" }
+
+[patch."https://github.com/handl-lang/lib-collections"]
+handl-lib-collections = { path = "../lib-collections" }
+
+[patch."https://github.com/handl-lang/lib-combinators"]
+handl-lib-combinators = { path = "../lib-combinators" }
+
+[patch."https://github.com/handl-lang/lib-datetime"]
+handl-lib-datetime = { path = "../lib-datetime" }
+
+[patch."https://github.com/handl-lang/lib-dedent"]
+handl-lib-dedent = { path = "../lib-dedent" }
+
+[patch."https://github.com/handl-lang/lib-encoding"]
+handl-lib-encoding = { path = "../lib-encoding" }
+
+[patch."https://github.com/handl-lang/lib-error"]
+handl-lib-error = { path = "../lib-error" }
+
+[patch."https://github.com/handl-lang/lib-hello"]
+handl-lib-hello = { path = "../lib-hello" }
+
+[patch."https://github.com/handl-lang/lib-hex"]
+handl-lib-hex = { path = "../lib-hex" }
+
+[patch."https://github.com/handl-lang/lib-intl"]
+handl-lib-intl = { path = "../lib-intl" }
+
+[patch."https://github.com/handl-lang/lib-intl-c"]
+handl-lib-intl-c = { path = "../lib-intl-c" }
+
+[patch."https://github.com/handl-lang/lib-ip"]
+handl-lib-ip = { path = "../lib-ip" }
+
+[patch."https://github.com/handl-lang/lib-json"]
+handl-lib-json = { path = "../lib-json" }
+
+[patch."https://github.com/handl-lang/lib-mood"]
+handl-lib-mood = { path = "../lib-mood" }
+
+[patch."https://github.com/handl-lang/lib-obj"]
+handl-lib-obj = { path = "../lib-obj" }
+
+[patch."https://github.com/handl-lang/lib-ops"]
+handl-lib-ops = { path = "../lib-ops" }
+
+[patch."https://github.com/handl-lang/lib-option"]
+handl-lib-option = { path = "../lib-option" }
+
+[patch."https://github.com/handl-lang/lib-parse"]
+handl-lib-parse = { path = "../lib-parse" }
+
+[patch."https://github.com/handl-lang/lib-prim"]
+handl-lib-prim = { path = "../lib-prim" }
+
+[patch."https://github.com/handl-lang/lib-prim-handl"]
+handl-lib-prim-handl = { path = "../lib-prim-handl" }
+
+[patch."https://github.com/handl-lang/lib-rand-c"]
+handl-lib-rand-c = { path = "../lib-rand-c" }
+
+[patch."https://github.com/handl-lang/lib-result"]
+handl-lib-result = { path = "../lib-result" }
+
+[patch."https://github.com/handl-lang/lib-serialize"]
+handl-lib-serialize = { path = "../lib-serialize" }
+
+[patch."https://github.com/handl-lang/lib-stats"]
+handl-lib-stats = { path = "../lib-stats" }
+
+[patch."https://github.com/handl-lang/lib-str-handl"]
+handl-lib-str-handl = { path = "../lib-str-handl" }
+
+[patch."https://github.com/handl-lang/lib-tar"]
+handl-lib-tar = { path = "../lib-tar" }
+
+[patch."https://github.com/handl-lang/lib-time-c"]
+handl-lib-time-c = { path = "../lib-time-c" }
+
+[patch."https://github.com/handl-lang/lib-transform"]
+handl-lib-transform = { path = "../lib-transform" }
+
+[patch."https://github.com/handl-lang/lib-type"]
+handl-lib-type = { path = "../lib-type" }
+
+[patch."https://github.com/handl-lang/lib-unicode"]
+handl-lib-unicode = { path = "../lib-unicode" }
+
+[patch."https://github.com/handl-lang/lib-unicode-c"]
+handl-lib-unicode-c = { path = "../lib-unicode-c" }
+
+[patch."https://github.com/handl-lang/lib-url-rfc"]
+handl-lib-url-rfc = { path = "../lib-url-rfc" }
+
+[patch."https://github.com/handl-lang/lib-url-whatwg"]
+handl-lib-url-whatwg = { path = "../lib-url-whatwg" }
+
+[patch."https://github.com/handl-lang/lib-utils"]
+handl-lib-utils = { path = "../lib-utils" }
+
+[patch."https://github.com/handl-lang/native"]
+hnl-engine-exec-cranelift = { path = "../native/modules/exec-cranelift" }
+
+[patch."https://github.com/handl-lang/otlp"]
+handl-plugin-lib-otlp = { path = "../otlp/modules/lib-otlp" }
+handl-plugin-lib-otlp-std = { path = "../otlp/modules/lib-otlp-std" }
+
+[patch."https://github.com/handl-lang/platform"]
+handl-kit-arrow-lower = { path = "../platform/crates/handl-kit-arrow-lower" }
+handl-kit-data = { path = "../platform/crates/handl-kit-data" }
+handl-platform = { path = "../platform/crates/platform" }
+handl-plugin-ext-diag = { path = "../platform/crates/plugin-ext-diag" }
+handl-plugin-lib-handl = { path = "../platform/crates/plugin-lib-handl" }
+handl-plugin-lib-tag = { path = "../platform/crates/plugin-lib-tag" }
+handl-plugin-module = { path = "../platform/crates/plugin-module" }
+handl-runtime = { path = "../platform/crates/handl-runtime" }
+handl-test-utils = { path = "../platform/crates/handl-test-utils" }
+
+[patch."https://github.com/handl-lang/stdlib"]
+handl-plugin-lib-char-native = { path = "../stdlib/modules/char-native" }
+handl-plugin-lib-crypto = { path = "../stdlib/modules/crypto" }
+handl-plugin-lib-kv = { path = "../stdlib/modules/kv" }
+handl-plugin-lib-kv-hashmap = { path = "../stdlib/modules/kv-hashmap" }
+handl-plugin-lib-lang-compile = { path = "../stdlib/modules/lib-lang-compile" }
+handl-plugin-lib-lang-eval = { path = "../stdlib/modules/lib-lang-eval" }
+handl-plugin-lib-lang-lex = { path = "../stdlib/modules/lib-lang-lex" }
+handl-plugin-lib-lang-parse = { path = "../stdlib/modules/lib-lang-parse" }
+handl-plugin-lib-lang-run-compiled = { path = "../stdlib/modules/lib-lang-run-compiled" }
+handl-plugin-lib-lang-typecheck = { path = "../stdlib/modules/lib-lang-typecheck" }
+handl-plugin-lib-stdlib = { path = "../stdlib/crates/plugin-lib-stdlib" }

@@ -1,11 +1,11 @@
-//! # handl-plugin-engine-exec-bytecode
+//! # hnl-engine-exec-bytecode
 //!
 //! The **bytecode eval engine** for the eval operation (ADR-0044 §4, §7).
 //!
 //! This engine compiles [`handl_language::Term`] (the v2 arrow-calculus
 //! kernel, ADR-0052) data to a bytecode representation and executes it via a
 //! stack-based VM. It shares the same `Term` vocabulary as the
-//! [`handl_plugin_engine_exec_tree_walk`](handl_plugin_engine_exec_tree_walk)
+//! [`hnl_engine_exec_tree_walk`](hnl_engine_exec_tree_walk)
 //! reference interpreter; conformance tests verify both produce **identical
 //! results**.
 //!
@@ -63,10 +63,10 @@ pub use compile::compile;
 pub use instr::{ArithOp, Instr};
 
 use handl_language::{Ast, AstRef, LangError, Language, SchemeVersion, Value};
-use handl_plugin_engine_exec::{EvalEngine, EvalRequest};
-use handl_plugin_engine_exec_tree_walk::EvalFrame as TreeWalkEvalFrame;
-use handl_plugin_engine_transform::native::{NativeRewrite, NativeRewriteRegistry, RewriteCtx};
-use handl_plugin_engine_transform_rewrite::RewriteEngine;
+use hnl_engine_exec::{EvalEngine, EvalRequest};
+use hnl_engine_exec_tree_walk::EvalFrame as TreeWalkEvalFrame;
+use hnl_engine_transform::native::{NativeRewrite, NativeRewriteRegistry, RewriteCtx};
+use hnl_engine_transform_rewrite::RewriteEngine;
 use handl_value::TaggedValue;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
@@ -89,7 +89,7 @@ pub struct BytecodeEngine {
     /// The module registry for `Foreign` dispatch (may be `None`).
     modules: Option<Rc<dyn handl_platform::ModuleLookup>>,
     /// The import resolver for `import "path"` statements (Phase 9.5).
-    import_resolver: Option<Rc<dyn handl_plugin_engine_exec::ImportResolver>>,
+    import_resolver: Option<Rc<dyn hnl_engine_exec::ImportResolver>>,
     /// Global variables injected by the host (e.g. `self` -> language value).
     globals: HashMap<String, Value>,
     /// Run the `lower` transform pass before evaluation.
@@ -278,7 +278,7 @@ impl EvalEngine for BytecodeEngine {
 
     fn with_import_resolver(
         &self,
-        resolver: Rc<dyn handl_plugin_engine_exec::ImportResolver>,
+        resolver: Rc<dyn hnl_engine_exec::ImportResolver>,
     ) -> Box<dyn EvalEngine> {
         let mut engine = self.clone();
         engine.import_resolver = Some(resolver);
@@ -432,9 +432,9 @@ mod tests {
     use super::*;
     use handl_language::{ArrSource, AstNode, EvalSchemeDef, Language, Value};
     use handl_platform::{EvalContext, Function, Module, ModuleLookup};
-    use handl_plugin_engine_exec::EvalRequest;
+    use hnl_engine_exec::EvalRequest;
     use handl_plugin_module::ModuleRegistry;
-    use plugin_engine::TermData;
+    use hnl_engine::TermData;
     use serde_json::json;
 
     /// Build a simple AST for testing.

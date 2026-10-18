@@ -62,11 +62,11 @@
 use std::rc::Rc;
 
 use handl_language::{Ast, AstNode, AstRef, LangError, Language, Term, Value};
-use handl_plugin_engine_exec::native_ops::{
+use hnl_engine_exec::native_ops::{
     self, NativeOpCtx, Num, OpService, as_num, bin_add, build_loop_step_args, is_truthy,
     loop_step_outcome, num_value, step_decision, type_tag,
 };
-use handl_plugin_engine_exec::pattern_match::{self, PatternMatchCtx};
+use hnl_engine_exec::pattern_match::{self, PatternMatchCtx};
 use handl_value::{TaggedValue, tagged_to_value};
 use rustc_hash::FxHashMap;
 
@@ -396,7 +396,7 @@ pub(crate) struct VmFrame<'a, 'h> {
     /// The module registry (for `Foreign` dispatch).
     modules: Option<&'h Rc<dyn handl_platform::ModuleLookup>>,
     /// The import resolver for `import "path"` statements (Phase 9.5).
-    import_resolver: Option<&'h Rc<dyn handl_plugin_engine_exec::ImportResolver>>,
+    import_resolver: Option<&'h Rc<dyn hnl_engine_exec::ImportResolver>>,
     /// Deserialized `body_def` arenas carried by applied arrows
     /// (ADR-0106). Applying an arrow pushes its arena here and executes
     /// under `active_def`; the entries keep the arenas alive for the
@@ -439,7 +439,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
         ast: &'a Ast,
         lang: &'a Language,
         modules: Option<&'h Rc<dyn handl_platform::ModuleLookup>>,
-        import_resolver: Option<&'h Rc<dyn handl_plugin_engine_exec::ImportResolver>>,
+        import_resolver: Option<&'h Rc<dyn hnl_engine_exec::ImportResolver>>,
     ) -> Self {
         Self {
             ast,
@@ -1394,7 +1394,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
     /// `countdown_step`, `infinite_step`).
     ///
     /// The op semantics are defined once in
-    /// `plugin-engine-exec::native_ops` (ADR-0044 §7): this engine supplies
+    /// `hnl-engine-exec::native_ops` (ADR-0044 §7): this engine supplies
     /// only the globals — the scope stack, AST-node execution, and arrow
     /// application — through [`VmCtx`]. The residual `match` below owns
     /// ops that still require this engine's machinery (imports, module
@@ -1917,7 +1917,7 @@ fn op_is_derived_step(op: &str) -> bool {
 /// The bytecode VM's [`NativeOpCtx`] — the engine-local globals the shared
 /// op table needs: the scope stack, AST-node execution, and arrow
 /// application. The op *semantics* live in
-/// `plugin-engine-exec::native_ops`; this struct only forwards services.
+/// `hnl-engine-exec::native_ops`; this struct only forwards services.
 struct VmCtx<'f, 'a, 'h, 'n> {
     frame: &'f mut VmFrame<'a, 'h>,
     node: &'n AstNode,
@@ -2093,7 +2093,7 @@ impl NativeOpCtx for VmCtx<'_, '_, '_, '_> {
         self.frame.apply_app(f, args, self.node)
     }
 
-    fn import_resolver(&self) -> Option<&dyn handl_plugin_engine_exec::ImportResolver> {
+    fn import_resolver(&self) -> Option<&dyn hnl_engine_exec::ImportResolver> {
         self.frame.import_resolver.map(|rc| &**rc)
     }
 }
@@ -2240,9 +2240,9 @@ mod tests {
     use super::*;
     use handl_language::{ArrSource, Ast, AstNode, EvalSchemeDef, Language, SchemeVersion, Term};
     use handl_platform::{EvalContext, Function, Module, ModuleLookup};
-    use handl_plugin_engine_exec::ImportResolver;
+    use hnl_engine_exec::ImportResolver;
     use handl_plugin_module::ModuleRegistry;
-    use plugin_engine::TermData;
+    use hnl_engine::TermData;
     use serde_json::json;
     use std::rc::Rc;
 
