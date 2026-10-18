@@ -235,6 +235,7 @@ handl-lib-utils = { path = "../lib-utils" }
 [patch."https://github.com/handl-lang/otlp"]
 
 [patch."https://github.com/handl-lang/host"]
+handl-plugin-lib-stdlib = { path = "../host/crates/plugin-lib-stdlib" }
 handl-kit-arrow-lower = { path = "../host/crates/handl-kit-arrow-lower" }
 handl-kit-data = { path = "../host/crates/handl-kit-data" }
 handl-platform = { path = "../host/crates/platform" }
@@ -245,5 +246,3 @@ handl-plugin-module = { path = "../host/crates/plugin-module" }
 handl-runtime = { path = "../host/crates/handl-runtime" }
 handl-test-utils = { path = "../host/crates/handl-test-utils" }
 
-[patch."https://github.com/handl-lang/stdlib"]
-handl-plugin-lib-stdlib = { path = "../stdlib/crates/plugin-lib-stdlib" }
