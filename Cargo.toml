@@ -3,7 +3,7 @@ name = "hnl-engine-exec-bytecode"
 version = "0.1.0"
 edition = "2024"
 description = "The **bytecode eval engine** for the eval operation (ADR-0044 §4, §7)."
-license = "MIT OR Apache-2.0"
+license = "MIT"
 repository = "https://github.com/handl-lang/engine-exec-bytecode"
 
 [dependencies]
