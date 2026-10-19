@@ -174,7 +174,7 @@ handl-lib-ops = { path = "../kernel/crates/ops" }
 handl-lib-option = { path = "../lib-option" }
 
 [patch."https://github.com/handl-lang/lib-otlp"]
-handl-plugin-lib-otlp = { path = "../lib-otlp" }
+handl-lib-otlp = { path = "../lib-otlp" }
 
 [patch."https://github.com/handl-lang/lib-otlp-std"]
 handl-plugin-lib-otlp-std = { path = "../lib-otlp-std" }
