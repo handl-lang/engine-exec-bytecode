@@ -70,12 +70,12 @@ hnl-engine-typecheck-handl = { path = "../engine-typecheck-handl" }
 handl-language = { path = "../kernel/crates/handl-language" }
 handl-value = { path = "../kernel/crates/handl-value" }
 
-[patch."https://github.com/handl-lang/kit-canonical"]
-handl-kit-canonical = { path = "../kit-canonical/crates/kit-canonical" }
-handl-plugin-ffi = { path = "../kit-canonical/modules/ffi" }
+[patch."https://github.com/handl-lang/kit-prelude"]
+handl-kit-prelude = { path = "../kit-prelude/crates/kit-prelude" }
+handl-plugin-ffi = { path = "../kit-ffi/modules/ffi" }
 
-[patch."https://github.com/handl-lang/kit-data-canonical"]
-handl-kit-data-canonical = { path = "../kit-data-canonical/crates/handl-kit-data-canonical" }
+[patch."https://github.com/handl-lang/kit-data-prelude"]
+handl-kit-data-prelude = { path = "../kit-data-prelude/crates/handl-kit-data-prelude" }
 
 [patch."https://github.com/handl-lang/lib-archive"]
 handl-lib-archive = { path = "../lib-archive" }
@@ -233,6 +233,28 @@ handl-lib-utils = { path = "../lib-utils" }
 [patch."https://github.com/handl-lang/native"]
 
 [patch."https://github.com/handl-lang/otlp"]
+
+[patch."https://github.com/handl-lang/kit-core"]
+handl-kit-core = { path = "../kit-core/crates/kit-core" }
+
+[patch."https://github.com/handl-lang/kit-stdlib"]
+handl-kit-stdlib = { path = "../kit-stdlib/crates/kit-stdlib" }
+
+[patch."https://github.com/handl-lang/kit-server"]
+handl-kit-server = { path = "../kit-server/crates/kit-server" }
+
+[patch."https://github.com/handl-lang/kit-test"]
+handl-kit-test = { path = "../kit-test/crates/kit-test" }
+
+[patch."https://github.com/handl-lang/kit-lang"]
+handl-kit-lang = { path = "../kit-lang/crates/kit-lang" }
+
+[patch."https://github.com/handl-lang/kit-ffi"]
+handl-kit-ffi = { path = "../kit-ffi/crates/kit-ffi" }
+handl-plugin-ffi = { path = "../kit-ffi/modules/ffi" }
+
+[patch."https://github.com/handl-lang/kit-pkg"]
+handl-kit-pkg = { path = "../kit-pkg/crates/kit-pkg" }
 
 [patch."https://github.com/handl-lang/host"]
 handl-plugin-lib-stdlib = { path = "../host/crates/plugin-lib-stdlib" }
