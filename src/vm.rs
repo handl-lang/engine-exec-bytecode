@@ -431,6 +431,11 @@ pub(crate) struct VmFrame<'a, 'h> {
     /// [`VmFrame::register_ffi`]. When `Ffi` finds no entry here it falls
     /// back to [`Instr::ForeignOp`] dispatch via `modules`.
     ffi_registry: FfiRegistry,
+    /// The runtime handler stack (ADR-0076 dynamic extent): `handle_dyn`
+    /// pushes the impl value for the body's extent; `arr_dispatch` and
+    /// the `IO(sig)` former interpretation resolve ops through it
+    /// (innermost-first), matching the tree-walk `handler_stack`.
+    handler_stack: Vec<TaggedValue>,
 }
 
 impl<'a, 'h> VmFrame<'a, 'h> {
@@ -453,6 +458,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
             scopes: ScopeStack::new(),
             scratch_stack: Vec::new(),
             ffi_registry: FfiRegistry::new(),
+            handler_stack: Vec::new(),
         }
     }
 
@@ -1588,20 +1594,26 @@ impl<'a, 'h> VmFrame<'a, 'h> {
 
     /// Dispatch a payload-resolved `arr <op>` against a concrete operand.
     /// Mirrors the tree-walk `arr_dispatch`: a handler implementation
+    /// resolved through the runtime handler stack (innermost-first) or
     /// carried by the operand's `impls` (or a same-named field) wins;
     /// otherwise the operand's `Pair` spine is flattened into positional
-    /// args for the native op.
-    ///
-    /// The runtime handler stack the tree-walk also consults does not
-    /// exist in this engine — `Handle` terms are eliminated at compile
-    /// time by `Term::eliminate_handlers`.
+    /// args for the native op. `handle_dyn` pushes handlers for the
+    /// body's dynamic extent; `handle` terms whose target is a *named*
+    /// capability still eliminate statically via
+    /// `Term::eliminate_handlers`.
     fn arr_dispatch(
         &mut self,
         op: &str,
         incoming: &TaggedValue,
         node: &AstNode,
     ) -> Result<TaggedValue, LangError> {
-        if let Some(impl_val) = handler_impl(incoming, op) {
+        let impl_val = self
+            .handler_stack
+            .iter()
+            .rev()
+            .find_map(|h| handler_impl(h, op))
+            .or_else(|| handler_impl(incoming, op));
+        if let Some(impl_val) = impl_val {
             if matches!(impl_val, TaggedValue::Arrow { .. }) {
                 return self.apply_app(&impl_val, std::slice::from_ref(incoming), node);
             }
@@ -1862,7 +1874,16 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 TaggedValue::Arr(Rc::from(tail.to_vec())),
             );
         }
+        // Deep-handler reinstall (the tree-walk `apply` parity): a
+        // `handle f with h` result carries `h` in the arrow's `handlers`
+        // — reinstall it for the body's extent so ops inside `f`
+        // dispatch through their captured handler.
+        let handlers_mark = self.handler_stack.len();
+        if let TaggedValue::Arrow { handlers, .. } = self_val {
+            self.handler_stack.extend(handlers.iter().cloned());
+        }
         let result = self.exec_node_inner(body_ref);
+        self.handler_stack.truncate(handlers_mark);
         // Restore: truncate bindings and marks to pre-call state, discarding
         // any scopes the body may have pushed, and restore the captured
         // root, lexical floor, and active arena.
@@ -2099,6 +2120,22 @@ impl NativeOpCtx for VmCtx<'_, '_, '_, '_> {
 
     fn import_resolver(&self) -> Option<&dyn hnl_engine_exec::ImportResolver> {
         self.frame.import_resolver.map(|rc| &**rc)
+    }
+
+    fn handler_push(&mut self, handler: TaggedValue) {
+        self.frame.handler_stack.push(handler);
+    }
+
+    fn handler_pop(&mut self) {
+        self.frame.handler_stack.pop();
+    }
+
+    fn handler_lookup(&self, op: &str) -> Option<TaggedValue> {
+        self.frame
+            .handler_stack
+            .iter()
+            .rev()
+            .find_map(|h| handler_impl(h, op))
     }
 }
 

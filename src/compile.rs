@@ -355,20 +355,46 @@ fn compile_into_td(
             }
             Ok(false)
         }
-        // `handle body with target = impl_` (ADR-0076): eliminate the
-        // handler at compile time, then compile the resulting handler-free
-        // scheme. Uses `eliminate_and_check` to surface unhandled
-        // capabilities as a compile-time error. `eliminate_and_check`
-        // operates on the `Term` enum, so the `TermData` is converted back
-        // via [`TermData::to_term`] for this one case.
+        // `handle body with target = impl_` (ADR-0076). An *unnamed*
+        // target (`""` — surface `handle <body> with <handler>`) is a
+        // dynamic-extent handler install: capability substitution cannot
+        // see it, so the shared `handle_dyn` op runs the runtime
+        // semantics (handler-stack push → body eval → `IO(sig)` former
+        // interpretation → carried-handler attach — the tree-walk
+        // `Handle` arm's behavior). A *named* target still eliminates
+        // statically via `Term::eliminate_handlers`.
         "Handle" => {
+            let target = td.get_str("target").unwrap_or_default();
+            if target.is_empty() {
+                out.push(Instr::NativeOp("handle_dyn".to_string(), 0));
+                return Ok(false);
+            }
             let term = td.to_term().map_err(|e| LangError::engine_node(e, node))?;
             let eliminated = term.eliminate_handlers();
             compile_into(&eliminated, lang, ast, node, out)
         }
 
         "Iter" => Err(LangError::NotImplemented),
-        "Child" => Err(LangError::NotImplemented),
+        // `Child { role }` (ADR-0081): resolve the named child role to a
+        // position and emit `EvalChild` — the same lowering `proj_child`
+        // receives. Reached via `!Child` scheme placeholders (e.g.
+        // `eval.handle`'s `target`/`impl`) and by `Term::Child` terms
+        // embedded by `eliminate_handlers`' `impl_` substitution.
+        "Child" => {
+            let role = td.get_str("role").expect("Child term missing 'role' field");
+            let idx = lang
+                .child_role_index_for(node, role)
+                .ok()
+                .flatten()
+                .ok_or_else(|| {
+                    LangError::engine_node(
+                        format!("Child: role '{role}' not declared on kind '{}'", node.kind),
+                        node,
+                    )
+                })?;
+            out.push(Instr::EvalChild(idx));
+            Ok(false)
+        }
         "Path" => Err(LangError::NotImplemented),
         "Equiv" => Err(LangError::NotImplemented),
         // HoTT/cell combinators lower to native `cell2_*` ops. The lowering
