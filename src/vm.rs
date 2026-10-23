@@ -535,6 +535,10 @@ impl<'a, 'h> PatternMatchCtx for VmFrame<'a, 'h> {
         self.scopes.globals.get(name).cloned()
     }
 
+    fn scope_value(&self, name: &str) -> Option<TaggedValue> {
+        self.scopes.lookup(name).cloned()
+    }
+
     fn lang(&self) -> Option<&Language> {
         Some(self.lang)
     }
