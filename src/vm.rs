@@ -59,6 +59,7 @@
 //!   [`VmFrame::apply_native_v2`]. See the [`instr`](crate::instr) module
 //!   docs for details.
 
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use handl_language::{Ast, AstNode, AstRef, LangError, Language, Term, Value};
@@ -119,6 +120,40 @@ impl FfiRegistry {
 /// tree-walk's `ARR_DISPATCH_TAG` (ADR-0103 value shape).
 const ARR_DISPATCH_TAG: &str = "__arr__";
 
+/// Id space base for bytecode-minted `{"__resume__": id}` values — keeps
+/// them disjoint from the tree-walk's small sequential ids so a
+/// cross-engine `resume` reports "unknown resumption" (see
+/// [`VmFrame::resume_next_id`]).
+const RESUME_ID_BASE: u64 = 1_000_000_000;
+
+/// A replay journal for multi-shot `resume` (ADR-0158 workstream —
+/// `host/project/design/multishot-resume.md`). Declaration for the
+/// frame's `journals` stack — the journal driver fills this in when the
+/// bytecode multi-shot workstream lands; mirrors the tree-walk's
+/// `ResumeJournal` (body term, incoming, entry-env snapshot, handler,
+/// entries, cursor).
+#[derive(Debug)]
+pub(crate) struct ResumeJournal;
+
+/// A captured `perform` suspension awaiting `resume` (see
+/// [`VmFrame::suspensions`]). Declaration for the suspension table —
+/// mirrors the tree-walk's `ResumeSuspension`.
+#[derive(Debug)]
+pub(crate) struct ResumeSuspension;
+
+/// Remaining-stack budget at which [`stacker::maybe_grow`] moves the next
+/// eval step onto a fresh segment. The instruction loop is iterative,
+/// but nested node evals and arrow applications still recurse natively
+/// (`exec_node_inner` → `exec_instrs_inner` → `apply_app` →
+/// `apply_arrow_body` → `exec_node_inner`), so a self-recursive arrow
+/// overflows the platform stack at a few thousand calls — same seam as
+/// the tree-walk engine's `STACK_RED_ZONE`.
+const STACK_RED_ZONE: usize = 4 * 1024 * 1024;
+
+/// Fresh stack segment allocated by [`stacker::maybe_grow`] on overflow
+/// (see [`STACK_RED_ZONE`]).
+const STACK_SEGMENT: usize = 8 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Scope stack — identical semantics to the tree-walk interpreter
 // ---------------------------------------------------------------------------
@@ -133,6 +168,11 @@ const ARR_DISPATCH_TAG: &str = "__arr__";
 /// restore. For the small scopes typical in handler programs (3-10
 /// variables), a linear scan is faster than `HashMap` because there is no
 /// hashing overhead.
+///
+/// `Clone`: multi-shot `resume` snapshots the `handle`-entry environment
+/// into a replay journal so each `resume` re-run starts from the same
+/// scope state (mirrors the tree-walk `entry_env` clone).
+#[derive(Clone)]
 pub(crate) struct ScopeStack {
     /// Flat list of (name, value) bindings, innermost last.
     pub(crate) bindings: Vec<(Rc<str>, TaggedValue)>,
@@ -436,6 +476,24 @@ pub(crate) struct VmFrame<'a, 'h> {
     /// the `IO(sig)` former interpretation resolve ops through it
     /// (innermost-first), matching the tree-walk `handler_stack`.
     handler_stack: Vec<TaggedValue>,
+    /// Active replay journals for multi-shot `resume` (ADR-0158
+    /// workstream — `host/project/design/multishot-resume.md`). One
+    /// entry per `handle` whose handler has a ≥2-ary resumption clause,
+    /// innermost last. Frame-local (the VM's journal state is owned,
+    /// not thread-local like the tree-walk's — `resume` values minted
+    /// here are only callable while this frame is alive).
+    journals: Vec<Rc<ResumeJournal>>,
+    /// Suspension table: `LangError::Suspended { id }` carries only the
+    /// index; the captured state lives here. Entries persist for the
+    /// frame's lifetime so an escaped `resume` still runs while the
+    /// frame is alive.
+    suspensions: FxHashMap<u64, Rc<ResumeSuspension>>,
+    /// Monotonic journal/suspension id source, starting at
+    /// [`RESUME_ID_BASE`] so bytecode-minted `{"__resume__": id}`
+    /// values can never alias the tree-walk's small sequential ids —
+    /// a cross-engine `resume` call reports "unknown resumption"
+    /// instead of silently resuming the wrong suspension.
+    resume_next_id: u64,
 }
 
 impl<'a, 'h> VmFrame<'a, 'h> {
@@ -459,6 +517,9 @@ impl<'a, 'h> VmFrame<'a, 'h> {
             scratch_stack: Vec::new(),
             ffi_registry: FfiRegistry::new(),
             handler_stack: Vec::new(),
+            journals: Vec::new(),
+            suspensions: FxHashMap::default(),
+            resume_next_id: RESUME_ID_BASE,
         }
     }
 
@@ -570,6 +631,18 @@ impl<'a, 'h> VmFrame<'a, 'h> {
     /// Internal node evaluator — the [`TaggedValue`] counterpart of
     /// [`exec_node`](Self::exec_node). Returns a [`TaggedValue`].
     pub(crate) fn exec_node_inner(&mut self, node_ref: AstRef) -> Result<TaggedValue, LangError> {
+        // Growable-stack seam (see `STACK_RED_ZONE`): every recursive
+        // eval cycle — arrow-body exec via `apply_arrow_body`, child
+        // exec via `ctx.eval_node`, `match`/`handle` shells — re-enters
+        // here, so checking at this one funnel bounds every level.
+        stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || {
+            self.exec_node_inner_unguarded(node_ref)
+        })
+    }
+
+    /// The recursive body of [`exec_node_inner`](Self::exec_node_inner),
+    /// run under [`stacker::maybe_grow`].
+    fn exec_node_inner_unguarded(&mut self, node_ref: AstRef) -> Result<TaggedValue, LangError> {
         // Resolve the node in the active arena. For a `body_def` arena we
         // clone the `Rc` into a local handle so `node` borrows the handle
         // rather than `self` — no per-node clone on either path.
@@ -1449,6 +1522,29 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                             node,
                         )
                     })?;
+                // Arg array position: when the callee arrives as `incoming`
+                // (canonical `call` scheme), the `proj_rest` arg array is
+                // `args[0]`; the legacy convention puts it at `args[1]`.
+                let arg_src = if incoming.as_ref().and_then(|v| v.as_str()).is_some() {
+                    args.first()
+                } else {
+                    args.get(1)
+                };
+                // ADR-0158: `perform(op, arg)` under a covering handler
+                // dispatches in-flight — consult the runtime handler
+                // stack before the `IO` mint; uncovered ops fall
+                // through to `PerformFn`'s residual mint.
+                if native_ops::is_perform_callee(callee) {
+                    let arg_tvs: Vec<TaggedValue> = arg_src
+                        .and_then(|v| v.as_array().map(|a| a.to_vec()))
+                        .unwrap_or_default();
+                    let mut ctx = VmCtx { frame: self, node };
+                    if let Some(v) = native_ops::perform_dispatch(&mut ctx, &arg_tvs)
+                        .map_err(|e| e.with_node(node))?
+                    {
+                        return Ok(v);
+                    }
+                }
                 let modules = self.modules.ok_or_else(|| {
                     LangError::engine_node("call_host: no module registry".to_string(), node)
                 })?;
@@ -1458,14 +1554,6 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                         node,
                     )
                 })?;
-                // Arg array position: when the callee arrives as `incoming`
-                // (canonical `call` scheme), the `proj_rest` arg array is
-                // `args[0]`; the legacy convention puts it at `args[1]`.
-                let arg_src = if incoming.as_ref().and_then(|v| v.as_str()).is_some() {
-                    args.first()
-                } else {
-                    args.get(1)
-                };
                 let call_args: Vec<Value> = arg_src
                     .and_then(|v| v.as_array())
                     .map(|arr| arr.iter().map(tagged_to_value).collect())
@@ -1568,6 +1656,16 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     vec![input.clone()]
                 };
                 if let Some(name) = callee.as_str() {
+                    // ADR-0158: `perform` under a covering handler
+                    // dispatches in-flight before the `IO` mint.
+                    if native_ops::is_perform_callee(name) {
+                        let mut ctx = VmCtx { frame: self, node };
+                        if let Some(v) = native_ops::perform_dispatch(&mut ctx, &actual_args)
+                            .map_err(|e| e.with_node(node))?
+                        {
+                            return Ok(v);
+                        }
+                    }
                     let modules = self.modules.ok_or_else(|| {
                         LangError::engine_node("flow: no module registry".to_string(), node)
                     })?;
@@ -1647,6 +1745,21 @@ impl<'a, 'h> VmFrame<'a, 'h> {
         args: &[TaggedValue],
         node: &AstNode,
     ) -> Result<TaggedValue, LangError> {
+        // Growable-stack seam (see `STACK_RED_ZONE`): the apply↔exec
+        // recursion passes through here once per arrow application.
+        stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, || {
+            self.apply_app_inner(callee, args, node)
+        })
+    }
+
+    /// The recursive body of [`apply_app`](Self::apply_app), run under
+    /// [`stacker::maybe_grow`].
+    fn apply_app_inner(
+        &mut self,
+        callee: &TaggedValue,
+        args: &[TaggedValue],
+        node: &AstNode,
+    ) -> Result<TaggedValue, LangError> {
         // First-class `arr <op>` dispatch object: apply the op to the
         // args (the tree-walk `apply_app` `__arr__` arm).
         if let Some(inner) = callee.get(ARR_DISPATCH_TAG) {
@@ -1667,6 +1780,16 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                 if let (Some(first), Some(second)) = (map.get("first"), map.get("second")) {
                     let mid = self.apply_app(first, args, node)?;
                     if let Some(name) = second.as_str() {
+                        // ADR-0158: `perform` under a covering handler
+                        // dispatches in-flight before the `IO` mint.
+                        if native_ops::is_perform_callee(name) {
+                            let mut ctx = VmCtx { frame: self, node };
+                            if let Some(v) = native_ops::perform_dispatch(&mut ctx, &[mid.clone()])
+                                .map_err(|e| e.with_node(node))?
+                            {
+                                return Ok(v);
+                            }
+                        }
                         let modules = self.modules.ok_or_else(|| {
                             LangError::engine_node("call_host: no module registry".to_string(), node)
                         })?;
@@ -2126,8 +2249,8 @@ impl NativeOpCtx for VmCtx<'_, '_, '_, '_> {
         self.frame.handler_stack.push(handler);
     }
 
-    fn handler_pop(&mut self) {
-        self.frame.handler_stack.pop();
+    fn handler_pop(&mut self) -> Option<TaggedValue> {
+        self.frame.handler_stack.pop()
     }
 
     fn handler_lookup(&self, op: &str) -> Option<TaggedValue> {
@@ -2136,6 +2259,25 @@ impl NativeOpCtx for VmCtx<'_, '_, '_, '_> {
             .iter()
             .rev()
             .find_map(|h| handler_impl(h, op))
+    }
+
+    fn handler_acc(&self, op: &str) -> Option<TaggedValue> {
+        native_ops::covering_frame_acc(&self.frame.handler_stack, op)
+    }
+
+    fn handler_set_acc(&mut self, op: &str, s: TaggedValue) {
+        native_ops::covering_frame_set_acc(&mut self.frame.handler_stack, op, s);
+    }
+
+    fn run_delimited(
+        &mut self,
+        target: AstRef,
+        handler: &TaggedValue,
+        frame_handler: &TaggedValue,
+    ) -> Result<TaggedValue, LangError> {
+        // One-shot tail until the journal driver lands here — mirrors
+        // `TwCtx::run_delimited` in the tree-walk.
+        native_ops::run_delimited_default(self, target, handler, frame_handler)
     }
 }
 
