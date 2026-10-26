@@ -26,8 +26,8 @@ use std::rc::Rc;
 
 use handl_language::{ArrSource, Language, Term};
 use handl_language::{Ast, AstNode, AstRef, LangError, Value};
-use hnl_engine_exec::native_ops;
 use hnl_engine::TermData;
+use hnl_engine_exec::native_ops;
 
 use crate::instr::{ArithOp, Instr};
 
@@ -148,17 +148,17 @@ fn compile_into_td(
                     // Propagate snd_pushed: an extend_env in snd position
                     // (the Bind lowering shape) is popped by the *enclosing*
                     // Seq.
-                    return Ok(snd_pushed);
+                    Ok(snd_pushed)
                 }
                 // A dynamic axis on 1-cell operands could resolve to 0 —
                 // sequential composition — which is not expressible as
                 // value-level composition.
                 None if fst_dim <= 1 => {
-                    return Err(LangError::engine_node(
+                    Err(LangError::engine_node(
                         "Seq: non-literal composition axis on 1-cell operands (dim ≤ 1) is not supported"
                             .to_string(),
                         node,
-                    ));
+                    ))
                 }
                 // Pasting regime: every other case lowers to the shared
                 // `cell_comp_axis` op — including `k >= dim(fst)` and
@@ -171,7 +171,7 @@ fn compile_into_td(
                 // `NativeOp` cannot carry `lit` (the `route_on_type`
                 // convention).
                 _ => {
-                    return compile_into_td(
+                    compile_into_td(
                         &TermData::op(
                             format!("cell_comp_axis:{fst_dim}"),
                             vec![td.axis(), fst, snd],
@@ -182,7 +182,7 @@ fn compile_into_td(
                         ast,
                         node,
                         out,
-                    );
+                    )
                 }
             }
         }
@@ -526,6 +526,7 @@ fn compile_into_td(
 ///
 /// `args` are the op's sub-schemes as [`TermData`] values (ADR-0103 Phase 6);
 /// each is compiled recursively via [`compile_into_td`].
+#[allow(clippy::too_many_arguments)]
 fn compile_arr(
     op: &str,
     args: &[TermData],
@@ -636,17 +637,18 @@ fn compile_arr(
     // allocated once at compile time and reused (refcount bump) on every
     // iteration. Falls back to `NativeOp("object", n)` for dynamic
     // (computed) keys or the `entries` payload shape.
-    if source == &ArrSource::Native && op == "object" {
-        if let Some(keys) = try_extract_static_object_keys(lang, ast, node)? {
-            // Emit `EvalNode(val_idx)` for each entry's value node, in
-            // source order. The VM evaluates the node at the given absolute
-            // arena index and pushes the result.
-            for &val_idx in keys.value_indices.iter() {
-                out.push(Instr::EvalNode(val_idx));
-            }
-            out.push(Instr::MakeObj { keys: keys.keys });
-            return Ok(false);
+    if source == &ArrSource::Native
+        && op == "object"
+        && let Some(keys) = try_extract_static_object_keys(lang, ast, node)?
+    {
+        // Emit `EvalNode(val_idx)` for each entry's value node, in
+        // source order. The VM evaluates the node at the given absolute
+        // arena index and pushes the result.
+        for &val_idx in keys.value_indices.iter() {
+            out.push(Instr::EvalNode(val_idx));
         }
+        out.push(Instr::MakeObj { keys: keys.keys });
+        return Ok(false);
     }
 
     // Hot-path optimization for `closure`: pre-extract the param names and
@@ -657,26 +659,27 @@ fn compile_arr(
     // `match op` dispatch, and the node payload extraction performed by the
     // `NativeOp("closure", n)` path. Falls back to `NativeOp("closure", n)`
     // when the params/body cannot be statically resolved.
-    if source == &ArrSource::Native && op == "closure" {
-        if let Some(closure) = try_extract_closure_params_body(lang, ast, node)? {
-            // Free-variable capture set: the body subtree's name
-            // candidates, computed once here so the VM can filter
-            // `scopes.capture()` to the bindings the body can actually
-            // reference. `None` (unresolvable subtree) keeps the full env.
-            let capture = handl_language::subtree_name_candidates(
-                |r| ast.get(r).map(|n| n.payload.clone()),
-                AstRef::new(closure.body),
-            )
-            .map(Rc::new);
-            out.push(Instr::Closure {
-                params: closure.params,
-                rest: closure.rest,
-                body: closure.body,
-                array_pattern: closure.array_pattern,
-                capture,
-            });
-            return Ok(false);
-        }
+    if source == &ArrSource::Native
+        && op == "closure"
+        && let Some(closure) = try_extract_closure_params_body(lang, ast, node)?
+    {
+        // Free-variable capture set: the body subtree's name
+        // candidates, computed once here so the VM can filter
+        // `scopes.capture()` to the bindings the body can actually
+        // reference. `None` (unresolvable subtree) keeps the full env.
+        let capture = handl_language::subtree_name_candidates(
+            |r| ast.get(r).map(|n| n.payload.clone()),
+            AstRef::new(closure.body),
+        )
+        .map(Rc::new);
+        out.push(Instr::Closure {
+            params: closure.params,
+            rest: closure.rest,
+            body: closure.body,
+            array_pattern: closure.array_pattern,
+            capture,
+        });
+        return Ok(false);
     }
 
     for arg in args {
@@ -897,10 +900,9 @@ fn try_extract_static_object_keys(
         Some(c) => c,
         None => return Ok(None),
     };
-    let start = match lang.child_role_index(&node.kind, "entries")? {
-        Some(i) => i,
-        None => 0,
-    };
+    let start = lang
+        .child_role_index(&node.kind, "entries")?
+        .unwrap_or_default();
 
     let mut keys: Vec<Rc<str>> = Vec::with_capacity(children.len().saturating_sub(start));
     let mut value_indices: Vec<usize> = Vec::with_capacity(children.len().saturating_sub(start));
@@ -940,7 +942,7 @@ fn try_extract_static_object_keys(
         // non-lowering path and role-less shapes (see doc comment above).
         let is_literal_key = lang
             .literal_child(&entry_node.kind, "key", &key_node.kind)
-            .unwrap_or_else(|| matches!(key_node.kind.as_str(), "var" | "string"));
+            .unwrap_or(matches!(key_node.kind.as_str(), "var" | "string"));
         let key_str: String = if is_literal_key {
             match key_node.payload.as_str() {
                 Some(s) => s.to_string(),
@@ -1097,7 +1099,7 @@ mod tests {
 
     #[test]
     fn compile_const() {
-        let s = TermData::op("const", vec![], &ArrSource::Native, Some(json!(42).into()))
+        let s = TermData::op("const", vec![], &ArrSource::Native, Some(json!(42)))
             .to_term()
             .unwrap();
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
@@ -1138,14 +1140,9 @@ mod tests {
 
     #[test]
     fn compile_proj_child() {
-        let s = TermData::op(
-            "proj_child",
-            vec![],
-            &ArrSource::Native,
-            Some(json!(2).into()),
-        )
-        .to_term()
-        .unwrap();
+        let s = TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(2)))
+            .to_term()
+            .unwrap();
         let instrs = compile(&s, &Language::new(), &dummy_ast(), &dummy_node()).unwrap();
         assert_eq!(instrs, vec![Instr::EvalChild(2), Instr::Return]);
     }
@@ -1184,18 +1181,8 @@ mod tests {
         let s = TermData::op(
             "add",
             vec![
-                TermData::op(
-                    "proj_child",
-                    vec![],
-                    &ArrSource::Native,
-                    Some(json!(0).into()),
-                ),
-                TermData::op(
-                    "proj_child",
-                    vec![],
-                    &ArrSource::Native,
-                    Some(json!(1).into()),
-                ),
+                TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0))),
+                TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1))),
             ],
             &ArrSource::Native,
             None,
@@ -1222,7 +1209,7 @@ mod tests {
                 "proj_child",
                 vec![],
                 &ArrSource::Native,
-                Some(json!(0).into()),
+                Some(json!(0)),
             )],
             &ArrSource::Foreign("double".into()),
             None,
@@ -1253,7 +1240,7 @@ mod tests {
     #[test]
     fn compile_seq_no_scope() {
         let s = TermData::seq(
-            TermData::op("const", vec![], &ArrSource::Native, Some(json!(5).into())),
+            TermData::op("const", vec![], &ArrSource::Native, Some(json!(5))),
             TermData::op("id", vec![], &ArrSource::Native, None),
         )
         .to_term()
@@ -1279,7 +1266,7 @@ mod tests {
         // pops after its snd (proj_env) completes.
         let s = TermData::seq(
             TermData::seq(
-                TermData::op("const", vec![], &ArrSource::Native, Some(json!(5).into())),
+                TermData::op("const", vec![], &ArrSource::Native, Some(json!(5))),
                 TermData::op("extend_env", vec![], &ArrSource::Native, Some("x".into())),
             ),
             TermData::op("proj_env", vec![], &ArrSource::Native, Some("x".into())),
@@ -1327,8 +1314,8 @@ mod tests {
     #[test]
     fn compile_choice() {
         let s = TermData::choice(
-            TermData::op("const", vec![], &ArrSource::Native, Some(json!(1).into())),
-            TermData::op("const", vec![], &ArrSource::Native, Some(json!(2).into())),
+            TermData::op("const", vec![], &ArrSource::Native, Some(json!(1))),
+            TermData::op("const", vec![], &ArrSource::Native, Some(json!(2))),
         )
         .to_term()
         .unwrap();
@@ -1379,7 +1366,7 @@ mod tests {
                 "const",
                 vec![],
                 &ArrSource::Native,
-                Some(json!(41).into()),
+                Some(json!(41)),
             )],
         )
         .to_term()
@@ -1418,12 +1405,7 @@ mod tests {
         // Seq(Seq(const true, tag), Choice(const "yes", const "no"))
         let s = TermData::seq(
             TermData::seq(
-                TermData::op(
-                    "const",
-                    vec![],
-                    &ArrSource::Native,
-                    Some(json!(true).into()),
-                ),
+                TermData::op("const", vec![], &ArrSource::Native, Some(json!(true))),
                 TermData::op("tag", vec![], &ArrSource::Native, None),
             ),
             TermData::choice(
@@ -1466,18 +1448,8 @@ mod tests {
         let s = TermData::op(
             "and",
             vec![
-                TermData::op(
-                    "proj_child",
-                    vec![],
-                    &ArrSource::Native,
-                    Some(json!(0).into()),
-                ),
-                TermData::op(
-                    "proj_child",
-                    vec![],
-                    &ArrSource::Native,
-                    Some(json!(1).into()),
-                ),
+                TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0))),
+                TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1))),
             ],
             &ArrSource::Native,
             None,
@@ -1505,7 +1477,7 @@ mod tests {
                 "proj_child",
                 vec![],
                 &ArrSource::Native,
-                Some(json!(0).into()),
+                Some(json!(0)),
             )],
             &ArrSource::Native,
             None,

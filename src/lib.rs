@@ -63,11 +63,11 @@ pub use compile::compile;
 pub use instr::{ArithOp, Instr};
 
 use handl_language::{Ast, AstRef, LangError, Language, SchemeVersion, Value};
+use handl_value::TaggedValue;
 use hnl_engine_exec::{EvalEngine, EvalRequest};
 use hnl_engine_exec_tree_walk::EvalFrame as TreeWalkEvalFrame;
 use hnl_engine_transform::native::{NativeRewrite, NativeRewriteRegistry, RewriteCtx};
 use hnl_engine_transform_rewrite::RewriteEngine;
-use handl_value::TaggedValue;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -168,6 +168,11 @@ impl BytecodeEngine {
         if ast.is_empty() {
             return Ok(Value::Null);
         }
+        // Finalize the shared multi-shot `resume` driver table when the
+        // outermost eval on this thread ends (ADR-0158). Journal and
+        // suspension state is per-`VmFrame` here, so only the cross-engine
+        // driver table needs reclaiming.
+        let _resume_scope = hnl_engine_exec::native_ops::ResumeTableScope::enter(|| {});
         // Term version check -- the engine supports v2 only.
         if !SchemeVersion::v2().supports(&lang.scheme_version) {
             return Err(LangError::engine(format!(
@@ -432,9 +437,9 @@ mod tests {
     use super::*;
     use handl_language::{ArrSource, AstNode, EvalSchemeDef, Language, Value};
     use handl_platform::{EvalContext, Function, Module, ModuleLookup};
-    use hnl_engine_exec::EvalRequest;
     use handl_plugin_module::ModuleRegistry;
     use hnl_engine::TermData;
+    use hnl_engine_exec::EvalRequest;
     use serde_json::json;
 
     /// Build a simple AST for testing.
@@ -510,7 +515,7 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.const",
                 "const",
-                TermData::op("const", vec![], &ArrSource::Native, Some(json!(99).into()))
+                TermData::op("const", vec![], &ArrSource::Native, Some(json!(99)))
                     .to_term()
                     .unwrap(),
             ))
@@ -531,18 +536,8 @@ mod tests {
                 TermData::op(
                     "add",
                     vec![
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(0u64).into()),
-                        ),
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(1u64).into()),
-                        ),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64))),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64))),
                     ],
                     &ArrSource::Native,
                     None,
@@ -584,12 +579,7 @@ mod tests {
                 "let",
                 TermData::seq(
                     TermData::seq(
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(0u64).into()),
-                        ),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64))),
                         TermData::op(
                             "extend_env",
                             vec![],
@@ -597,12 +587,7 @@ mod tests {
                             Some("$payload".into()),
                         ),
                     ),
-                    TermData::op(
-                        "proj_child",
-                        vec![],
-                        &ArrSource::Native,
-                        Some(json!(1u64).into()),
-                    ),
+                    TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64))),
                 )
                 .to_term()
                 .unwrap(),
@@ -627,27 +612,12 @@ mod tests {
                 "if",
                 TermData::seq(
                     TermData::seq(
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(0u64).into()),
-                        ),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64))),
                         TermData::op("tag", vec![], &ArrSource::Native, None),
                     ),
                     TermData::choice(
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(1u64).into()),
-                        ),
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(2u64).into()),
-                        ),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64))),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(2u64))),
                     ),
                 )
                 .to_term()
@@ -674,27 +644,12 @@ mod tests {
                 "if",
                 TermData::seq(
                     TermData::seq(
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(0u64).into()),
-                        ),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64))),
                         TermData::op("tag", vec![], &ArrSource::Native, None),
                     ),
                     TermData::choice(
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(1u64).into()),
-                        ),
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(2u64).into()),
-                        ),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64))),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(2u64))),
                     ),
                 )
                 .to_term()
@@ -725,7 +680,7 @@ mod tests {
                         "proj_child",
                         vec![],
                         &ArrSource::Native,
-                        Some(json!(0u64).into()),
+                        Some(json!(0u64)),
                     )],
                     &ArrSource::Foreign("double".into()),
                     None,
@@ -756,7 +711,7 @@ mod tests {
                         "proj_child",
                         vec![],
                         &ArrSource::Native,
-                        Some(json!(0u64).into()),
+                        Some(json!(0u64)),
                     )],
                     &ArrSource::Foreign("double".into()),
                     None,
@@ -798,12 +753,7 @@ mod tests {
                 "let",
                 TermData::seq(
                     TermData::seq(
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(0u64).into()),
-                        ),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64))),
                         TermData::op(
                             "extend_env",
                             vec![],
@@ -811,12 +761,7 @@ mod tests {
                             Some("$payload".into()),
                         ),
                     ),
-                    TermData::op(
-                        "proj_child",
-                        vec![],
-                        &ArrSource::Native,
-                        Some(json!(1u64).into()),
-                    ),
+                    TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64))),
                 )
                 .to_term()
                 .unwrap(),
@@ -829,18 +774,8 @@ mod tests {
                 TermData::op(
                     "add",
                     vec![
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(0u64).into()),
-                        ),
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(1u64).into()),
-                        ),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64))),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64))),
                     ],
                     &ArrSource::Native,
                     None,
@@ -926,18 +861,8 @@ mod tests {
                 TermData::op(
                     "add",
                     vec![
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(0u64).into()),
-                        ),
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(1u64).into()),
-                        ),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64))),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64))),
                     ],
                     &ArrSource::Native,
                     None,
@@ -951,17 +876,12 @@ mod tests {
                 "e.call",
                 "call",
                 TermData::app(
-                    TermData::op(
-                        "proj_child",
-                        vec![],
-                        &ArrSource::Native,
-                        Some(json!(0u64).into()),
-                    ),
+                    TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64))),
                     vec![TermData::op(
                         "proj_child",
                         vec![],
                         &ArrSource::Native,
-                        Some(json!(1u64).into()),
+                        Some(json!(1u64)),
                     )],
                 )
                 .to_term()
@@ -1004,12 +924,7 @@ mod tests {
                 "let",
                 TermData::seq(
                     TermData::seq(
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(0u64).into()),
-                        ),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64))),
                         TermData::op(
                             "extend_env",
                             vec![],
@@ -1017,12 +932,7 @@ mod tests {
                             Some("$payload".into()),
                         ),
                     ),
-                    TermData::op(
-                        "proj_child",
-                        vec![],
-                        &ArrSource::Native,
-                        Some(json!(1u64).into()),
-                    ),
+                    TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64))),
                 )
                 .to_term()
                 .unwrap(),
@@ -1035,18 +945,8 @@ mod tests {
                 TermData::op(
                     "add",
                     vec![
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(0u64).into()),
-                        ),
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(1u64).into()),
-                        ),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64))),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64))),
                     ],
                     &ArrSource::Native,
                     None,
@@ -1069,17 +969,12 @@ mod tests {
                 "e.call",
                 "call",
                 TermData::app(
-                    TermData::op(
-                        "proj_child",
-                        vec![],
-                        &ArrSource::Native,
-                        Some(json!(0u64).into()),
-                    ),
+                    TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64))),
                     vec![TermData::op(
                         "proj_child",
                         vec![],
                         &ArrSource::Native,
-                        Some(json!(1u64).into()),
+                        Some(json!(1u64)),
                     )],
                 )
                 .to_term()
@@ -1117,7 +1012,7 @@ mod tests {
                         "proj_child",
                         vec![],
                         &ArrSource::Native,
-                        Some(json!(0u64).into()),
+                        Some(json!(0u64)),
                     )],
                     &ArrSource::Foreign("triple".into()),
                     None,
@@ -1166,18 +1061,8 @@ mod tests {
                 TermData::op(
                     "add",
                     vec![
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(0u64).into()),
-                        ),
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(1u64).into()),
-                        ),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64))),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64))),
                     ],
                     &ArrSource::Native,
                     None,

@@ -63,12 +63,12 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use handl_language::{Ast, AstNode, AstRef, LangError, Language, Term, Value};
+use handl_value::{TaggedValue, tagged_to_value};
 use hnl_engine_exec::native_ops::{
     self, NativeOpCtx, Num, OpService, as_num, bin_add, build_loop_step_args, is_truthy,
     loop_step_outcome, num_value, step_decision, type_tag,
 };
 use hnl_engine_exec::pattern_match::{self, PatternMatchCtx};
-use handl_value::{TaggedValue, tagged_to_value};
 use rustc_hash::FxHashMap;
 
 use crate::compile::compile;
@@ -127,19 +127,62 @@ const ARR_DISPATCH_TAG: &str = "__arr__";
 const RESUME_ID_BASE: u64 = 1_000_000_000;
 
 /// A replay journal for multi-shot `resume` (ADR-0158 workstream —
-/// `host/project/design/multishot-resume.md`). Declaration for the
-/// frame's `journals` stack — the journal driver fills this in when the
-/// bytecode multi-shot workstream lands; mirrors the tree-walk's
-/// `ResumeJournal` (body term, incoming, entry-env snapshot, handler,
-/// entries, cursor).
-#[derive(Debug)]
-pub(crate) struct ResumeJournal;
+/// `host/project/design/multishot-resume.md`): everything `resume`
+/// needs to re-run one `handle` body (delimited re-run model). All
+/// captured state is data — the body node + its def-arena slot, the
+/// `handle`-entry scope snapshot, and the covering handler value.
+/// Mirrors the tree-walk's `ResumeJournal`; `target`/`active_def`
+/// replace its `body: TermData`/`ast` pair (the VM evals arena nodes,
+/// not term trees).
+pub(crate) struct ResumeJournal {
+    /// Unique journal instance id — suspensions name the journal they
+    /// belong to so nested `handle`s catch only their own.
+    id: u64,
+    /// The `handle` body node — `handle_dyn`'s `target` child —
+    /// resolved against the arena selected by `active_def`.
+    target: AstRef,
+    /// The `def_arenas` slot live when the journal was minted (`None` =
+    /// the frame's `ast`). `apply_arrow_body` switches `active_def` for
+    /// the clause call that invokes `resume`, so each re-run restores
+    /// the body's own arena.
+    active_def: Option<usize>,
+    /// Environment snapshot at `handle` entry — each run evals a clone,
+    /// so `assign` writes and scope pushes stay inside the run.
+    entry_env: ScopeStack,
+    /// The handler value (`{impls: {op: impl}}` or `{op: impl}` record).
+    handler: TaggedValue,
+    /// `(op, result)` entries in perform order: the replay log.
+    /// `resume(x)` at suspension index `i` seeds a fresh journal with
+    /// `entries[..i] ++ [(op, x)]`.
+    entries: RefCell<Vec<(Rc<str>, TaggedValue)>>,
+    /// Count of journal-intercepted `perform`s so far this run — the
+    /// replay cursor. Fresh runs start at 0 and consume `entries`.
+    cursor: Cell<usize>,
+}
 
 /// A captured `perform` suspension awaiting `resume` (see
-/// [`VmFrame::suspensions`]). Declaration for the suspension table —
-/// mirrors the tree-walk's `ResumeSuspension`.
-#[derive(Debug)]
-pub(crate) struct ResumeSuspension;
+/// [`VmFrame::suspensions`]) — mirrors the tree-walk's
+/// `ResumeSuspension`.
+pub(crate) struct ResumeSuspension {
+    /// The journal active when the perform suspended.
+    journal: Rc<ResumeJournal>,
+    /// This perform's index in the journal's `entries` order.
+    index: usize,
+    /// The performed op name.
+    op: Rc<str>,
+    /// The perform's payload argument.
+    arg: TaggedValue,
+}
+
+/// Decode a `__resume__` payload to a suspension id — mirrors the
+/// tree-walk decoder (integral `Int`/`Float` payloads only).
+fn resume_id_of(v: &TaggedValue) -> Option<u64> {
+    match v {
+        TaggedValue::Int(i) if *i >= 0 => Some(*i as u64),
+        TaggedValue::Float(f) if *f >= 0.0 && f.fract() == 0.0 => Some(*f as u64),
+        _ => None,
+    }
+}
 
 /// Remaining-stack budget at which [`stacker::maybe_grow`] moves the next
 /// eval step onto a fresh segment. The instruction loop is iterative,
@@ -302,10 +345,10 @@ impl ScopeStack {
     /// mark. Never pops the root scope (the `marks` stack always keeps at
     /// least one entry).
     pub(crate) fn pop_scope(&mut self) {
-        if self.marks.len() > 1 {
-            if let Some(mark) = self.marks.pop() {
-                self.bindings.truncate(mark);
-            }
+        if self.marks.len() > 1
+            && let Some(mark) = self.marks.pop()
+        {
+            self.bindings.truncate(mark);
         }
     }
 
@@ -881,9 +924,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                                         node,
                                     )
                                 })?
-                                .iter()
-                                .cloned()
-                                .collect()
+                                .to_vec()
                         } else {
                             args
                         };
@@ -921,9 +962,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                                     node,
                                 )
                             })?
-                            .iter()
-                            .cloned()
-                            .collect();
+                            .to_vec();
                         self.apply_app(&callee, &actual, node)?
                     } else {
                         self.apply_app(&callee, std::slice::from_ref(&arg0), node)?
@@ -1057,8 +1096,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     // Detached `Seq`/`Choice` arg — run on a fresh stack
                     // with the region's incoming; only the sub-program's
                     // top result returns (see `Instr::SubProgram`).
-                    let result =
-                        self.exec_instrs_inner(prog, node, current_incoming.clone())?;
+                    let result = self.exec_instrs_inner(prog, node, current_incoming.clone())?;
                     stack.push(result);
                 }
                 Instr::ArrDispatch(n) => {
@@ -1538,6 +1576,12 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     let arg_tvs: Vec<TaggedValue> = arg_src
                         .and_then(|v| v.as_array().map(|a| a.to_vec()))
                         .unwrap_or_default();
+                    // Multi-shot first: a journal-bound ≥2-ary clause
+                    // replays a journaled result or suspends
+                    // (`LangError::Suspended`) to the `handle` driver.
+                    if let Some(v) = self.journal_perform_or_suspend(&arg_tvs, node)? {
+                        return Ok(v);
+                    }
                     let mut ctx = VmCtx { frame: self, node };
                     if let Some(v) = native_ops::perform_dispatch(&mut ctx, &arg_tvs)
                         .map_err(|e| e.with_node(node))?
@@ -1659,6 +1703,11 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     // ADR-0158: `perform` under a covering handler
                     // dispatches in-flight before the `IO` mint.
                     if native_ops::is_perform_callee(name) {
+                        // Multi-shot first: journal-bound ≥2-ary clauses
+                        // replay or suspend to the `handle` driver.
+                        if let Some(v) = self.journal_perform_or_suspend(&actual_args, node)? {
+                            return Ok(v);
+                        }
                         let mut ctx = VmCtx { frame: self, node };
                         if let Some(v) = native_ops::perform_dispatch(&mut ctx, &actual_args)
                             .map_err(|e| e.with_node(node))?
@@ -1705,6 +1754,13 @@ impl<'a, 'h> VmFrame<'a, 'h> {
         incoming: &TaggedValue,
         node: &AstNode,
     ) -> Result<TaggedValue, LangError> {
+        // Multi-shot resumption (ADR-0158 workstream): an `arr <op>`
+        // dispatch covered by a journal-bound ≥2-ary clause replays a
+        // journaled result or suspends — same interception as
+        // `perform` (the tree-walk `dispatch_op` arm).
+        if let Some(v) = self.journal_perform_or_suspend_op(op, incoming.clone(), node)? {
+            return Ok(v);
+        }
         let impl_val = self
             .handler_stack
             .iter()
@@ -1730,6 +1786,222 @@ impl<'a, 'h> VmFrame<'a, 'h> {
         }
         let op_args = flatten_pair(incoming);
         self.apply_native_v2(op, &op_args, node, Some(incoming.clone()))
+    }
+
+    // ------------------------------------------------------------------
+    // Multi-shot resumption (ADR-0158 workstream —
+    // `host/project/design/multishot-resume.md`): replay-journal driver.
+    // ------------------------------------------------------------------
+
+    /// Next journal/suspension id — bytecode ids start at
+    /// [`RESUME_ID_BASE`] so they never alias the tree-walk's small
+    /// sequential ids (a cross-engine `resume` reports "unknown
+    /// resumption" rather than resuming the wrong suspension).
+    fn take_resume_id(&mut self) -> u64 {
+        let id = self.resume_next_id;
+        self.resume_next_id += 1;
+        id
+    }
+
+    /// Run `journal`'s `handle` body — the driver behind the multi-shot
+    /// [`NativeOpCtx::run_delimited`] branch and `resume` application.
+    ///
+    /// The journal + a `__journal__`-stamped handler frame are installed
+    /// for the body's dynamic extent (in place of the `handle_dyn`
+    /// shell's frame — the `run_delimited` override pops the shell's
+    /// first), then dropped before the `return`/op clauses apply: the
+    /// clauses run outside their own coverage (a `perform` inside a
+    /// clause dispatches to *outer* handlers, matching the algebra
+    /// reading).
+    ///
+    /// - Body completes `v` → `h["return"](v)` when a `return` clause
+    ///   exists, else `v`.
+    /// - Body suspends (`LangError::Suspended`) on this journal →
+    ///   invoke the op's clause `(payload, resume)`; the clause result
+    ///   is the driver's result — `resume`'s own calls fold the
+    ///   `return` clause in through their own runs.
+    /// - Suspensions owned by other journals, and ordinary errors,
+    ///   re-propagate.
+    fn drive_journal(
+        &mut self,
+        journal: &Rc<ResumeJournal>,
+        node: &AstNode,
+    ) -> Result<TaggedValue, LangError> {
+        self.journals.push(Rc::clone(journal));
+        let stamped = native_ops::journal_frame_value(&journal.handler, journal.id);
+        self.handler_stack.push(stamped);
+        // Each run evals a *clone* of the handle-entry env — scope
+        // pushes and `assign` writes stay inside the run — under the
+        // arena the body node belongs to.
+        let saved_scopes = std::mem::replace(&mut self.scopes, journal.entry_env.clone());
+        let saved_def = std::mem::replace(&mut self.active_def, journal.active_def);
+        let run_result = self.exec_node_inner(journal.target);
+        self.active_def = saved_def;
+        self.scopes = saved_scopes;
+        self.handler_stack.pop();
+        self.journals.pop();
+        match run_result {
+            Ok(val) => {
+                // `return` clause — the algebra's unit map on the pure
+                // result (ADR-0158). Applied at every driver completion
+                // so a `resume` return includes it.
+                if let Some(ret) = handler_impl(&journal.handler, "return") {
+                    return self.apply_app(&ret, &[val], node);
+                }
+                Ok(val)
+            }
+            Err(e) => {
+                if let Some(id) = e.suspension_id()
+                    && let Some(susp) = self.suspensions.get(&id).cloned()
+                    && susp.journal.id == journal.id
+                {
+                    let impl_val = handler_impl(&journal.handler, &susp.op).ok_or_else(|| {
+                        LangError::engine_node(
+                            format!("resume: no impl for suspended op '{}'", susp.op),
+                            node,
+                        )
+                    })?;
+                    // The clause gets `(payload, resume)`; its
+                    // result is the `handle` result
+                    // (deep-handler reading).
+                    let k = native_ops::mint_resume_value(id);
+                    return self.apply_app(&impl_val, &[susp.arg.clone(), k], node);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// `perform` interception (multi-shot): `args` are the `PerformFn`
+    /// argument vector `[op, payload?]`. When the op's covering handler
+    /// frame is journal-bound and its clause is ≥2-ary, either replay
+    /// the journaled result at the cursor (`Ok(Some(v))`) or suspend
+    /// (`Err(LangError::Suspended)`). `Ok(None)` → fall through to
+    /// `native_ops::perform_dispatch` (one-shot) or the residual mint.
+    fn journal_perform_or_suspend(
+        &mut self,
+        args: &[TaggedValue],
+        node: &AstNode,
+    ) -> Result<Option<TaggedValue>, LangError> {
+        // Op-name operand spellings mirror `PerformFn`: string, sym, or
+        // the `{"sym": <sym>}` object encoding.
+        let op: Rc<str> = match args.first() {
+            Some(TaggedValue::Str(s)) => Rc::clone(s) as Rc<str>,
+            Some(TaggedValue::Sym(s)) => Rc::from(s.name()),
+            Some(TaggedValue::Obj(f)) => match f.get("sym") {
+                Some(TaggedValue::Sym(s)) => Rc::from(s.name()),
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        let arg = args.get(1).cloned().unwrap_or(TaggedValue::Null);
+        self.journal_perform_or_suspend_op(&op, arg, node)
+    }
+
+    /// The op-level half of [`journal_perform_or_suspend`], shared with
+    /// [`arr_dispatch`]: resolve the innermost covering handler frame,
+    /// and when its clause is a journal-bound ≥2-ary impl, replay or
+    /// suspend.
+    fn journal_perform_or_suspend_op(
+        &mut self,
+        op: &str,
+        arg: TaggedValue,
+        node: &AstNode,
+    ) -> Result<Option<TaggedValue>, LangError> {
+        // The innermost covering frame — the same frame
+        // `handler_lookup` / `perform_dispatch` would resolve.
+        let covering = self
+            .handler_stack
+            .iter()
+            .rev()
+            .find(|h| handler_impl(h, op).is_some())
+            .cloned();
+        let Some(frame) = covering else {
+            return Ok(None);
+        };
+        // `acc` frames use 2-ary impls for the `(payload, s)`
+        // convention — not resumptions. Non-arrow and 1-ary impls take
+        // the one-shot path.
+        if frame.get(native_ops::HANDLER_ACC_KEY).is_some() {
+            return Ok(None);
+        }
+        let Some(impl_val) = handler_impl(&frame, op) else {
+            return Ok(None);
+        };
+        if !native_ops::impl_takes_resumption(&impl_val) {
+            return Ok(None);
+        }
+        // Journal-bound? A frame installed by a journal driver carries
+        // `__journal__`. Carried/foreign ≥2-ary impls fall through to
+        // the ordinary apply (arity error, as before).
+        let Some(TaggedValue::Int(jid)) = frame.get(native_ops::JOURNAL_FRAME_KEY) else {
+            return Ok(None);
+        };
+        let jid = *jid as u64;
+        let Some(journal) = self.journals.iter().rev().find(|j| j.id == jid).cloned() else {
+            return Ok(None);
+        };
+        // Replay-or-suspend at this journal's cursor.
+        let i = journal.cursor.get();
+        journal.cursor.set(i + 1);
+        if let Some((logged_op, val)) = journal.entries.borrow().get(i).cloned() {
+            if logged_op.as_ref() != op {
+                return Err(LangError::engine_node(
+                    format!(
+                        "resume: replay op mismatch at index {i} — journaled '{logged_op}', \
+                         re-ran '{op}' (nondeterministic perform sequence: replay requires \
+                         deterministic bodies)"
+                    ),
+                    node,
+                ));
+            }
+            return Ok(Some(val));
+        }
+        let id = self.take_resume_id();
+        self.suspensions.insert(
+            id,
+            Rc::new(ResumeSuspension {
+                journal,
+                index: i,
+                op: Rc::from(op),
+                arg,
+            }),
+        );
+        Err(LangError::suspended(id))
+    }
+
+    /// `resume(x)` — re-run the suspended `handle` body under a fresh
+    /// journal seeded with `entries[..index] ++ [(op, x)]`. The body's
+    /// completed value (through the `return` clause) is `resume`'s
+    /// result; a suspension inside the re-run invokes the covering
+    /// clause again and its result is this call's result — copyable,
+    /// multi-shot delimited continuation via replay.
+    fn resume_suspension(
+        &mut self,
+        id: u64,
+        x: TaggedValue,
+        node: &AstNode,
+    ) -> Result<TaggedValue, LangError> {
+        let susp = self.suspensions.get(&id).cloned().ok_or_else(|| {
+            LangError::engine_node(
+                format!("resume: unknown resumption {id} — suspension not in the table"),
+                node,
+            )
+        })?;
+        let j = &susp.journal;
+        let prefix_len = susp.index.min(j.entries.borrow().len());
+        let mut entries: Vec<(Rc<str>, TaggedValue)> = j.entries.borrow()[..prefix_len].to_vec();
+        entries.push((Rc::clone(&susp.op), x));
+        let j2 = Rc::new(ResumeJournal {
+            id: self.take_resume_id(),
+            target: j.target,
+            active_def: j.active_def,
+            entry_env: j.entry_env.clone(),
+            handler: j.handler.clone(),
+            entries: RefCell::new(entries),
+            cursor: Cell::new(0),
+        });
+        self.drive_journal(&j2, node)
     }
 
     /// Apply an `App` callee: closure application only (ADR-0060).
@@ -1760,6 +2032,23 @@ impl<'a, 'h> VmFrame<'a, 'h> {
         args: &[TaggedValue],
         node: &AstNode,
     ) -> Result<TaggedValue, LangError> {
+        // Multi-shot resumption (ADR-0158 workstream): a `resume` value
+        // (`{"__resume__": <id>}`) drives a replay re-run of the
+        // suspended `handle` body. Intercepted before the
+        // dispatch-object/`__term__`/Arrow arms — the reserved-key
+        // convention is the same (`__term__`, `__arr__`).
+        if let TaggedValue::Obj(map) = callee
+            && let Some(id_val) = map.get(native_ops::RESUME_KEY)
+        {
+            let id = resume_id_of(id_val).ok_or_else(|| {
+                LangError::engine_node(
+                    format!("resume: malformed resumption value {id_val:?}"),
+                    node,
+                )
+            })?;
+            let x = args.first().cloned().unwrap_or(TaggedValue::Null);
+            return self.resume_suspension(id, x, node);
+        }
         // First-class `arr <op>` dispatch object: apply the op to the
         // args (the tree-walk `apply_app` `__arr__` arm).
         if let Some(inner) = callee.get(ARR_DISPATCH_TAG) {
@@ -1776,39 +2065,46 @@ impl<'a, 'h> VmFrame<'a, 'h> {
             // `x ~> second(first(x))`. A `second` that is a bare string
             // is a host-function name and dispatches through the module
             // registry (the tree-walk `apply_app` `Arrow` arm).
-            if map.get("__tag__").and_then(|t| t.as_str()) == Some("Arrow") {
-                if let (Some(first), Some(second)) = (map.get("first"), map.get("second")) {
-                    let mid = self.apply_app(first, args, node)?;
-                    if let Some(name) = second.as_str() {
-                        // ADR-0158: `perform` under a covering handler
-                        // dispatches in-flight before the `IO` mint.
-                        if native_ops::is_perform_callee(name) {
-                            let mut ctx = VmCtx { frame: self, node };
-                            if let Some(v) = native_ops::perform_dispatch(&mut ctx, &[mid.clone()])
-                                .map_err(|e| e.with_node(node))?
-                            {
-                                return Ok(v);
-                            }
+            if map.get("__tag__").and_then(|t| t.as_str()) == Some("Arrow")
+                && let (Some(first), Some(second)) = (map.get("first"), map.get("second"))
+            {
+                let mid = self.apply_app(first, args, node)?;
+                if let Some(name) = second.as_str() {
+                    // ADR-0158: `perform` under a covering handler
+                    // dispatches in-flight before the `IO` mint.
+                    if native_ops::is_perform_callee(name) {
+                        // Multi-shot first: journal-bound ≥2-ary
+                        // clauses replay or suspend to the driver.
+                        if let Some(v) =
+                            self.journal_perform_or_suspend(std::slice::from_ref(&mid), node)?
+                        {
+                            return Ok(v);
                         }
-                        let modules = self.modules.ok_or_else(|| {
-                            LangError::engine_node("call_host: no module registry".to_string(), node)
-                        })?;
-                        let func = modules.lookup(name).ok_or_else(|| {
-                            LangError::engine_node(
-                                format!("call_host: function '{}' not found", name),
-                                node,
-                            )
-                        })?;
-                        let call_args: Vec<Value> =
-                            vec![mid].iter().map(tagged_to_value).collect();
-                        let mut pctx = handl_platform::EvalContext::new();
-                        let val = func
-                            .call(&call_args, &mut pctx)
-                            .map_err(|e| LangError::engine_node(e.to_string(), node))?;
-                        return Ok(TaggedValue::from(val));
+                        let mut ctx = VmCtx { frame: self, node };
+                        if let Some(v) =
+                            native_ops::perform_dispatch(&mut ctx, std::slice::from_ref(&mid))
+                                .map_err(|e| e.with_node(node))?
+                        {
+                            return Ok(v);
+                        }
                     }
-                    return self.apply_app(second, &[mid], node);
+                    let modules = self.modules.ok_or_else(|| {
+                        LangError::engine_node("call_host: no module registry".to_string(), node)
+                    })?;
+                    let func = modules.lookup(name).ok_or_else(|| {
+                        LangError::engine_node(
+                            format!("call_host: function '{}' not found", name),
+                            node,
+                        )
+                    })?;
+                    let call_args: Vec<Value> = [mid].iter().map(tagged_to_value).collect();
+                    let mut pctx = handl_platform::EvalContext::new();
+                    let val = func
+                        .call(&call_args, &mut pctx)
+                        .map_err(|e| LangError::engine_node(e.to_string(), node))?;
+                    return Ok(TaggedValue::from(val));
                 }
+                return self.apply_app(second, &[mid], node);
             }
             if let Some(term_val) = map.get("__term__") {
                 let mut elems: Vec<TaggedValue> = Vec::new();
@@ -1925,7 +2221,8 @@ impl<'a, 'h> VmFrame<'a, 'h> {
         // args, evaluate the body, then apply the result to the surplus —
         // `f(1, 5)` on a curried arrow is `(f 1) 5`.
         let (head, mut rest) = actual_args.split_at(params.len());
-        let mut val = self.apply_arrow_body(&params, None, &body_def, &binds, head, &[], node, callee)?;
+        let mut val =
+            self.apply_arrow_body(&params, None, &body_def, &binds, head, &[], node, callee)?;
         while !rest.is_empty() {
             val = self.apply_app(&val, rest, node)?;
             rest = &[];
@@ -2275,9 +2572,41 @@ impl NativeOpCtx for VmCtx<'_, '_, '_, '_> {
         handler: &TaggedValue,
         frame_handler: &TaggedValue,
     ) -> Result<TaggedValue, LangError> {
-        // One-shot tail until the journal driver lands here — mirrors
-        // `TwCtx::run_delimited` in the tree-walk.
-        native_ops::run_delimited_default(self, target, handler, frame_handler)
+        // Multi-shot resumption (ADR-0158 workstream —
+        // `design/multishot-resume.md`): a ≥2-ary clause
+        // `(payload, resume) ~> …` runs the body under a replay journal —
+        // covered `perform`s/`arr` dispatches suspend to the driver and
+        // `resume` re-runs `target` from this boundary. `acc` frames are
+        // excluded: their 2-ary impls are the `(payload, s)` convention,
+        // not resumptions. 1-ary-only handlers take the shared one-shot
+        // tail.
+        let multishot = frame_handler.get(native_ops::HANDLER_ACC_KEY).is_none()
+            && native_ops::handler_has_resumption(handler);
+        if !multishot {
+            return native_ops::run_delimited_default(self, target, handler, frame_handler);
+        }
+        let journal = Rc::new(ResumeJournal {
+            id: self.frame.take_resume_id(),
+            target,
+            active_def: self.frame.active_def,
+            entry_env: self.frame.scopes.clone(),
+            handler: handler.clone(),
+            entries: RefCell::new(Vec::new()),
+            cursor: Cell::new(0),
+        });
+        // The shell already pushed `frame_handler`; the journal driver
+        // installs its own `__journal__`-stamped frame for the extent.
+        // This pop *is* the shell-frame pop the `run_delimited`
+        // contract requires — the driver pushes/pops its own frame.
+        self.frame.handler_stack.pop();
+        let val = self.frame.drive_journal(&journal, self.node)?;
+        // Residual-`IO` interpretation under the handler + deep-handler
+        // carry — the tree-walk multi-shot `Handle` arm's postlude.
+        self.frame.handler_stack.push(frame_handler.clone());
+        let interpreted = native_ops::interpret_io_former(self, val);
+        self.frame.handler_stack.pop();
+        let val = interpreted?;
+        Ok(native_ops::attach_carried_handler(val, frame_handler))
     }
 }
 
@@ -2423,9 +2752,9 @@ mod tests {
     use super::*;
     use handl_language::{ArrSource, Ast, AstNode, EvalSchemeDef, Language, SchemeVersion, Term};
     use handl_platform::{EvalContext, Function, Module, ModuleLookup};
-    use hnl_engine_exec::ImportResolver;
     use handl_plugin_module::ModuleRegistry;
     use hnl_engine::TermData;
+    use hnl_engine_exec::ImportResolver;
     use serde_json::json;
     use std::rc::Rc;
 
@@ -2473,7 +2802,7 @@ mod tests {
 
     #[test]
     fn arr_const_returns_literal() {
-        let s = TermData::op("const", vec![], &ArrSource::Native, Some(json!(42).into()))
+        let s = TermData::op("const", vec![], &ArrSource::Native, Some(json!(42)))
             .to_term()
             .unwrap();
         let result = eval_standalone(&s).unwrap();
@@ -2525,7 +2854,7 @@ mod tests {
     #[test]
     fn seq_const_then_id() {
         let s = TermData::seq(
-            TermData::op("const", vec![], &ArrSource::Native, Some(json!(5).into())),
+            TermData::op("const", vec![], &ArrSource::Native, Some(json!(5))),
             TermData::op("id", vec![], &ArrSource::Native, None),
         )
         .to_term()
@@ -2540,7 +2869,7 @@ mod tests {
     fn bind_shape_extend_env_then_proj_env() {
         let s = TermData::seq(
             TermData::seq(
-                TermData::op("const", vec![], &ArrSource::Native, Some(json!(5).into())),
+                TermData::op("const", vec![], &ArrSource::Native, Some(json!(5))),
                 TermData::op("extend_env", vec![], &ArrSource::Native, Some("x".into())),
             ),
             TermData::op("proj_env", vec![], &ArrSource::Native, Some("x".into())),
@@ -2560,7 +2889,7 @@ mod tests {
                 "const",
                 vec![],
                 &ArrSource::Native,
-                Some(pair(json!(3), json!(7)).into()),
+                Some(pair(json!(3), json!(7))),
             ),
             TermData::first(TermData::op("id", vec![], &ArrSource::Native, None)),
         )
@@ -2577,13 +2906,13 @@ mod tests {
                 "const",
                 vec![],
                 &ArrSource::Native,
-                Some(pair(json!(3), json!(7)).into()),
+                Some(pair(json!(3), json!(7))),
             ),
             TermData::first(TermData::op(
                 "const",
                 vec![],
                 &ArrSource::Native,
-                Some(json!(99).into()),
+                Some(json!(99)),
             )),
         )
         .to_term()
@@ -2601,11 +2930,11 @@ mod tests {
                 "const",
                 vec![],
                 &ArrSource::Native,
-                Some(either_left(json!(5)).into()),
+                Some(either_left(json!(5))),
             ),
             TermData::choice(
-                TermData::op("const", vec![], &ArrSource::Native, Some(json!(1).into())),
-                TermData::op("const", vec![], &ArrSource::Native, Some(json!(2).into())),
+                TermData::op("const", vec![], &ArrSource::Native, Some(json!(1))),
+                TermData::op("const", vec![], &ArrSource::Native, Some(json!(2))),
             ),
         )
         .to_term()
@@ -2621,11 +2950,11 @@ mod tests {
                 "const",
                 vec![],
                 &ArrSource::Native,
-                Some(either_right(json!(5)).into()),
+                Some(either_right(json!(5))),
             ),
             TermData::choice(
-                TermData::op("const", vec![], &ArrSource::Native, Some(json!(1).into())),
-                TermData::op("const", vec![], &ArrSource::Native, Some(json!(2).into())),
+                TermData::op("const", vec![], &ArrSource::Native, Some(json!(1))),
+                TermData::op("const", vec![], &ArrSource::Native, Some(json!(2))),
             ),
         )
         .to_term()
@@ -2640,12 +2969,7 @@ mod tests {
     fn tag_choice_true_yields_then() {
         let s = TermData::seq(
             TermData::seq(
-                TermData::op(
-                    "const",
-                    vec![],
-                    &ArrSource::Native,
-                    Some(json!(true).into()),
-                ),
+                TermData::op("const", vec![], &ArrSource::Native, Some(json!(true))),
                 TermData::op("tag", vec![], &ArrSource::Native, None),
             ),
             TermData::choice(
@@ -2663,12 +2987,7 @@ mod tests {
     fn tag_choice_false_yields_else() {
         let s = TermData::seq(
             TermData::seq(
-                TermData::op(
-                    "const",
-                    vec![],
-                    &ArrSource::Native,
-                    Some(json!(false).into()),
-                ),
+                TermData::op("const", vec![], &ArrSource::Native, Some(json!(false))),
                 TermData::op("tag", vec![], &ArrSource::Native, None),
             ),
             TermData::choice(
@@ -2687,7 +3006,7 @@ mod tests {
     #[test]
     fn loop_causal_single_step() {
         let s = TermData::seq(
-            TermData::op("const", vec![], &ArrSource::Native, Some(json!(10).into())),
+            TermData::op("const", vec![], &ArrSource::Native, Some(json!(10))),
             TermData::loop_feedback(TermData::op("inc_fst", vec![], &ArrSource::Native, None)),
         )
         .to_term()
@@ -2705,7 +3024,7 @@ mod tests {
                 "const",
                 vec![],
                 &ArrSource::Native,
-                Some(pair(json!(42), json!(5)).into()),
+                Some(pair(json!(42), json!(5))),
             ),
             TermData::loop_feedback(TermData::op(
                 "countdown_step",
@@ -2723,7 +3042,7 @@ mod tests {
     #[test]
     fn loop_multi_step_max_iterations_guard() {
         let s = TermData::seq(
-            TermData::op("const", vec![], &ArrSource::Native, Some(json!(1).into())),
+            TermData::op("const", vec![], &ArrSource::Native, Some(json!(1))),
             TermData::loop_feedback(TermData::op(
                 "infinite_step",
                 vec![],
@@ -2758,7 +3077,7 @@ mod tests {
                     "proj_env",
                     vec![],
                     &ArrSource::Native,
-                    Some(Value::String("$payload".into()).into()),
+                    Some(Value::String("$payload".into())),
                 )
                 .to_term()
                 .unwrap(),
@@ -2781,13 +3100,13 @@ mod tests {
                                 "proj_child",
                                 vec![],
                                 &ArrSource::Native,
-                                Some(json!(0u64).into()),
+                                Some(json!(0u64)),
                             ),
                             TermData::op(
                                 "proj_child",
                                 vec![],
                                 &ArrSource::Native,
-                                Some(json!(1u64).into()),
+                                Some(json!(1u64)),
                             ),
                         ],
                         &ArrSource::Native,
@@ -2805,27 +3124,12 @@ mod tests {
                 "if",
                 TermData::seq(
                     TermData::seq(
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(0u64).into()),
-                        ),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64))),
                         TermData::op("tag", vec![], &ArrSource::Native, None),
                     ),
                     TermData::choice(
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(1u64).into()),
-                        ),
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(2u64).into()),
-                        ),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64))),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(2u64))),
                     ),
                 )
                 .to_term()
@@ -2857,14 +3161,9 @@ mod tests {
             .merge(EvalSchemeDef::new(
                 "e.return",
                 "return",
-                TermData::op(
-                    "proj_child",
-                    vec![],
-                    &ArrSource::Native,
-                    Some(json!(0u64).into()),
-                )
-                .to_term()
-                .unwrap(),
+                TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64)))
+                    .to_term()
+                    .unwrap(),
             ))
             .unwrap();
         // loop -> Seq(proj_child(0), Loop(loop_step(proj_child(1))))
@@ -2873,19 +3172,14 @@ mod tests {
                 "e.loop",
                 "loop",
                 TermData::seq(
-                    TermData::op(
-                        "proj_child",
-                        vec![],
-                        &ArrSource::Native,
-                        Some(json!(0u64).into()),
-                    ),
+                    TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64))),
                     TermData::loop_feedback(TermData::op(
                         "loop_step",
                         vec![TermData::op(
                             "proj_child",
                             vec![],
                             &ArrSource::Native,
-                            Some(json!(1u64).into()),
+                            Some(json!(1u64)),
                         )],
                         &ArrSource::Native,
                         None,
@@ -3064,7 +3358,7 @@ mod tests {
         // is_pos: native op, 0 args, uses incoming (checks > 0)
         // dec: native op, 0 args, uses incoming (subtracts 1)
         let s = TermData::seq(
-            TermData::op("const", vec![], &ArrSource::Native, Some(json!(5).into())),
+            TermData::op("const", vec![], &ArrSource::Native, Some(json!(5))),
             TermData::loop_feedback(TermData::op(
                 "while_step",
                 vec![
@@ -3085,7 +3379,7 @@ mod tests {
     #[test]
     fn while_step_zero_iterations() {
         let s = TermData::seq(
-            TermData::op("const", vec![], &ArrSource::Native, Some(json!(0).into())),
+            TermData::op("const", vec![], &ArrSource::Native, Some(json!(0))),
             TermData::loop_feedback(TermData::op(
                 "while_step",
                 vec![
@@ -3111,7 +3405,7 @@ mod tests {
                 "const",
                 vec![],
                 &ArrSource::Native,
-                Some(pair(json!(5), json!(0)).into()),
+                Some(pair(json!(5), json!(0))),
             ),
             TermData::loop_feedback(TermData::op(
                 "for_step",
@@ -3134,7 +3428,7 @@ mod tests {
                 "const",
                 vec![],
                 &ArrSource::Native,
-                Some(pair(json!(0), json!(99)).into()),
+                Some(pair(json!(0), json!(99))),
             ),
             TermData::loop_feedback(TermData::op(
                 "for_step",
@@ -3154,7 +3448,7 @@ mod tests {
     #[test]
     fn fix_step_halve_to_zero() {
         let s = TermData::seq(
-            TermData::op("const", vec![], &ArrSource::Native, Some(json!(100).into())),
+            TermData::op("const", vec![], &ArrSource::Native, Some(json!(100))),
             TermData::loop_feedback(TermData::op(
                 "fix_step",
                 vec![TermData::op("half_floor", vec![], &ArrSource::Native, None)],
@@ -3172,7 +3466,7 @@ mod tests {
     #[test]
     fn fix_step_already_at_fixpoint() {
         let s = TermData::seq(
-            TermData::op("const", vec![], &ArrSource::Native, Some(json!(0).into())),
+            TermData::op("const", vec![], &ArrSource::Native, Some(json!(0))),
             TermData::loop_feedback(TermData::op(
                 "fix_step",
                 vec![TermData::op("half_floor", vec![], &ArrSource::Native, None)],
@@ -3223,12 +3517,12 @@ mod tests {
             },
         });
         let s = TermData::app(
-            TermData::op("const", vec![], &ArrSource::Native, Some(closure.into())),
+            TermData::op("const", vec![], &ArrSource::Native, Some(closure)),
             vec![TermData::op(
                 "const",
                 vec![],
                 &ArrSource::Native,
-                Some(json!(41).into()),
+                Some(json!(41)),
             )],
         )
         .to_term()
@@ -3247,8 +3541,8 @@ mod tests {
         let s = TermData::op(
             "add",
             vec![
-                TermData::op("const", vec![], &ArrSource::Native, Some(json!(2).into())),
-                TermData::op("const", vec![], &ArrSource::Native, Some(json!(3).into())),
+                TermData::op("const", vec![], &ArrSource::Native, Some(json!(2))),
+                TermData::op("const", vec![], &ArrSource::Native, Some(json!(3))),
             ],
             &ArrSource::Native,
             None,
@@ -3264,8 +3558,8 @@ mod tests {
         let s = TermData::op(
             "eq",
             vec![
-                TermData::op("const", vec![], &ArrSource::Native, Some(json!(2).into())),
-                TermData::op("const", vec![], &ArrSource::Native, Some(json!(2).into())),
+                TermData::op("const", vec![], &ArrSource::Native, Some(json!(2))),
+                TermData::op("const", vec![], &ArrSource::Native, Some(json!(2))),
             ],
             &ArrSource::Native,
             None,
@@ -3331,7 +3625,7 @@ mod tests {
                 "const",
                 vec![],
                 &ArrSource::Native,
-                Some(json!(21).into()),
+                Some(json!(21)),
             )],
             &ArrSource::Foreign("double".into()),
             None,
@@ -3356,7 +3650,7 @@ mod tests {
                 "const",
                 vec![],
                 &ArrSource::Native,
-                Some(json!(21).into()),
+                Some(json!(21)),
             )],
             &ArrSource::Foreign("double".into()),
             None,
@@ -3384,18 +3678,8 @@ mod tests {
                 TermData::op(
                     "add",
                     vec![
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(0u64).into()),
-                        ),
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(1u64).into()),
-                        ),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64))),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64))),
                     ],
                     &ArrSource::Native,
                     None,
@@ -3423,27 +3707,12 @@ mod tests {
                 "if",
                 TermData::seq(
                     TermData::seq(
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(0u64).into()),
-                        ),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64))),
                         TermData::op("tag", vec![], &ArrSource::Native, None),
                     ),
                     TermData::choice(
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(1u64).into()),
-                        ),
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(2u64).into()),
-                        ),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64))),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(2u64))),
                     ),
                 )
                 .to_term()
@@ -3470,27 +3739,12 @@ mod tests {
                 "if",
                 TermData::seq(
                     TermData::seq(
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(0u64).into()),
-                        ),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(0u64))),
                         TermData::op("tag", vec![], &ArrSource::Native, None),
                     ),
                     TermData::choice(
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(1u64).into()),
-                        ),
-                        TermData::op(
-                            "proj_child",
-                            vec![],
-                            &ArrSource::Native,
-                            Some(json!(2u64).into()),
-                        ),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(1u64))),
+                        TermData::op("proj_child", vec![], &ArrSource::Native, Some(json!(2u64))),
                     ),
                 )
                 .to_term()
@@ -3553,7 +3807,7 @@ mod tests {
                     "proj_env",
                     vec![],
                     &ArrSource::Native,
-                    Some(Value::from("$payload").into()),
+                    Some(Value::from("$payload")),
                 )
                 .to_term()
                 .unwrap(),
@@ -3570,7 +3824,7 @@ mod tests {
                         "proj_child",
                         vec![],
                         &ArrSource::Native,
-                        Some(Value::from(0u64).into()),
+                        Some(Value::from(0u64)),
                     )],
                     &ArrSource::Native,
                     None,
@@ -3609,7 +3863,7 @@ mod tests {
                         "const",
                         vec![],
                         &ArrSource::Native,
-                        Some(Value::from("m.hnl").into()),
+                        Some(Value::from("m.hnl")),
                     )],
                     &ArrSource::Native,
                     None,
@@ -3648,7 +3902,7 @@ mod tests {
                     "proj_env",
                     vec![],
                     &ArrSource::Native,
-                    Some(Value::from("$payload").into()),
+                    Some(Value::from("$payload")),
                 )
                 .to_term()
                 .unwrap(),
@@ -3673,7 +3927,7 @@ mod tests {
                         "proj_child",
                         vec![],
                         &ArrSource::Native,
-                        Some(Value::from(0u64).into()),
+                        Some(Value::from(0u64)),
                     )],
                     &ArrSource::Native,
                     None,
@@ -3832,5 +4086,219 @@ mod tests {
         let mut frame = VmFrame::new(&ast, &lang, Some(&registry), None);
         let result = frame.exec_instrs(&instrs, node, None).unwrap();
         assert_eq!(result, json!(6));
+    }
+
+    // -----------------------------------------------------------------
+    // Multi-shot `resume` (ADR-0158 workstream — replay journals)
+    // -----------------------------------------------------------------
+
+    /// `proj_env name` — variable lookup (the v2 `var` spelling).
+    fn rvar(name: &str) -> Term {
+        TermData::op("proj_env", vec![], &ArrSource::Native, Some(name.into()))
+            .to_term()
+            .expect("TermData -> Term")
+    }
+
+    /// `proj_child n` — child-node projection.
+    fn rchild(n: u64) -> Term {
+        TermData::op(
+            "proj_child",
+            vec![],
+            &ArrSource::Native,
+            Some(Value::from(n)),
+        )
+        .to_term()
+        .expect("TermData -> Term")
+    }
+
+    /// `arr_native op args` — a native op with no literal operand.
+    fn rprim(op: &str, args: Vec<Term>) -> Term {
+        Term::arr_native(op, args)
+    }
+
+    /// Minimal language for resumption tests (mirrors the cranelift and
+    /// tree-walk `resume_lang`): `var`, payload fallback, `binary.add`,
+    /// `array`, `idx` (`prim index` — element projection), `call`
+    /// (canonical callee routing — string callees go to `call_host`,
+    /// values to `App`), `function` (closure op), `object`/`entry`
+    /// (handler records), and the dynamic-extent `handle`.
+    fn resume_lang() -> Language {
+        let mut lang = Language::new();
+        lang.eval
+            .merge(EvalSchemeDef::new("e.var", "var", rvar("$payload")))
+            .unwrap();
+        lang.eval
+            .merge(EvalSchemeDef::new(
+                "e.add",
+                "binary.add",
+                rprim("add", vec![rchild(0), rchild(1)]),
+            ))
+            .unwrap();
+        lang.eval
+            .merge(EvalSchemeDef::new(
+                "e.array",
+                "array",
+                rprim("array", vec![]),
+            ))
+            .unwrap();
+        lang.eval
+            .merge(EvalSchemeDef::new(
+                "e.index",
+                "idx",
+                rprim("index", vec![rchild(0), rchild(1)]),
+            ))
+            .unwrap();
+        // eval.call's canonical shape: route the evaluated callee by
+        // type — string → `call_host` (host fn, incl. `perform`), value
+        // → `App` (arrows, `resume` objects).
+        lang.eval
+            .merge(EvalSchemeDef::new(
+                "e.call",
+                "call",
+                Term::seq(
+                    Term::seq(
+                        rchild(0),
+                        Term::arr_native_lit("route_on_type", vec![], "string"),
+                    ),
+                    Term::choice(
+                        rprim("call_host", vec![rprim("proj_rest", vec![])]),
+                        Term::app(rprim("id", vec![]), vec![rprim("proj_rest", vec![])]),
+                    ),
+                ),
+            ))
+            .unwrap();
+        lang.eval
+            .merge(EvalSchemeDef::new(
+                "e.function",
+                "function",
+                rprim("closure", vec![]),
+            ))
+            .unwrap();
+        lang.eval
+            .merge(EvalSchemeDef::new(
+                "e.object",
+                "object",
+                rprim("object", vec![]),
+            ))
+            .unwrap();
+        lang.eval
+            .merge(EvalSchemeDef::new(
+                "e.handle",
+                "handle",
+                Term::handle(rchild(0), "", rchild(1)),
+            ))
+            .unwrap();
+        lang
+    }
+
+    /// `choose`: `handle (perform(choose, [1,2]) + 100) with
+    /// {choose: (opts, resume) ~> [resume(opts[0]), resume(opts[1])]}`
+    /// → `[101, 102]` — each `resume` call re-runs the body, feeding the
+    /// option back at the `perform` site and continuing through `+100`.
+    #[test]
+    fn choose_multishot_resume_collects_both_continuations() {
+        let engine = crate::BytecodeEngine::new();
+        let lang = resume_lang();
+        let ast = make_ast(vec![
+            AstNode::new("var").with_payload(json!("perform")), // 0: callee
+            AstNode::new("var").with_payload(json!("choose")),  // 1: op arg
+            AstNode::new("value").with_payload(json!(1)),       // 2
+            AstNode::new("value").with_payload(json!(2)),       // 3
+            AstNode::new("array").with_payload(json!({"children": [2, 3]})), // 4: [1,2]
+            AstNode::new("call").with_payload(json!({"children": [0, 1, 4]})), // 5: perform(choose,[1,2])
+            AstNode::new("value").with_payload(json!(100)),                    // 6
+            AstNode::new("binary.add").with_payload(json!({"children": [5, 6]})), // 7: BODY
+            AstNode::new("var").with_payload(json!("resume")),                 // 8
+            AstNode::new("var").with_payload(json!("opts")),                   // 9
+            AstNode::new("value").with_payload(json!(0)),                      // 10
+            AstNode::new("idx").with_payload(json!({"children": [9, 10]})),    // 11: opts[0]
+            AstNode::new("call").with_payload(json!({"children": [8, 11]})), // 12: resume(opts[0])
+            AstNode::new("value").with_payload(json!(1)),                    // 13
+            AstNode::new("idx").with_payload(json!({"children": [9, 13]})),  // 14: opts[1]
+            AstNode::new("call").with_payload(json!({"children": [8, 14]})), // 15: resume(opts[1])
+            AstNode::new("array").with_payload(json!({"children": [12, 15]})), // 16: clause body
+            AstNode::new("function")
+                .with_payload(json!({"params": ["opts", "resume"], "body": 16})), // 17
+            AstNode::new("key").with_payload(json!("choose")),               // 18: entry key
+            AstNode::new("entry").with_payload(json!({"children": [18, 17]})), // 19
+            AstNode::new("object").with_payload(json!({"children": [19]})),  // 20: handler
+            AstNode::new("handle").with_payload(json!({"children": [7, 20]})), // 21: root
+        ]);
+        let req = hnl_engine_exec::EvalRequest::new(ast);
+        assert_eq!(
+            hnl_engine_exec::EvalEngine::eval(&engine, &lang, &req).unwrap(),
+            json!([101, 102])
+        );
+    }
+
+    /// Nested multi-shot: two `choose`s in one body.
+    /// `handle (perform(choose,[1,2]) + perform(choose,[10,20])) with
+    /// {choose: (opts, resume) ~> [resume(opts[0]), resume(opts[1])]}`
+    /// → `[[11, 21], [12, 22]]` — the second perform suspends inside each
+    /// first-level resume, the clause re-runs per nested suspension.
+    #[test]
+    fn choose_nested_suspensions_are_cartesian() {
+        let engine = crate::BytecodeEngine::new();
+        let lang = resume_lang();
+        let ast = make_ast(vec![
+            AstNode::new("var").with_payload(json!("perform")), // 0
+            AstNode::new("var").with_payload(json!("choose")),  // 1
+            AstNode::new("value").with_payload(json!(1)),       // 2
+            AstNode::new("value").with_payload(json!(2)),       // 3
+            AstNode::new("array").with_payload(json!({"children": [2, 3]})), // 4: [1,2]
+            AstNode::new("call").with_payload(json!({"children": [0, 1, 4]})), // 5: perform(choose,[1,2])
+            AstNode::new("value").with_payload(json!(10)),                     // 6
+            AstNode::new("value").with_payload(json!(20)),                     // 7
+            AstNode::new("array").with_payload(json!({"children": [6, 7]})),   // 8: [10,20]
+            AstNode::new("call").with_payload(json!({"children": [0, 1, 8]})), // 9: perform(choose,[10,20])
+            AstNode::new("binary.add").with_payload(json!({"children": [5, 9]})), // 10: BODY
+            AstNode::new("var").with_payload(json!("resume")),                 // 11
+            AstNode::new("var").with_payload(json!("opts")),                   // 12
+            AstNode::new("value").with_payload(json!(0)),                      // 13
+            AstNode::new("idx").with_payload(json!({"children": [12, 13]})),   // 14: opts[0]
+            AstNode::new("call").with_payload(json!({"children": [11, 14]})), // 15: resume(opts[0])
+            AstNode::new("value").with_payload(json!(1)),                     // 16
+            AstNode::new("idx").with_payload(json!({"children": [12, 16]})),  // 17: opts[1]
+            AstNode::new("call").with_payload(json!({"children": [11, 17]})), // 18: resume(opts[1])
+            AstNode::new("array").with_payload(json!({"children": [15, 18]})), // 19: clause
+            AstNode::new("function")
+                .with_payload(json!({"params": ["opts", "resume"], "body": 19})), // 20
+            AstNode::new("key").with_payload(json!("choose")),                // 21
+            AstNode::new("entry").with_payload(json!({"children": [21, 20]})), // 22
+            AstNode::new("object").with_payload(json!({"children": [22]})),   // 23
+            AstNode::new("handle").with_payload(json!({"children": [10, 23]})), // 24: root
+        ]);
+        let req = hnl_engine_exec::EvalRequest::new(ast);
+        assert_eq!(
+            hnl_engine_exec::EvalEngine::eval(&engine, &lang, &req).unwrap(),
+            json!([[11, 21], [12, 22]])
+        );
+    }
+
+    /// One-shot regression: a 1-ary clause stays on the direct dispatch
+    /// path — `handle perform(puts, "hi") with {puts: s ~> s}` returns
+    /// the impl's result at the perform site (in-flight dispatch,
+    /// ADR-0158). No journal is installed.
+    #[test]
+    fn perform_one_shot_clause_dispatch_unchanged() {
+        let engine = crate::BytecodeEngine::new();
+        let lang = resume_lang();
+        let ast = make_ast(vec![
+            AstNode::new("var").with_payload(json!("perform")), // 0
+            AstNode::new("var").with_payload(json!("puts")),    // 1
+            AstNode::new("value").with_payload(json!("hi")),    // 2
+            AstNode::new("call").with_payload(json!({"children": [0, 1, 2]})), // 3: perform(puts,"hi")
+            AstNode::new("var").with_payload(json!("s")),                      // 4: clause body
+            AstNode::new("function").with_payload(json!({"params": ["s"], "body": 4})), // 5: 1-ary impl
+            AstNode::new("key").with_payload(json!("puts")),                            // 6
+            AstNode::new("entry").with_payload(json!({"children": [6, 5]})),            // 7
+            AstNode::new("object").with_payload(json!({"children": [7]})),              // 8
+            AstNode::new("handle").with_payload(json!({"children": [3, 8]})),           // 9: root
+        ]);
+        let req = hnl_engine_exec::EvalRequest::new(ast);
+        assert_eq!(
+            hnl_engine_exec::EvalEngine::eval(&engine, &lang, &req).unwrap(),
+            json!("hi")
+        );
     }
 }
