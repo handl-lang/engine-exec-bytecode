@@ -5,7 +5,7 @@
 //! This engine compiles [`handl_language::Term`] (the v2 arrow-calculus
 //! kernel, ADR-0052) data to a bytecode representation and executes it via a
 //! stack-based VM. It shares the same `Term` vocabulary as the
-//! [`hnl_engine_exec_tree_walk`](hnl_engine_exec_tree_walk)
+//! [`hnl_engine_exec_tree_walk`]
 //! reference interpreter; conformance tests verify both produce **identical
 //! results**.
 //!
@@ -18,7 +18,7 @@
 //! matching, no `lang.eval` access at execution time.
 //!
 //! A per-node compilation cache (compile each node's scheme once, cache by
-//! [`AstRef`](handl_language::AstRef)) is used to demonstrate this. When
+//! [`AstRef`]) is used to demonstrate this. When
 //! [`Instr::EvalChild`] runs, it looks up the child's `AstRef` in the cache;
 //! on a miss, it compiles the child's scheme (one-time `lang.eval` lookup)
 //! and caches the result. On subsequent executions, the cached instructions
@@ -77,7 +77,7 @@ use vm::VmFrame;
 
 /// The bytecode eval engine.
 ///
-/// Compiles [`Term`](handl_language::Term) (the v2 arrow-calculus kernel)
+/// Compiles [`handl_language::Term`] (the v2 arrow-calculus kernel)
 /// data to bytecode and executes via a stack-based VM. Construct with
 /// [`BytecodeEngine::new`] and optionally pass a module registry via
 /// [`BytecodeEngine::with_modules`].
@@ -110,8 +110,8 @@ impl BytecodeEngine {
     /// Create a bytecode engine with a module registry attached.
     ///
     /// The module registry is used for
-    /// [`Term::Arr`](handl_language::Term::Arr) with
-    /// [`ArrSource::Foreign`](handl_language::ArrSource::Foreign) dispatch.
+    /// [`handl_language::Term::Arr`] with
+    /// [`handl_language::ArrSource::Foreign`] dispatch.
     pub fn with_modules(modules: Rc<dyn handl_platform::ModuleLookup>) -> Self {
         Self {
             modules: Some(modules),
@@ -151,9 +151,9 @@ impl BytecodeEngine {
     }
 
     /// Shared core of [`EvalEngine::eval_shared_with_call_args`] (ADR-0106):
-    /// like [`eval_ast_rc`](Self::eval_ast_rc), but merges `call_args`
+    /// like [`eval_ast_rc`], but merges `call_args`
     /// directly into the call frame's `ScopeStack::globals` map — without
-    /// cloning the engine via [`with_global`](Self::with_global).
+    /// cloning the engine via [`with_global`].
     ///
     /// The call args live in the same `globals` field as host-provided
     /// globals (e.g. `self`), so they are resolvable by name lookup but

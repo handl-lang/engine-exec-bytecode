@@ -56,7 +56,7 @@
 //! - `while_step`/`for_step`/`fix_step`: the `DerivedStepOp` instruction
 //!   re-evaluates the arg sub-programs per iteration with the current value
 //!   (extracted from the loop pair) as incoming, then dispatches to
-//!   `VmFrame::apply_native_v2`. See the [`instr`](crate::instr) module
+//!   `VmFrame::apply_native_v2`. See the [`instr`] module
 //!   docs for details.
 
 use std::cell::{Cell, RefCell};
@@ -84,7 +84,7 @@ use crate::instr::{ArithOp, Instr};
 /// `serde_json::Value`) and returns a result value or an error message. The
 /// registry is keyed by `(module, name)`; when `Ffi` does not find an entry
 /// it falls back to the existing [`Instr::ForeignOp`] dispatch via
-/// [`ModuleLookup`](handl_platform::ModuleLookup).
+/// [`ModuleLookup`].
 pub(crate) type FfiFn = Rc<dyn Fn(&[Value]) -> Result<Value, String>>;
 
 /// A registry of `(module, name)` -> host function mappings for `Ffi`.
@@ -672,7 +672,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
     }
 
     /// Internal node evaluator — the [`TaggedValue`] counterpart of
-    /// [`exec_node`](Self::exec_node). Returns a [`TaggedValue`].
+    /// [`exec_node`]. Returns a [`TaggedValue`].
     pub(crate) fn exec_node_inner(&mut self, node_ref: AstRef) -> Result<TaggedValue, LangError> {
         // Growable-stack seam (see `STACK_RED_ZONE`): every recursive
         // eval cycle — arrow-body exec via `apply_arrow_body`, child
@@ -683,7 +683,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
         })
     }
 
-    /// The recursive body of [`exec_node_inner`](Self::exec_node_inner),
+    /// The recursive body of [`exec_node_inner`],
     /// run under [`stacker::maybe_grow`].
     fn exec_node_inner_unguarded(&mut self, node_ref: AstRef) -> Result<TaggedValue, LangError> {
         // Resolve the node in the active arena. For a `body_def` arena we
@@ -747,7 +747,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
     }
 
     /// Internal instruction executor — the [`TaggedValue`] counterpart of
-    /// [`exec_instrs`](Self::exec_instrs). Operates on a `Vec<TaggedValue>`
+    /// [`exec_instrs`]. Operates on a `Vec<TaggedValue>`
     /// operand stack and returns a [`TaggedValue`].
     pub(crate) fn exec_instrs_inner(
         &mut self,
@@ -2024,7 +2024,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
         })
     }
 
-    /// The recursive body of [`apply_app`](Self::apply_app), run under
+    /// The recursive body of [`apply_app`], run under
     /// [`stacker::maybe_grow`].
     fn apply_app_inner(
         &mut self,

@@ -1,10 +1,10 @@
 //! `Term` -> v2 bytecode compilation (ADR-0052 Phase B).
 //!
 //! The [`compile`] function translates a
-//! [`Term`](handl_language::Term) combinator tree into a
+//! [`Term`] combinator tree into a
 //! flat [`Vec<Instr>`](crate::Instr) program. Each combinator maps to a
 //! fixed instruction sequence -- see the
-//! [`instr`](crate::instr) module for the full mapping table.
+//! [`crate::instr`] module for the full mapping table.
 //!
 //! Every compiled program ends with [`Instr::Return`]. Sub-schemes are
 //! inlined (their instructions are appended without a trailing `Return`) so
