@@ -5,8 +5,7 @@
 //! This engine compiles [`handl_language::Term`] (the v2 arrow-calculus
 //! kernel, ADR-0052) data to a bytecode representation and executes it via a
 //! stack-based VM. It shares the same `Term` vocabulary as the
-//! [`hnl_engine_exec_tree_walk`]
-//! reference interpreter; conformance tests verify both produce **identical
+//! `hnl-engine-exec-tree-walk` reference interpreter (a dev-dependency); conformance tests verify both produce **identical
 //! results**.
 //!
 //! ## Compilers erase data dispatch (ADR-0044 §7)
@@ -64,14 +63,11 @@ pub use instr::{ArithOp, Instr};
 
 use handl_language::{Ast, AstRef, LangError, Language, SchemeVersion, Value};
 use handl_value::TaggedValue;
+use hnl_engine_exec::EvalFrame;
 use hnl_engine_exec::{EvalEngine, EvalRequest};
-use hnl_engine_exec_tree_walk::EvalFrame as TreeWalkEvalFrame;
-use hnl_engine_transform::native::{NativeRewrite, NativeRewriteRegistry, RewriteCtx};
-use hnl_engine_transform_rewrite::RewriteEngine;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
 
 use vm::VmFrame;
 
@@ -92,8 +88,6 @@ pub struct BytecodeEngine {
     import_resolver: Option<Rc<dyn hnl_engine_exec::ImportResolver>>,
     /// Global variables injected by the host (e.g. `self` -> language value).
     globals: HashMap<String, Value>,
-    /// Run the `lower` transform pass before evaluation.
-    lowering: bool,
 }
 
 impl BytecodeEngine {
@@ -103,7 +97,6 @@ impl BytecodeEngine {
             modules: None,
             import_resolver: None,
             globals: HashMap::new(),
-            lowering: false,
         }
     }
 
@@ -117,14 +110,7 @@ impl BytecodeEngine {
             modules: Some(modules),
             import_resolver: None,
             globals: HashMap::new(),
-            lowering: false,
         }
-    }
-
-    /// Opt in to the `lower` transform pass before evaluation.
-    pub fn with_lowering(mut self) -> Self {
-        self.lowering = true;
-        self
     }
 
     /// Inject a global variable into the root scope (builder style).
@@ -144,7 +130,7 @@ impl Default for BytecodeEngine {
 impl BytecodeEngine {
     /// Shared core of [`EvalEngine::eval`] and [`EvalEngine::eval_shared`]:
     /// install the `ast`/`lang`/`modules` in the ambient-frame thread-locals
-    /// (`TreeWalkEvalFrame` — services only, not lexical state), then
+    /// (`EvalFrame` — services only, not lexical state), then
     /// compile/execute the arena root and return a `Value`.
     fn eval_ast_rc(&self, lang: Rc<Language>, ast: Rc<Ast>) -> Result<Value, LangError> {
         self.eval_ast_rc_with_args(lang, ast, &[])
@@ -181,20 +167,8 @@ impl BytecodeEngine {
             )));
         }
 
-        // Optional lowering pass.  The `lower` pass canonicalizes backend-
-        // specific AST shapes (e.g. object entry key kinds) before the VM
-        // compiles and executes the program.  It is disabled by default to
-        // preserve existing behavior; opt in with `with_lowering`.
-        let (lowered, root_ref) = if self.lowering {
-            let root = AstRef::new(ast.len() - 1);
-            let engine = RewriteEngine::new()
-                .with_native_registry(Arc::new(lower_natives()) as Arc<dyn NativeRewrite>);
-            let out = engine.run_pass(&lang, &ast, root, "lower")?;
-            (Some(out.ast), out.root)
-        } else {
-            (None, AstRef::new(ast.len() - 1))
-        };
-        let ast_ref: &Ast = lowered.as_ref().unwrap_or(&ast);
+        let root_ref = AstRef::new(ast.len() - 1);
+        let ast_ref: &Ast = &ast;
 
         // Host-provided globals (e.g. `self`, `__arg_N`) merged with the
         // per-call argument bindings. Both live in the `ScopeStack::globals`
@@ -218,7 +192,7 @@ impl BytecodeEngine {
         // this eval's language/module context. Arrows themselves are
         // self-contained (`body_def` + `binds`, ADR-0106) — the frame is
         // ambient services only, not lexical state.
-        let eval_frame = TreeWalkEvalFrame {
+        let eval_frame = EvalFrame {
             lang: Rc::clone(&lang),
             modules: self.modules.clone(),
             globals: Some(Rc::clone(&globals_rc)),
@@ -386,50 +360,6 @@ impl handl_runtime::CompileEngine for BytecodeCompileEngine {
     fn box_clone(&self) -> Box<dyn handl_runtime::CompileEngine> {
         Box::new(self.clone())
     }
-}
-
-/// Native rewrites for the `lower` pass.
-///
-/// These are backend-specific normalizations that the canonical transform
-/// engine cannot express without an escape hatch (e.g. copying a child
-/// payload into a newly-created leaf).  They are registered only when the
-/// `BytecodeEngine` opts in to `with_lowering`.
-pub(crate) fn lower_natives() -> NativeRewriteRegistry {
-    let mut reg = NativeRewriteRegistry::new();
-    reg.register(
-        "lower.object_key",
-        Box::new(|ctx: &mut RewriteCtx<'_>| {
-            // `key`/`value` child positions resolve by named role
-            // (ADR-0081); positional 0/1 is the role-less fallback.
-            let key_role = ctx
-                .lang()
-                .child_role_index(&ctx.node().kind, "key")
-                .ok()
-                .flatten()
-                .unwrap_or(0);
-            let val_role = ctx
-                .lang()
-                .child_role_index(&ctx.node().kind, "value")
-                .ok()
-                .flatten()
-                .unwrap_or(1);
-            let key_idx = ctx.child_ref(key_role).ok_or_else(|| {
-                LangError::engine("lower.object_key: entry missing key child".to_string())
-            })?;
-            let key_node = ctx.ast().get(AstRef::new(key_idx)).ok_or_else(|| {
-                LangError::engine("lower.object_key: key child out of bounds".to_string())
-            })?;
-            if key_node.kind != "string" {
-                return Ok(ctx.pass_through());
-            }
-            let val_idx = ctx.remap_child(val_role).ok_or_else(|| {
-                LangError::engine("lower.object_key: entry missing value child".to_string())
-            })?;
-            let new_key = ctx.push_leaf("var", key_node.payload.clone());
-            Ok(AstRef::new(ctx.push_node("entry", vec![new_key, val_idx])))
-        }),
-    );
-    reg
 }
 
 #[cfg(test)]
@@ -1089,65 +1019,5 @@ mod tests {
         ]);
         let req = EvalRequest::new(ast);
         assert_eq!(engine.eval(&lang, &req).unwrap(), json!(6));
-    }
-
-    #[test]
-    fn lower_object_key_bypasses_string_kind_heuristic() {
-        use handl_language::{
-            AstShapeDef, ChildRoleSpec, TransformCondition, TransformDef, TransformRule,
-        };
-
-        let mut lang = Language::new();
-        lang.ast
-            .merge(AstShapeDef::new("ast.entry", "entry").with_children(vec![
-                ChildRoleSpec {
-                    role: "key".into(),
-                    variadic: false,
-                    optional: false,
-                },
-                ChildRoleSpec {
-                    role: "value".into(),
-                    variadic: false,
-                    optional: false,
-                },
-            ]))
-            .unwrap();
-        lang.transforms
-            .merge(
-                TransformDef::new(
-                    "transform.lower.entry",
-                    "lower",
-                    "entry",
-                    TransformRule::Native("lower.object_key".into()),
-                )
-                .with_when(TransformCondition::KindAt {
-                    index: None,
-                    role: Some("key".into()),
-                    kind: "string".into(),
-                }),
-            )
-            .unwrap();
-
-        let ast = make_ast(vec![
-            AstNode::new("string").with_payload(json!("x")),
-            AstNode::new("value").with_payload(json!({"value": 1})),
-            AstNode::new("entry").with_payload(json!({"children": [0, 1]})),
-        ]);
-        let root = AstRef::new(ast.len() - 1);
-        let engine = RewriteEngine::new()
-            .with_native_registry(Arc::new(super::lower_natives()) as Arc<dyn NativeRewrite>);
-        let out = engine.run_pass(&lang, &ast, root, "lower").unwrap();
-
-        let out_entry = out.ast.at(out.root).unwrap();
-        let children = out_entry
-            .payload
-            .get("children")
-            .unwrap()
-            .as_array()
-            .unwrap();
-        let key_idx = children[0].as_u64().unwrap() as usize;
-        let key_node = out.ast.at(AstRef::new(key_idx)).unwrap();
-        assert_eq!(key_node.kind, "var");
-        assert_eq!(key_node.payload, json!("x"));
     }
 }
