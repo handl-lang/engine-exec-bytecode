@@ -1,6 +1,6 @@
 //! V2 bytecode instruction set for the arrow-calculus kernel (ADR-0052).
 //!
-//! Each [`Term`](handl_language::term::Term) combinator compiles
+//! Each [`Instr::Term`](handl_language::term::Term) combinator compiles
 //! to a flat sequence of [`Instr`] values. The v2 VM executes them against an
 //! operand stack and a scope stack, producing values identical to the v2
 //! tree-walk reference handler.
@@ -11,26 +11,26 @@
 //!
 //! | Instruction          | Stack effect                          | Description |
 //!|----------------------|---------------------------------------|-------------|
-//! | [`Push`]             | `-> val`                              | Push a literal value. |
-//! | [`Load`]             | `-> val`                              | Look up a named variable in the scope stack. |
-//! | [`LoadPayloadVar`]   | `-> val`                              | Read `node.payload` as a string, look up that variable (`$payload`). |
-//! | [`LoadPayload`]      | `-> val`                              | Push `node.payload` (no-scheme fallback). |
-//! | [`EvalChild`]        | `-> val`                              | Evaluate child `n` of the current node (compile-cache + execute). |
-//! | [`Store`]            | `val ->`                              | Pop value, push a new scope, bind name (`extend_env`). |
-//! | [`StorePayloadName`] | `val ->`                              | Pop value, read `node.payload["name"]`, push scope, bind (`extend_env $payload`). |
-//! | [`PopScope`]         | `->`                                  | Pop the top scope (after a `Seq` whose `fst` pushed a scope). |
-//! | [`Call`]             | `callee arg... -> result`             | Apply a closure or host fn to `n` arguments (`App`). |
-//! | [`ChoiceJump`]       | `either -> val`                       | Pop Either; push its value; jump to left or right target (`Choice`). |
-//! | [`Jump`]             | `->`                                  | Unconditional jump. |
-//! | [`NativeOp`]         | `arg... -> result`                    | Apply native op `op` to `n` args (`Arr Native`). |
-//! | [`ArrDispatch`]      | `operand arg... -> result`            | Resolve `node.payload` as the op name and dispatch (`arr <op>`, `Arr` op `"$payload"`). |
-//! | [`ForeignOp`]        | `arg... -> result`                    | Call host function `name` with `n` args (`Arr Foreign`). |
-//! | [`FirstOp`]          | `pair -> {__pair__:[result, snd]}`    | Run inner sub-program on pair's first component; re-pair with second (`First`). |
-//! | [`LoopCheck`]        | `result -> ...`                       | Inspect loop body result; route single-step vs multi-step (`Loop`). |
-//! | [`DerivedStepOp`]   | `pair -> either`                      | Re-evaluate arg sub-programs per iteration; apply derived step op (`while_step`/`for_step`/`fix_step`). |
-//! | [`Return`]           | `val ->`                              | Pop and return the top of the operand stack. |
-//! | [`EvalNode`]         | `-> val`                              | Evaluate the AST node at an absolute arena index (used by `MakeObj`). |
-//! | [`MakeObj`]          | `val... -> obj`                       | Pop `keys.len()` values, construct an object with pre-allocated keys. |
+//! | [`Instr::Push`]             | `-> val`                              | Push a literal value. |
+//! | [`Instr::Load`]             | `-> val`                              | Look up a named variable in the scope stack. |
+//! | [`Instr::LoadPayloadVar`]   | `-> val`                              | Read `node.payload` as a string, look up that variable (`$payload`). |
+//! | [`Instr::LoadPayload`]      | `-> val`                              | Push `node.payload` (no-scheme fallback). |
+//! | [`Instr::EvalChild`]        | `-> val`                              | Evaluate child `n` of the current node (compile-cache + execute). |
+//! | [`Instr::Store`]            | `val ->`                              | Pop value, push a new scope, bind name (`extend_env`). |
+//! | [`Instr::StorePayloadName`] | `val ->`                              | Pop value, read `node.payload["name"]`, push scope, bind (`extend_env $payload`). |
+//! | [`Instr::PopScope`]         | `->`                                  | Pop the top scope (after a `Seq` whose `fst` pushed a scope). |
+//! | [`Instr::Call`]             | `callee arg... -> result`             | Apply a closure or host fn to `n` arguments (`App`). |
+//! | [`Instr::ChoiceJump`]       | `either -> val`                       | Pop Either; push its value; jump to left or right target (`Choice`). |
+//! | [`Instr::Jump`]             | `->`                                  | Unconditional jump. |
+//! | [`Instr::NativeOp`]         | `arg... -> result`                    | Apply native op `op` to `n` args (`Arr Native`). |
+//! | [`Instr::ArrDispatch`]      | `operand arg... -> result`            | Resolve `node.payload` as the op name and dispatch (`arr <op>`, `Arr` op `"$payload"`). |
+//! | [`Instr::ForeignOp`]        | `arg... -> result`                    | Call host function `name` with `n` args (`Arr Foreign`). |
+//! | [`Instr::FirstOp`]          | `pair -> {__pair__:[result, snd]}`    | Run inner sub-program on pair's first component; re-pair with second (`First`). |
+//! | [`Instr::LoopCheck`]        | `result -> ...`                       | Inspect loop body result; route single-step vs multi-step (`Loop`). |
+//! | [`Instr::DerivedStepOp`]   | `pair -> either`                      | Re-evaluate arg sub-programs per iteration; apply derived step op (`while_step`/`for_step`/`fix_step`). |
+//! | [`Instr::Return`]           | `val ->`                              | Pop and return the top of the operand stack. |
+//! | [`Instr::EvalNode`]         | `-> val`                              | Evaluate the AST node at an absolute arena index (used by `MakeObj`). |
+//! | [`Instr::MakeObj`]          | `val... -> obj`                       | Pop `keys.len()` values, construct an object with pre-allocated keys. |
 //!
 //! ## Combinator → instruction mapping
 //!
@@ -44,7 +44,7 @@
 //! | `Arr { op: "object", source: Native, .. }` (static keys) | `EvalNode(val_0)...`, `MakeObj { keys }` |
 //! | `Arr { op: "while_step"/"for_step"/"fix_step", args, source: Native, .. }` | `Jump(derived_pos)`, `<arg sub-programs>`, `DerivedStepOp(op, ranges)` |
 //! | `Arr { op, args, source: Foreign(name), .. }` | `compile(args)...`, `ForeignOp(name, n)` |
-//! | `Seq { fst, snd }` | `compile(fst)`, `compile(snd)`, [`PopScope`] if `fst` pushed a scope |
+//! | `Seq { fst, snd }` | `compile(fst)`, `compile(snd)`, [`Instr::PopScope`] if `fst` pushed a scope |
 //! | `First { inner }` | `FirstOp(start, end)`, `<inner sub-program at [start, end)>` |
 //! | `Choice { l, r }` | `ChoiceJump(left_target, right_target)`, `compile(l)`, `Jump(end)`, `compile(r)` |
 //! | `Loop { body }` | `LoopCheck(loop_back)`, `compile(body)` (laid out as a loop body region) |
@@ -57,22 +57,22 @@
 //! - **`loop_step`** (the ergonomic `loop` surface lowering): its carried
 //!   sub-scheme arg (the body closure) is compiled inline like any other
 //!   `Arr.arg`; the `NativeOp` handler recognizes `loop_step` via
-//!   [`op_is_derived_step`] and additionally pops the loop pair `(in, state)`
+//!   `op_is_derived_step` and additionally pops the loop pair `(in, state)`
 //!   left on the operand stack by the enclosing `Loop`, passing it as
-//!   `incoming` to [`VmFrame::apply_native_v2`]. The body closure is then
-//!   applied via [`VmFrame::apply_app`] (recursive `exec_node`).
+//!   `incoming` to `VmFrame::apply_native_v2`. The body closure is then
+//!   applied via `VmFrame::apply_app` (recursive `exec_node`).
 //!
 //! - **`while_step`/`for_step`/`fix_step`** (built by
 //!   `plugin-lib-stdlib::arrow_iter::{while_loop,for_loop,fix_loop}`):
 //!   these carry cond/body sub-schemes that must be re-evaluated **per
 //!   iteration** with the current value (extracted from the loop pair) as
-//!   incoming. The compiler emits a [`DerivedStepOp`] instruction that
+//!   incoming. The compiler emits a [`Instr::DerivedStepOp`] instruction that
 //!   stores each arg as an instruction range `(start, end)`. A `Jump` before
 //!   the sub-programs skips them during normal execution; the
-//!   `DerivedStepOp` handler re-executes them via [`VmFrame::exec_instrs`]
+//!   `DerivedStepOp` handler re-executes them via `VmFrame::exec_instrs`
 //!   with the current value as incoming, then dispatches to
-//!   [`VmFrame::apply_native_v2`] with the fresh results and the loop pair
-//!   as incoming. The produced `Either` is pushed for [`LoopCheck`].
+//!   `VmFrame::apply_native_v2` with the fresh results and the loop pair
+//!   as incoming. The produced `Either` is pushed for [`Instr::LoopCheck`].
 
 use std::rc::Rc;
 
@@ -84,7 +84,7 @@ use handl_language::Value;
 /// These map directly to CPU arithmetic/logic operations — they are the
 /// irreducible arithmetic boundary of the kernel. `Neg` and `Not` are unary
 /// (pop one value); all others are binary (pop two values). Semantics mirror
-/// the corresponding `NativeOp` arms in [`crate::vm`] exactly, so results are
+/// the corresponding `NativeOp` arms in `crate::vm` exactly, so results are
 /// identical to the `NativeOp`/typed-bytecode paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArithOp {
@@ -126,7 +126,7 @@ pub enum ArithOp {
 /// combinator-to-instruction mapping, and the derived-step-op limitation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Instr {
-    /// Push a literal [`Value`] onto the operand stack.
+    /// Push a literal `Instr::Value` onto the operand stack.
     ///
     /// Emitted by `Arr { op: "const", lit: Some(v), .. }`.
     Push(Value),
@@ -159,7 +159,7 @@ pub enum Instr {
     /// cache) and executes that child node's v2 bytecode.
     EvalChild(usize),
 
-    /// Like [`EvalChild`], but pushes `null` when the child index is absent
+    /// Like [`Instr::EvalChild`], but pushes `null` when the child index is absent
     /// (e.g. the missing `else` of an else-less `if` — a child produced by an
     /// `optional_children` grammar row).
     ///
@@ -169,7 +169,7 @@ pub enum Instr {
     /// Pop a value, push a new scope, and bind the given name in that scope.
     ///
     /// Emitted by `Arr { op: "extend_env", lit: Some(name), .. }` when the
-    /// name is not `"$payload"`. The matching [`PopScope`] is emitted by the
+    /// name is not `"$payload"`. The matching [`Instr::PopScope`] is emitted by the
     /// enclosing `Seq` after its `snd` completes.
     Store(Rc<str>),
 
@@ -178,7 +178,7 @@ pub enum Instr {
     ///
     /// Emitted by `Arr { op: "extend_env", lit: Some("$payload"), .. }` (the
     /// actual bind name lives in the node's payload at runtime). The matching
-    /// [`PopScope`] is emitted by the enclosing `Seq`.
+    /// [`Instr::PopScope`] is emitted by the enclosing `Seq`.
     StorePayloadName,
 
     /// Pop the top scope from the scope stack.
@@ -195,25 +195,25 @@ pub enum Instr {
     /// function.
     Call(usize),
 
-    /// Fixed-arity variant of [`Call`] for 1-argument applications.
+    /// Fixed-arity variant of [`Instr::Call`] for 1-argument applications.
     ///
     /// Avoids the per-call `Vec` allocation in the `Call(1)` path. Emitted by
     /// the compiler when `App` has exactly 1 arg. Produces results identical
-    /// to [`Call`]`(1)`.
+    /// to [`Instr::Call`]`(1)`.
     Call1,
 
-    /// Fixed-arity variant of [`Call`] for 2-argument applications.
+    /// Fixed-arity variant of [`Instr::Call`] for 2-argument applications.
     ///
     /// Avoids the per-call `Vec` allocation in the `Call(2)` path. Emitted by
     /// the compiler when `App` has exactly 2 args. Produces results identical
-    /// to [`Call`]`(2)`.
+    /// to [`Instr::Call`]`(2)`.
     Call2,
 
-    /// Fixed-arity variant of [`Call`] for 3-argument applications.
+    /// Fixed-arity variant of [`Instr::Call`] for 3-argument applications.
     ///
     /// Avoids the per-call `Vec` allocation in the `Call(3)` path. Emitted by
     /// the compiler when `App` has exactly 3 args. Produces results identical
-    /// to [`Call`]`(3)`.
+    /// to [`Instr::Call`]`(3)`.
     Call3,
 
     /// Pop an Either value, push its carried value, and jump to `left_target`
@@ -251,13 +251,13 @@ pub enum Instr {
     /// Emitted at incoming-boundaries: after `Seq{0}`'s `fst` compiles
     /// (so `snd` sees the predecessor's result) and at the head of each
     /// `Choice` arm (so the arm sees the routed value). Paired with
-    /// [`RestoreIncoming`] when the region ends, so a `Seq`/`Choice`
+    /// [`Instr::RestoreIncoming`] when the region ends, so a `Seq`/`Choice`
     /// nested inside an `Arr` arg doesn't leak its incoming to sibling
     /// args.
     SetIncoming,
 
     /// Restore `current_incoming` to the value saved by the matching
-    /// [`SetIncoming`].
+    /// [`Instr::SetIncoming`].
     RestoreIncoming,
 
     /// Pop `n` argument values, apply the native op `op`, and push the
@@ -265,7 +265,7 @@ pub enum Instr {
     ///
     /// Emitted by `Arr { op, args, source: Native, .. }` for general native
     /// ops (not the lit-bearing special cases, and not the derived step
-    /// ops `while_step`/`for_step`/`fix_step` which use [`DerivedStepOp`]).
+    /// ops `while_step`/`for_step`/`fix_step` which use [`Instr::DerivedStepOp`]).
     /// The native op set matches the v2 tree-walk exactly: arithmetic
     /// (`add`/`sub`/`mul`/`div`/`mod`/`neg`), comparison (`eq`/`neq`/`lt`/
     /// `gt`/`lte`/`gte`), logic (`and`/`or`/`not`), `tag`, `id`, `closure`,
@@ -285,8 +285,8 @@ pub enum Instr {
     /// and dispatched through handler-impl lookup then the native op table —
     /// the tree-walk `arr_dispatch` path. With no operand, the result is a
     /// first-class `{__arr__: {op}}` dispatch object that
-    /// [`VmFrame::apply_app`] applies later. With args, falls through to
-    /// [`VmFrame::apply_native_v2`] under the resolved name (mirroring the
+    /// `VmFrame::apply_app` applies later. With args, falls through to
+    /// `VmFrame::apply_native_v2` under the resolved name (mirroring the
     /// tree-walk's `eval_arr` argument case).
     ArrDispatch(usize),
 
@@ -295,7 +295,7 @@ pub enum Instr {
     ///
     /// Emitted by `Arr { op, args, source: Foreign(name), .. }`. The host
     /// function is looked up in the
-    /// [`ModuleLookup`](handl_platform::ModuleLookup) registry.
+    /// [`Instr::ModuleLookup`](handl_platform::ModuleLookup) registry.
     ForeignOp(String, usize),
 
     /// Run the `First` combinator's inner sub-program on the first component
@@ -354,7 +354,7 @@ pub enum Instr {
     /// Derived step op (`while_step`/`for_step`/`fix_step`) with
     /// re-evaluatable arg sub-programs.
     ///
-    /// Unlike [`NativeOp`], which evaluates args once before the handler
+    /// Unlike [`Instr::NativeOp`], which evaluates args once before the handler
     /// runs, `DerivedStepOp` stores each arg as an instruction range
     /// `(start, end)` and re-evaluates them **per iteration** with the
     /// current value (extracted from the loop pair) as incoming. This is
@@ -364,13 +364,13 @@ pub enum Instr {
     ///
     /// The handler pops the loop pair `(in, state)` from the stack (left
     /// by the enclosing `Loop`), extracts the current value, re-executes
-    /// each arg sub-program via [`VmFrame::exec_instrs`] with `Some(current)`
-    /// as incoming, then dispatches to [`VmFrame::apply_native_v2`] with
+    /// each arg sub-program via `VmFrame::exec_instrs` with `Some(current)`
+    /// as incoming, then dispatches to `VmFrame::apply_native_v2` with
     /// the fresh results. The produced `Either` is pushed for `LoopCheck`.
     ///
-    /// (`loop_step` is handled by [`NativeOp`] instead — its body arg
+    /// (`loop_step` is handled by [`Instr::NativeOp`] instead — its body arg
     /// is a closure evaluated once, then applied per iteration via
-    /// [`VmFrame::apply_app`].)
+    /// `VmFrame::apply_app`.)
     DerivedStepOp(String, Vec<(usize, usize)>),
 
     /// Pop the top of the operand stack and return it as the program result.
@@ -388,7 +388,7 @@ pub enum Instr {
     // --- Typed arithmetic/comparison bytecodes (hot-path optimization) ---
     //
     // These mirror the `add`/`sub`/`mul`/`div`/`mod`/`eq`/`neq`/`lt`/`lte`/
-    // `gt`/`gte` cases of [`NativeOp`] but avoid the per-op `Vec` allocation
+    // `gt`/`gte` cases of [`Instr::NativeOp`] but avoid the per-op `Vec` allocation
     // and string dispatch: they pop two values directly from the operand
     // stack and push the result. Emitted by the compiler for the
     // corresponding `Arr { op, source: Native, .. }` ops. They produce
@@ -420,9 +420,9 @@ pub enum Instr {
     /// Evaluate the AST node at the given absolute arena index and push the
     /// result.
     ///
-    /// Used by [`MakeObj`] to evaluate object entry value nodes. Object entry
+    /// Used by [`Instr::MakeObj`] to evaluate object entry value nodes. Object entry
     /// values are nested inside `entry` nodes (which are children of the
-    /// `object` node), so they cannot be reached via [`EvalChild`] (which
+    /// `object` node), so they cannot be reached via [`Instr::EvalChild`] (which
     /// reads `node.payload["children"][n]` — that yields entry nodes, not
     /// value nodes). `EvalNode` takes an absolute arena index instead.
     EvalNode(usize),
@@ -438,7 +438,7 @@ pub enum Instr {
     ///
     /// Emitted by the compiler for `Arr { op: "object", source: Native, .. }`
     /// when all entry keys are static (`var` or `string` kind). Dynamic
-    /// (computed) keys fall back to [`NativeOp`]`("object", n)`.
+    /// (computed) keys fall back to [`Instr::NativeOp`]`("object", n)`.
     MakeObj {
         /// Pre-allocated object keys (allocated once at compile time).
         keys: Rc<[Rc<str>]>,
@@ -457,7 +457,7 @@ pub enum Instr {
     ///
     /// Emitted by the compiler for `Arr { op: "closure", source: Native, .. }`
     /// when the params/body can be statically resolved from the node
-    /// payload. Falls back to [`NativeOp`]`("closure", n)` otherwise.
+    /// payload. Falls back to [`Instr::NativeOp`]`("closure", n)` otherwise.
     Closure {
         /// Pre-extracted parameter names (allocated once at compile time).
         params: Rc<[String]>,
@@ -500,12 +500,12 @@ pub enum Instr {
     /// This is the hardware-boundary instruction for effects (ADR-0103
     /// §2.4). The VM looks up `(module, name)` in its foreign-function
     /// registry; if absent, it falls back to the existing `ForeignOp`
-    /// dispatch (looking up `name` in the [`ModuleLookup`] registry) so
+    /// dispatch (looking up `name` in the [`Instr::ModuleLookup`] registry) so
     /// already-registered host functions keep working. Generalizes
     /// [`Instr::ForeignOp`] with a `module` field for routing to different
     /// host registries (`"host"`, `"io"`, `"fs"`, …).
     ///
-    /// [`ModuleLookup`]: handl_platform::ModuleLookup
+    /// [`Instr::ModuleLookup`]: handl_platform::ModuleLookup
     Ffi {
         /// The host module name (e.g. `"host"`, `"io"`, `"fs"`).
         module: String,

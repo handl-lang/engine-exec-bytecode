@@ -13,7 +13,7 @@
 //!
 //! ## Scope discipline
 //!
-//! Only `extend_env` pushes a scope. [`compile_into`] returns `true` when
+//! Only `extend_env` pushes a scope. `compile_into` returns `true` when
 //! the compiled code pushes a scope that the caller is responsible for
 //! popping. `Seq` pops the scope its `fst` reported after `snd` completes
 //! (emitting [`Instr::PopScope`]), and propagates whatever `snd` reported.

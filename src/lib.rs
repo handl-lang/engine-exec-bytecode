@@ -253,7 +253,7 @@ impl EvalEngine for BytecodeEngine {
 
     /// Bytecode override (ADR-0106): bind `args` directly into the call
     /// frame's `ScopeStack::globals` alongside host-provided globals, without
-    /// cloning the engine or persisting the args into [`BytecodeEngine::globals`].
+    /// cloning the engine or persisting the args into `BytecodeEngine::globals`.
     ///
     /// This mirrors the tree-walk engine's zero-clone path: args are
     /// resolvable by name lookup, excluded from closure capture, and scoped to

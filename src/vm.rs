@@ -51,12 +51,12 @@
 //! - `loop_step` (the ergonomic `loop` surface lowering): the `NativeOp`
 //!   handler pops the loop pair from the operand stack (below the
 //!   inline-compiled args) and passes it as `incoming` to
-//!   [`VmFrame::apply_native_v2`], which applies the body closure via
-//!   [`VmFrame::apply_app`].
+//!   `VmFrame::apply_native_v2`, which applies the body closure via
+//!   `VmFrame::apply_app`.
 //! - `while_step`/`for_step`/`fix_step`: the `DerivedStepOp` instruction
 //!   re-evaluates the arg sub-programs per iteration with the current value
 //!   (extracted from the loop pair) as incoming, then dispatches to
-//!   [`VmFrame::apply_native_v2`]. See the [`instr`](crate::instr) module
+//!   `VmFrame::apply_native_v2`. See the [`instr`](crate::instr) module
 //!   docs for details.
 
 use std::cell::{Cell, RefCell};
@@ -2342,12 +2342,12 @@ pub(crate) fn op_uses_incoming(op: &str) -> bool {
 /// compiled inline *and* consume the loop pair `(in, state)` that the
 /// enclosing `Loop` combinator left on the operand stack below those args.
 /// The `NativeOp` handler pops the args first, then pops the pair as
-/// `incoming`, before dispatching to [`VmFrame::apply_native_v2`].
+/// `incoming`, before dispatching to `VmFrame::apply_native_v2`.
 ///
 /// `loop_step` (the ergonomic `loop` surface lowering) and `fold_step`
 /// (the ADR-0120 `loop` fold node) are handled here — their step arg is a
 /// closure evaluated once, then applied per iteration via
-/// [`VmFrame::apply_app`]. The remaining derived step ops
+/// `VmFrame::apply_app`. The remaining derived step ops
 /// (`while_step`/`for_step`/`fix_step`) use the [`Instr::DerivedStepOp`]
 /// instruction instead, which re-evaluates their cond/body sub-programs
 /// per iteration with the current value as incoming.
