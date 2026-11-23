@@ -2,7 +2,7 @@
 #
 # Per-push gate for this repo: the rust family campaign from the
 # `handl-gates` tamias bundle (handl-lang/workspace/workflows), pinned
-# to 0.3.0. Bupha/the fleet runner invokes:
+# to 0.3.1. Bupha/the fleet runner invokes:
 #
 #   GATE_REPO="$PWD" GATE_RESULTS="$PWD/.gate-results.jsonl" \
 #     peregrin campaign run workflows/gate.yaml --result .ci-result.json
@@ -12,4 +12,4 @@
 # Regenerate/extend by editing the family campaign in the handl-gates
 # bundle, or replace this file with a local composition — local keys
 # win over the include on merge.
-include: tamias:handl-gates@0.3.0//gates/rust.yaml
+include: tamias:handl-gates@0.3.1//gates/rust.yaml
