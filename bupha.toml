@@ -7,7 +7,7 @@
 
 [[repos]]
 name = "handl-lang/engine-exec-bytecode"
-dir = "/home/luis/GitHub/handl-lang/engine-exec-bytecode"
+dir = "~/GitHub/handl-lang/engine-exec-bytecode"
 branch = "refs/heads/main"
   [repos.runner]
   kind = "script"
