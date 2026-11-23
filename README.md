@@ -2,7 +2,7 @@
 
 `hnl-exec-bytecode` — the bytecode eval engine for the eval operation.
 
-An `engine-*` crate: a concrete eval engine that compiles node schemes to
+An `exec-*` crate: a concrete eval engine that compiles node schemes to
 bytecode and executes them on a small VM.
 
 ## Development
