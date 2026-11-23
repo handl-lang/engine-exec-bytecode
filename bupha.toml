@@ -1,4 +1,4 @@
-# bupha.toml — committed CI manifest for handl-lang/engine-exec-bytecode.
+# bupha.toml — committed CI manifest for handl-lang/exec-bytecode.
 #
 # The runner is this repo's ci.sh (fmt -> clippy -D warnings -> test -> doc),
 # executed natively in a detached worktree of the pushed sha. Merge the
@@ -6,8 +6,8 @@
 # a dedicated instance with: bupha watch --config bupha.toml
 
 [[repos]]
-name = "handl-lang/engine-exec-bytecode"
-dir = "~/GitHub/handl-lang/engine-exec-bytecode"
+name = "handl-lang/exec-bytecode"
+dir = "~/GitHub/handl-lang/exec-bytecode"
 branch = "refs/heads/main"
   [repos.runner]
   kind = "script"

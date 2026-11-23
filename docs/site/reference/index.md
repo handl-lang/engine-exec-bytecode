@@ -4,7 +4,7 @@
 
 | item | what it is |
 |---|---|
-| `EvalEngine` impl | the `engine-exec` contract |
+| `EvalEngine` impl | the `exec` contract |
 | bytecode compilation | scheme lookup happens at compile time, not per node |
 | conformance suite | shared cases asserting parity with the tree-walk engine |
 
@@ -12,7 +12,7 @@
 
 | crate | role |
 |---|---|
-| `hnl-engine-exec-bytecode` | engine implementation |
+| `hnl-exec-bytecode` | engine implementation |
 
 ## Build and test
 

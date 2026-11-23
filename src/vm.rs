@@ -64,11 +64,11 @@ use std::rc::Rc;
 
 use handl_language::{Ast, AstNode, AstRef, LangError, Language, Term, Value};
 use handl_value::{TaggedValue, tagged_to_value};
-use hnl_engine_exec::native_ops::{
+use hnl_exec::native_ops::{
     self, NativeOpCtx, Num, OpService, as_num, bin_add, build_loop_step_args, is_truthy,
     loop_step_outcome, num_value, step_decision, type_tag,
 };
-use hnl_engine_exec::pattern_match::{self, PatternMatchCtx};
+use hnl_exec::pattern_match::{self, PatternMatchCtx};
 use rustc_hash::FxHashMap;
 
 use crate::compile::compile;
@@ -479,7 +479,7 @@ pub(crate) struct VmFrame<'a, 'h> {
     /// The module registry (for `Foreign` dispatch).
     modules: Option<&'h Rc<dyn handl_platform::ModuleLookup>>,
     /// The import resolver for `import "path"` statements (Phase 9.5).
-    import_resolver: Option<&'h Rc<dyn hnl_engine_exec::ImportResolver>>,
+    import_resolver: Option<&'h Rc<dyn hnl_exec::ImportResolver>>,
     /// Deserialized `body_def` arenas carried by applied arrows
     /// (ADR-0106). Applying an arrow pushes its arena here and executes
     /// under `active_def`; the entries keep the arenas alive for the
@@ -545,7 +545,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
         ast: &'a Ast,
         lang: &'a Language,
         modules: Option<&'h Rc<dyn handl_platform::ModuleLookup>>,
-        import_resolver: Option<&'h Rc<dyn hnl_engine_exec::ImportResolver>>,
+        import_resolver: Option<&'h Rc<dyn hnl_exec::ImportResolver>>,
     ) -> Self {
         Self {
             ast,
@@ -1515,7 +1515,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
     /// `countdown_step`, `infinite_step`).
     ///
     /// The op semantics are defined once in
-    /// `hnl-engine-exec::native_ops` (ADR-0044 §7): this engine supplies
+    /// `hnl-exec::native_ops` (ADR-0044 §7): this engine supplies
     /// only the globals — the scope stack, AST-node execution, and arrow
     /// application — through [`VmCtx`]. The residual `match` below owns
     /// ops that still require this engine's machinery (imports, module
@@ -2362,7 +2362,7 @@ fn op_is_derived_step(op: &str) -> bool {
 /// The bytecode VM's [`NativeOpCtx`] — the engine-local globals the shared
 /// op table needs: the scope stack, AST-node execution, and arrow
 /// application. The op *semantics* live in
-/// `hnl-engine-exec::native_ops`; this struct only forwards services.
+/// `hnl-exec::native_ops`; this struct only forwards services.
 struct VmCtx<'f, 'a, 'h, 'n> {
     frame: &'f mut VmFrame<'a, 'h>,
     node: &'n AstNode,
@@ -2538,7 +2538,7 @@ impl NativeOpCtx for VmCtx<'_, '_, '_, '_> {
         self.frame.apply_app(f, args, self.node)
     }
 
-    fn import_resolver(&self) -> Option<&dyn hnl_engine_exec::ImportResolver> {
+    fn import_resolver(&self) -> Option<&dyn hnl_exec::ImportResolver> {
         self.frame.import_resolver.map(|rc| &**rc)
     }
 
@@ -2754,7 +2754,7 @@ mod tests {
     use handl_platform::{EvalContext, Function, Module, ModuleLookup};
     use handl_plugin_module::ModuleRegistry;
     use hnl_engine::TermData;
-    use hnl_engine_exec::ImportResolver;
+    use hnl_exec::ImportResolver;
     use serde_json::json;
     use std::rc::Rc;
 
@@ -4224,9 +4224,9 @@ mod tests {
             AstNode::new("object").with_payload(json!({"children": [19]})),  // 20: handler
             AstNode::new("handle").with_payload(json!({"children": [7, 20]})), // 21: root
         ]);
-        let req = hnl_engine_exec::EvalRequest::new(ast);
+        let req = hnl_exec::EvalRequest::new(ast);
         assert_eq!(
-            hnl_engine_exec::EvalEngine::eval(&engine, &lang, &req).unwrap(),
+            hnl_exec::EvalEngine::eval(&engine, &lang, &req).unwrap(),
             json!([101, 102])
         );
     }
@@ -4268,9 +4268,9 @@ mod tests {
             AstNode::new("object").with_payload(json!({"children": [22]})),   // 23
             AstNode::new("handle").with_payload(json!({"children": [10, 23]})), // 24: root
         ]);
-        let req = hnl_engine_exec::EvalRequest::new(ast);
+        let req = hnl_exec::EvalRequest::new(ast);
         assert_eq!(
-            hnl_engine_exec::EvalEngine::eval(&engine, &lang, &req).unwrap(),
+            hnl_exec::EvalEngine::eval(&engine, &lang, &req).unwrap(),
             json!([[11, 21], [12, 22]])
         );
     }
@@ -4295,9 +4295,9 @@ mod tests {
             AstNode::new("object").with_payload(json!({"children": [7]})),              // 8
             AstNode::new("handle").with_payload(json!({"children": [3, 8]})),           // 9: root
         ]);
-        let req = hnl_engine_exec::EvalRequest::new(ast);
+        let req = hnl_exec::EvalRequest::new(ast);
         assert_eq!(
-            hnl_engine_exec::EvalEngine::eval(&engine, &lang, &req).unwrap(),
+            hnl_exec::EvalEngine::eval(&engine, &lang, &req).unwrap(),
             json!("hi")
         );
     }

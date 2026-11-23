@@ -13,5 +13,5 @@ This crate belongs to the `engine-*` family. Plugins, kits and hosts reach it
 through the kit's operation slot, so the engine can be swapped without touching a
 language definition.
 
-See the [reference](/engine-exec-bytecode/reference/) for the API and the
-[how-to guides](/engine-exec-bytecode/how-to/) for tasks.
+See the [reference](/exec-bytecode/reference/) for the API and the
+[how-to guides](/exec-bytecode/how-to/) for tasks.

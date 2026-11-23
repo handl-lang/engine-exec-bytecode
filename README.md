@@ -1,6 +1,6 @@
-# engine-exec-bytecode
+# exec-bytecode
 
-`hnl-engine-exec-bytecode` — the bytecode eval engine for the eval operation.
+`hnl-exec-bytecode` — the bytecode eval engine for the eval operation.
 
 An `engine-*` crate: a concrete eval engine that compiles node schemes to
 bytecode and executes them on a small VM.
@@ -21,4 +21,4 @@ MIT.
 
 ## Documentation
 
-<https://handl-lang.github.io/docs/engine-exec-bytecode/>
+<https://handl-lang.github.io/docs/exec-bytecode/>

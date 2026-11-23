@@ -27,7 +27,7 @@ use std::rc::Rc;
 use handl_language::{ArrSource, Language, Term};
 use handl_language::{Ast, AstNode, AstRef, LangError, Value};
 use hnl_engine::TermData;
-use hnl_engine_exec::native_ops;
+use hnl_exec::native_ops;
 
 use crate::instr::{ArithOp, Instr};
 
@@ -251,7 +251,7 @@ fn compile_into_td(
             // avoids re-creating the closure (and deep-cloning its captured
             // scope via `capture()`) on every iteration. Mirrors the
             // tree-walk optimization at
-            // `hnl-engine-exec-tree-walk/src/lib.rs:402-456`.
+            // `hnl-exec-tree-walk/src/lib.rs:402-456`.
             if body.tag() == "Op" {
                 let op = body.get_str("name").unwrap_or("");
                 let source = body.arr_source().unwrap_or(ArrSource::Native);
