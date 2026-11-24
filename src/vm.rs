@@ -1382,6 +1382,7 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                         body_def: Rc::new(TaggedValue::from(handl_language::ast_value(&sub))),
                         binds: Rc::new(binds),
                         handlers: Rc::from(Vec::new()),
+                        sig: None,
                     });
                 }
                 // --- ADR-0103 hardware-boundary instructions ---
