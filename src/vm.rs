@@ -1182,7 +1182,13 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     let func = modules.lookup(name).ok_or_else(|| {
                         LangError::engine_node(format!("unregistered foreign: {}", name), node)
                     })?;
-                    let val_args: Vec<Value> = args.iter().map(tagged_to_value).collect();
+                    // T-153: elide a leading `null` filling a `type.unit`
+                    // signature domain — `f(null)` ≡ `f()`.
+                    let val_args: Vec<Value> = handl_platform::elide_unit_args(
+                        &**modules,
+                        name,
+                        args.iter().map(tagged_to_value).collect(),
+                    );
                     let mut pctx = handl_platform::EvalContext::new();
                     let result = func
                         .call(&val_args, &mut pctx)
@@ -1443,7 +1449,13 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                                 node,
                             )
                         })?;
-                        let val_args: Vec<Value> = args.iter().map(tagged_to_value).collect();
+                        // T-153: elide a leading `null` filling a
+                        // `type.unit` signature domain — `f(null)` ≡ `f()`.
+                        let val_args: Vec<Value> = handl_platform::elide_unit_args(
+                            &**modules,
+                            name,
+                            args.iter().map(tagged_to_value).collect(),
+                        );
                         let mut pctx = handl_platform::EvalContext::new();
                         let result = func
                             .call(&val_args, &mut pctx)
@@ -1599,10 +1611,16 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                         node,
                     )
                 })?;
-                let call_args: Vec<Value> = arg_src
-                    .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().map(tagged_to_value).collect())
-                    .unwrap_or_default();
+                // T-153: elide a leading `null` filling a `type.unit`
+                // signature domain — `f(null)` ≡ `f()`.
+                let call_args: Vec<Value> = handl_platform::elide_unit_args(
+                    &**modules,
+                    callee,
+                    arg_src
+                        .and_then(|v| v.as_array())
+                        .map(|arr| arr.iter().map(tagged_to_value).collect())
+                        .unwrap_or_default(),
+                );
                 let mut pctx = handl_platform::EvalContext::new();
                 let val = func
                     .call(&call_args, &mut pctx)
@@ -1722,7 +1740,13 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                     let func = modules.lookup(name).ok_or_else(|| {
                         LangError::engine_node(format!("flow: function '{}' not found", name), node)
                     })?;
-                    let call_args: Vec<Value> = actual_args.iter().map(tagged_to_value).collect();
+                    // T-153: elide a leading `null` filling a `type.unit`
+                    // signature domain — `f(null)` ≡ `f()`.
+                    let call_args: Vec<Value> = handl_platform::elide_unit_args(
+                        &**modules,
+                        name,
+                        actual_args.iter().map(tagged_to_value).collect(),
+                    );
                     let mut pctx = handl_platform::EvalContext::new();
                     let val = func
                         .call(&call_args, &mut pctx)
@@ -2098,7 +2122,13 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                             node,
                         )
                     })?;
-                    let call_args: Vec<Value> = [mid].iter().map(tagged_to_value).collect();
+                    // T-153: elide a leading `null` filling a `type.unit`
+                    // signature domain — `f(null)` ≡ `f()`.
+                    let call_args: Vec<Value> = handl_platform::elide_unit_args(
+                        &**modules,
+                        name,
+                        [mid].iter().map(tagged_to_value).collect(),
+                    );
                     let mut pctx = handl_platform::EvalContext::new();
                     let val = func
                         .call(&call_args, &mut pctx)
