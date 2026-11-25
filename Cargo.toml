@@ -2,6 +2,7 @@
 name = "hnl-exec-bytecode"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 description = "The bytecode eval engine for the eval operation (ADR-0044 §4, §7)."
 license = "MIT"
 repository = "https://github.com/handl-lang/exec-bytecode"
