@@ -12,7 +12,7 @@ dir = "~/GitHub/handl-lang/exec-bytecode"
 branch = "refs/heads/main"
   [repos.runner]
   kind = "script"
-  cmd = "export PATH="$HOME/.local/bin:$PATH"; GATE_REPO="$PWD" GATE_RESULTS="$PWD/.gate-results.jsonl" peregrin campaign run workflows/gate.yaml --result .ci-result.json && jq -e '.conclusion == "success"' .ci-result.json"
+  cmd = "export PATH=\"$HOME/.local/bin:$PATH\"; GATE_REPO=\"$PWD\" GATE_RESULTS=\"$PWD/.gate-results.jsonl\" peregrin campaign run workflows/gate.yaml --result .ci-result.json && jq -e '.conclusion == \"success\"' .ci-result.json"
   cancel_running = true
 
 [status]
