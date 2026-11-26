@@ -77,6 +77,7 @@
 use std::rc::Rc;
 
 use handl_language::Value;
+use handl_value::TaggedValue;
 
 /// An ALU operation selected by the [`Instr::Arith`] hardware-boundary
 /// instruction (ADR-0103 §2.4).
@@ -467,6 +468,10 @@ pub enum Instr {
         body: usize,
         /// Whether the params node is an array-destructuring pattern.
         array_pattern: bool,
+        /// Destructured parameter patterns (`{"__ast__": …}` params
+        /// subtree) when the params are not plain bindings — stored
+        /// verbatim as the arrow's `param_defs`. `None` for plain params.
+        param_defs: Option<Rc<TaggedValue>>,
         /// Compile-time free-name superset of `body` (see
         /// `handl_language::subtree_name_candidates`): the captured env is
         /// filtered to these names so sequential sibling closures cannot

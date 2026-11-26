@@ -28,6 +28,7 @@ use handl_language::{ArrSource, Language, Term};
 use handl_language::{Ast, AstNode, AstRef, LangError, Value};
 use hnl_engine::TermData;
 use hnl_exec::native_ops;
+use handl_value::TaggedValue;
 
 use crate::instr::{ArithOp, Instr};
 
@@ -677,6 +678,7 @@ fn compile_arr(
             rest: closure.rest,
             body: closure.body,
             array_pattern: closure.array_pattern,
+            param_defs: closure.param_defs,
             capture,
         });
         return Ok(false);
@@ -981,6 +983,9 @@ struct StaticClosure {
     body: usize,
     /// Whether the params node is an array-destructuring pattern.
     array_pattern: bool,
+    /// Destructured parameter patterns (`{"__ast__": …}` params subtree)
+    /// when the params are not plain bindings — the arrow's `param_defs`.
+    param_defs: Option<Rc<TaggedValue>>,
 }
 
 /// Try to extract the param names and body node index from a `function`
@@ -1025,6 +1030,7 @@ fn try_extract_closure_params_body(
             rest,
             body: b as usize,
             array_pattern: false,
+            param_defs: None,
         }));
     }
 
@@ -1050,25 +1056,31 @@ fn try_extract_closure_params_body(
             Some(idx) => idx as usize,
             None => return Ok(None),
         };
-        let param_node = ast.at(AstRef::new(param_idx))?;
         // Collection-vs-single params is a shape question (ADR-0081): a
         // shape declaring a variadic role (e.g. `params`) is a param list;
         // the legacy `paren`/`array` kinds remain only as the role-less
         // fallback.
-        // `param_names` resolves fixed params plus an optional rest param
-        // (`...name`) data-driven via `pattern_role`/variadic metadata
-        // (ADR-0081). `Err` (unresolvable param shape) falls back to the
-        // runtime `NativeOp("closure")` path like `Ok(None)`.
-        let (names, rest) = match lang.param_names(ast, param_node) {
-            Ok(v) => v,
+        // `resolve_closure_params` resolves fixed params plus an optional
+        // rest param (`...name`) and destructured patterns
+        // (`([x, y]) ~>`, `({a, b}) ~>`) data-driven via
+        // `pattern_role`/variadic metadata (ADR-0081) — the same shared
+        // resolution the runtime `closure` op uses. `Err` (unresolvable
+        // param shape) falls back to the runtime `NativeOp("closure")`
+        // path like `Ok(None)`.
+        let cp = match native_ops::resolve_closure_params(
+            lang,
+            ast,
+            AstRef::new(param_idx),
+        ) {
+            Ok(cp) => cp,
             Err(_) => return Ok(None),
         };
-        let array_pattern = lang.is_array_pattern(param_node);
         return Ok(Some(StaticClosure {
-            params: Rc::from(names),
-            rest: rest.map(Rc::from),
+            params: Rc::from(cp.names),
+            rest: cp.rest.map(Rc::from),
             body: body_idx,
-            array_pattern,
+            array_pattern: cp.array_pattern,
+            param_defs: cp.param_defs.map(Rc::new),
         }));
     }
 
