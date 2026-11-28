@@ -1372,7 +1372,20 @@ impl<'a, 'h> VmFrame<'a, 'h> {
                         std::collections::HashMap::with_capacity(captured.len());
                     let mut binds: FxHashMap<Rc<str>, TaggedValue> = FxHashMap::default();
                     for (name, value) in captured.iter() {
-                        if self.scopes.rec_names.contains(name) || !native_ops::arrow_free(value) {
+                        // Canonical ctor objects stay residual `binds`
+                        // (mirrors the shared `closure` op, ADR-0152 §2):
+                        // `instantiate` substitutes only term-position
+                        // `var`s — a `var` leaf in a match pattern is a
+                        // binder site and is never rewritten, so a
+                        // `subst`-baked `VNil` would leave the pattern's
+                        // `var` unbound inside the arrow — `try_pattern`'s
+                        // `scope_value` miss then degrades it to a
+                        // catch-all binder and the first arm swallows
+                        // every scrutinee.
+                        if self.scopes.rec_names.contains(name)
+                            || !native_ops::arrow_free(value)
+                            || pattern_match::is_ctor_object(value)
+                        {
                             binds.insert(Rc::clone(name), value.clone());
                         } else {
                             subst.insert(Rc::clone(name), tagged_to_value(value));
